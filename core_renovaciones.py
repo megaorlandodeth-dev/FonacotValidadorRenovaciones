@@ -634,21 +634,22 @@ class RenovacionTicketParser:
                     if token not in creditos_renovados_found:
                         creditos_renovados_found.append(token)
 
-        # Patrón en Asunto/Resumen con signos '+' o '-': "+ 7239770+50074", "-8220974-60117", "+ 2431191 + 20757 + 20758"
-        for m_plus in re.finditer(
+        # Patrón Cliente + Crédito con signos: "+ 7239770+50074", "-8220974-60117", "+ 2431191 + 20757 + 20758",
+        # o con asterisco: "Cancelación de crédito 1184282*10430", "1184282 * 10430 * 10431"
+        for pat_par in (
             r'[\+\-]\s*(\d{5,10})\s*[\+\-]\s*(\d{3,7})\b(?:\s*(?:[\+\-,]|y)\s*(\d{3,7})\b)?',
-            full_context,
-            re.I
+            r'\b(\d{5,10})\s*\*\s*(\d{3,7})\b(?:\s*(?:[\*,]|y)\s*(\d{3,7})\b)?',
         ):
-            c_cand = m_plus.group(1)
-            r1 = m_plus.group(2)
-            r2 = m_plus.group(3)
-            if cls._is_valid_number_token(c_cand, 5, 10) and c_cand not in clientes_found:
-                clientes_found.append(c_cand)
-            for rx in (r1, r2):
-                if rx and cls._is_valid_number_token(rx, 3, 7) and rx not in clientes_found and rx not in creditos_padre_found:
-                    if rx not in creditos_renovados_found:
-                        creditos_renovados_found.append(rx)
+            for m_plus in re.finditer(pat_par, full_context, re.I):
+                c_cand = m_plus.group(1)
+                r1 = m_plus.group(2)
+                r2 = m_plus.group(3)
+                if cls._is_valid_number_token(c_cand, 5, 10) and c_cand not in clientes_found:
+                    clientes_found.append(c_cand)
+                for rx in (r1, r2):
+                    if rx and cls._is_valid_number_token(rx, 3, 7) and rx not in clientes_found and rx not in creditos_padre_found:
+                        if rx not in creditos_renovados_found:
+                            creditos_renovados_found.append(rx)
 
         # Patrón en Resumen tipo: "CANCELACION DE RENOVACION 5042466 57521" o "82377 y 82379 7113273"
         if not clientes_found or not creditos_renovados_found:
