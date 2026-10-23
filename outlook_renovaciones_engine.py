@@ -35,7 +35,12 @@ from core_renovaciones import (
     parse_fecha_asunto,
     previous_business_day,
     extract_concentrado_tokens,
+    extract_concentrado_rows,
+    extract_concentrado_intro,
     clasificar_lotes,
+    ticket_key,
+    is_aviso_solucion,
+    parse_aviso_solucion,
     HORA_CORTE_DEFAULT,
     ASUNTO_CONCENTRADO_DEFAULT,
     RenovacionTicketParser
@@ -402,6 +407,7 @@ class FonacotRenovacionesEngine:
         raw_candidates_map = {}
         all_gafetes_by_ticket = {}  # ticket_num -> set(gafetes)
         assignments_history = {}    # ticket_num -> list of (rec_time, gafete, agente)
+        avisos_solucion = {}        # ticket_key -> (rec_time, msg) del aviso de cierre más reciente
 
         total_folders = max(len(folders_to_scan), 1)
         scanned_folder_eids = set()
@@ -457,14 +463,21 @@ class FonacotRenovacionesEngine:
                     else:
                         consecutive_older = 0
 
-                    if rec_time > extended_end_dt:
-                        continue
-
                     if getattr(msg, 'Class', 0) != 43:
                         continue
 
                     subject = str(getattr(msg, 'Subject', '') or '').strip()
                     if not subject:
+                        continue
+
+                    # Avisos de cierre de iTop: se toman aunque lleguen después del periodo (el ticket pudo cerrarse hoy)
+                    t_cierre = is_aviso_solucion(subject)
+                    if t_cierre:
+                        if t_cierre not in avisos_solucion or rec_time > avisos_solucion[t_cierre][0]:
+                            avisos_solucion[t_cierre] = (rec_time, msg)
+                        continue
+
+                    if rec_time > extended_end_dt:
                         continue
 
                     subj_low = subject.lower()
@@ -685,9 +698,48 @@ class FonacotRenovacionesEngine:
                 r['Ticket_Duplicado'] = False
                 r['Otros_Tickets_Mismo_Credito'] = ""
 
+        self._aplicar_cierres_itop(all_renewal_rows, avisos_solucion, clean_timeline_by_ticket)
+
         self.renovaciones_rows = all_renewal_rows
         self.tickets_summary = tickets_summary_list
         return all_renewal_rows, tickets_summary_list
+
+    @staticmethod
+    def _aplicar_cierres_itop(rows: list, avisos_solucion: dict, timeline_by_ticket: dict):
+        """
+        Marca las renovaciones cuyo ticket ya tiene "Aviso de solución" de iTop: estado, motivo y quién lo cerró.
+        Si el correo no dice quién, se toma el agente que tenía asignado el ticket al momento del cierre.
+        """
+        timelines = {ticket_key(t): tl for t, tl in timeline_by_ticket.items()}
+        cierres = {}
+        for r in rows:
+            r['Cerrado_iTop'] = False
+            r['Cierre_iTop'] = None
+            t = ticket_key(r['Numero_Ticket'])
+            if t not in avisos_solucion:
+                continue
+            if t not in cierres:
+                rec_time, msg = avisos_solucion[t]
+                try:
+                    html = str(getattr(msg, 'HTMLBody', '') or '')
+                except Exception:
+                    html = ''
+                try:
+                    plain = str(getattr(msg, 'Body', '') or '')
+                except Exception:
+                    plain = ''
+                cierre = parse_aviso_solucion(html, plain)
+                cierre['fecha_dt'] = rec_time
+                cierre['cerro_fuente'] = 'correo' if cierre.get('cerro') else ''
+                if not cierre.get('cerro'):
+                    previas = [(dt, g, ag) for dt, g, ag in timelines.get(t, []) if dt <= rec_time]
+                    if previas:
+                        _dt, g, ag = previas[-1]
+                        cierre['cerro'] = f"{g} {ag}".strip()
+                        cierre['cerro_fuente'] = 'asignacion'
+                cierres[t] = cierre
+            r['Cerrado_iTop'] = True
+            r['Cierre_iTop'] = cierres[t]
 
     def export_to_excel(
         self,
@@ -1033,6 +1085,8 @@ class FonacotRenovacionesEngine:
                         html_txt = ""
                     full_text = f"{body}\n{html_txt}\n{self._attachments_text(msg)}"
                     tickets, numeros = extract_concentrado_tokens(full_text)
+                    filas = extract_concentrado_rows(html)
+                    tickets.update(f['ticket'].split('-', 1)[-1] for f in filas if f['ticket'])
 
                     found[dedup_key] = {
                         'asunto': subject,
@@ -1042,6 +1096,8 @@ class FonacotRenovacionesEngine:
                         'carpeta': lbl,
                         'tickets': tickets,
                         'numeros': numeros,
+                        'filas': filas,
+                        'intro': extract_concentrado_intro(body),
                     }
                 except Exception:
                     continue

@@ -22,19 +22,22 @@ from core_renovaciones import (
     LOTE_REZAGADA,
     LOTE_ENVIADA,
     LOTE_EN_CONCENTRADO,
-    LOTE_SIGUIENTE
+    LOTE_SIGUIENTE,
+    resumen_cierre
 )
 from lote_utils import (
     EstadoValidaciones,
     row_key,
     build_lote_tsv,
-    build_lote_html,
+    build_ticket_unico_tsv,
+    build_ticket_unico_html,
     set_clipboard_html,
-    plain_text
+    plain_text,
+    INTRO_TICKET_UNICO_DEFAULT
 )
 
 
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"),
@@ -87,14 +90,17 @@ FILTRO_VALIDADAS = "Validadas"
 FILTRO_ENVIADAS = "Ya enviadas (excluidas)"
 FILTRO_SIGUIENTE = "Después del corte de hoy"
 FILTRO_PAPELERA = "Descartadas"
+FILTRO_CERRADAS = "Cerradas en iTop"
 OTRAS_VISTAS = "Otras vistas"
 
 FILTROS_PRINCIPALES = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_MULTIPLES, FILTRO_REZAGADAS, FILTRO_NUEVAS]
-FILTROS_SECUNDARIOS = [FILTRO_VALIDADAS, FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_PAPELERA]
+FILTROS_SECUNDARIOS = [FILTRO_CERRADAS, FILTRO_VALIDADAS, FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_PAPELERA]
 
 MODOS = {"CONCENTRADO": "Concentrado", "AGENTE": "Por compañero"}
 
-ASUNTO_BORRADOR_DEFAULT = "TICKET UNICO {fecha}"
+# Mismo asunto que el correo que ya se envía: "Cancelación de renovaciones – ticket único 22-10-2026"
+ASUNTO_BORRADOR_DEFAULT = "Cancelación de renovaciones – ticket único {fecha}"
+ASUNTO_BORRADOR_ANTERIOR = "TICKET UNICO {fecha}"
 
 ATAJOS = [
     ("F5", "Extraer y validar renovaciones"),
@@ -320,6 +326,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "asunto_borrador": ASUNTO_BORRADOR_DEFAULT,
             "correo_para": "",
             "correo_cc": "",
+            # Texto antes de la tabla; admite {total}. Vacío = el aprendido del último concentrado o el predeterminado.
+            "texto_correo": "",
+            "texto_correo_aprendido": "",
             "auto_refresh": False,
             "auto_refresh_min": "10",
             # Plantilla opcional para otro servidor de iTop; admite {id}, {ref} y {clase}. Vacío = servidor FONACOT.
@@ -332,6 +341,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     default_cfg.update(data)
+                if default_cfg.get("asunto_borrador") == ASUNTO_BORRADOR_ANTERIOR:
+                    default_cfg["asunto_borrador"] = ASUNTO_BORRADOR_DEFAULT
             except Exception:
                 pass
         return default_cfg
@@ -573,10 +584,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         # Correo del lote
         sec = self._section(side, "Correo del lote")
         self.ent_asunto_borrador = self._field(
-            sec, 0, "Asunto", self.config_data.get("asunto_borrador", ASUNTO_BORRADOR_DEFAULT), "TICKET UNICO {fecha}"
+            sec, 0, "Asunto", self.config_data.get("asunto_borrador", ASUNTO_BORRADOR_DEFAULT), ASUNTO_BORRADOR_DEFAULT
         )
         self.ent_correo_para = self._field(sec, 2, "Para", self.config_data.get("correo_para", ""), "correo@fonacot.gob.mx")
         self.ent_correo_cc = self._field(sec, 4, "CC", self.config_data.get("correo_cc", ""), "Opcional")
+        ctk.CTkLabel(
+            sec, text="{fecha} se cambia por dd-mm-aaaa. El texto del correo se toma del último concentrado.",
+            font=F(11), text_color=COL["muted"], justify="left", anchor="w", wraplength=230
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Auto-actualizar
         sec = self._section(side, "Actualización automática")
@@ -654,7 +669,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.lbl_kpi_tickets = self._kpi(kpi_bar, 0, "Tickets", "Incidentes únicos en iTop", "#0B5CAD", FILTRO_TODAS)
         self.lbl_kpi_renovaciones = self._kpi(kpi_bar, 1, "Créditos a cancelar", "Renovaciones desglosadas", "#0F766E", FILTRO_TODAS)
         self.lbl_kpi_multiples = self._kpi(kpi_bar, 2, "Tickets múltiples", "2 o más créditos", "#D97706", FILTRO_MULTIPLES)
-        self.lbl_kpi_alertas = self._kpi(kpi_bar, 3, "Alertas", "Falta dato o duplicado", "#DC2626", FILTRO_ALERTAS)
+        self.lbl_kpi_alertas = self._kpi(kpi_bar, 3, "Alertas", "Falta dato, duplicado o cerrado", "#DC2626", FILTRO_ALERTAS)
         self.lbl_kpi_rezagadas = self._kpi(kpi_bar, 4, "Rezagadas", "Del día anterior, sumadas hoy", "#4F46E5", FILTRO_REZAGADAS)
         self.lbl_kpi_validados = self._kpi(kpi_bar, 5, "Avance", "Clic para ver pendientes", "#16A34A", FILTRO_PENDIENTES,
                                            progreso=True)
@@ -836,6 +851,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         tree.tag_configure("rezagada", background="#EEF2FF", foreground="#3730A3")      # Índigo: rezagada del día anterior
         tree.tag_configure("fuera_lote", background="#FFFFFF", foreground=COL["faint"])  # Gris: ya enviada / después del corte
         tree.tag_configure("validado", background="#F0FDF4", foreground="#166534")      # Verde: validada
+        tree.tag_configure("cerrado", background="#F5F3FF", foreground="#5B21B6")       # Violeta: ya cerrado en iTop
         tree.tag_configure("descartado", background=COL["subtle"], foreground=COL["faint"])  # Gris: descartada
 
         vsb = ctk.CTkScrollbar(parent, orientation="vertical", command=tree.yview, width=12)
@@ -855,6 +871,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "credito_hijo": ("Crédito a cancelar", 135, "center"),
             "credito_padre": ("Crédito origen", 120, "center"),
             "lote": ("Lote / corte", 270, "w"),
+            "cierre": ("Cierre en iTop", 300, "w"),
             "gafete": ("Gafete", 70, "center"),
             "agente": ("Agente responsable", 190, "w"),
             "alerta_reno": ("Alerta de renovación", 290, "w"),
@@ -882,6 +899,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "agente": ("Agente responsable", 200, "w"),
             "resumen": ("Resumen del ticket", 320, "w"),
             "alerta_asig": ("Asignación", 240, "w"),
+            "cierre": ("Cierre en iTop", 300, "w"),
             "fecha": ("Llegada", 135, "center"),
         }, selectmode="browse")
         self.tree_tickets.bind("<<TreeviewSelect>>", self._on_select_ticket_row)
@@ -929,6 +947,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.txt_detail.tag_config("ok", foreground=COL["success"])
         self.txt_detail.tag_config("warn", foreground=COL["warning"])
         self.txt_detail.tag_config("muted", foreground=COL["muted"])
+        self.txt_detail.tag_config("cierre", foreground="#5B21B6")
 
         self.txt_body = ctk.CTkTextbox(parent, font=F(12), wrap="word")
         self.txt_body.grid(row=2, column=1, padx=(6, 16), pady=(0, 16), sticky="nsew")
@@ -1246,13 +1265,31 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 msg += f"  ·  {conteos[LOTE_REZAGADA]} rezagada(s) del día anterior"
             if conteos.get(LOTE_SIGUIENTE):
                 msg += f"  ·  {conteos[LOTE_SIGUIENTE]} después del corte"
+        cerradas = {r['Numero_Ticket'] for r in active_rows if r.get('Cerrado_iTop')}
+        if cerradas:
+            msg += f"  ·  {len(cerradas)} ticket(s) ya cerrados en iTop"
         self.lbl_status.configure(text=msg)
+        self._aprender_texto_correo(lote_info)
 
         if self.new_keys:
             nuevas = sum(1 for r in active_rows if self._key_by_rid.get(r['Row_ID']) in self.new_keys)
             if nuevas:
                 self.bell()
                 self._toast(f"{nuevas} renovación(es) nueva(s) desde el último escaneo.\nUsa el filtro «{FILTRO_NUEVAS}» para verlas.")
+
+    def _aprender_texto_correo(self, lote_info):
+        """Guarda el texto (saludo y 'FAVOR DE BLOQUEAR…') del último concentrado original para repetirlo en el correo de hoy."""
+        concs = sorted((lote_info or {}).get('concentrados') or [], key=lambda c: c.get('recibido') or datetime.min, reverse=True)
+        for conc in concs:
+            if conc.get('intro') and not re.match(r'\s*(re|rv|fw|fwd)\s*:', conc.get('asunto', ''), re.I):
+                if conc['intro'] != self.config_data.get("texto_correo_aprendido"):
+                    self.config_data["texto_correo_aprendido"] = conc['intro']
+                    self._save_config()
+                return
+
+    def _texto_correo(self) -> str:
+        return (self.config_data.get("texto_correo") or self.config_data.get("texto_correo_aprendido")
+                or INTRO_TICKET_UNICO_DEFAULT)
 
     # ================= CORTE / ÚLTIMA CONSIDERADA =================
 
@@ -1340,6 +1377,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             r.get('Datos_Incompletos')
             or r.get('Ticket_Duplicado')
             or r.get('Requiere_Validacion_Agente')
+            or r.get('Cerrado_iTop')
             or "DISCREPANCIA" in r.get('Alerta_Renovacion', '')
         )
 
@@ -1387,6 +1425,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     continue
                 if q_filter == FILTRO_NUEVAS and not self._es_nueva(r):
                     continue
+                if q_filter == FILTRO_CERRADAS and not r.get('Cerrado_iTop'):
+                    continue
 
             if search_txt:
                 haystack = (
@@ -1410,6 +1450,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             return "fuera_lote"
         if rid in self.validated_row_ids:
             return "validado"
+        if r.get('Cerrado_iTop'):
+            return "cerrado"
         if r.get('Lote_Estado') == LOTE_REZAGADA:
             return "rezagada"
         if r.get('Datos_Incompletos'):
@@ -1462,6 +1504,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     r['Credito_Renovado_Hijo'],
                     r['Credito_Origen_Padre'],
                     plain_text(r.get('Lote_Etiqueta', '')),
+                    resumen_cierre(r.get('Cierre_iTop')),
                     r['Gafete'],
                     r['Nombre_Asignado'],
                     plain_text(r['Alerta_Renovacion']),
@@ -1493,7 +1536,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             g = tickets_grouped.setdefault(r['Numero_Ticket'], {
                 'clientes': [], 'creditos_hijos': [], 'creditos_padres': [],
                 'gafete': r['Gafete'], 'agente': r['Nombre_Asignado'], 'resumen': r['Resumen_iTop'],
-                'alerta_asig': plain_text(r['Alerta_Asignacion']), 'fecha': self._fecha_llegada_str(r), 'has_missing': False
+                'alerta_asig': plain_text(r['Alerta_Asignacion']), 'fecha': self._fecha_llegada_str(r), 'has_missing': False,
+                'cierre': resumen_cierre(r.get('Cierre_iTop'))
             })
             if r['Numero_Cliente'] not in g['clientes']:
                 g['clientes'].append(r['Numero_Cliente'])
@@ -1506,7 +1550,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         for i, (tnum, g) in enumerate(tickets_grouped.items()):
             cant = len(g['creditos_hijos'])
-            tag = "incompleto" if g['has_missing'] else ("multiple" if cant > 1 else ("normal_alt" if i % 2 else "normal"))
+            tag = "incompleto" if g['has_missing'] else (
+                "cerrado" if g['cierre'] else ("multiple" if cant > 1 else ("normal_alt" if i % 2 else "normal"))
+            )
             self.tree_tickets.insert(
                 "", "end", iid=f"TKT_{tnum}",
                 values=(
@@ -1515,7 +1561,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     ", ".join(g['clientes']),
                     ", ".join(g['creditos_hijos']),
                     ", ".join(g['creditos_padres']) if g['creditos_padres'] else "-",
-                    g['gafete'], g['agente'], g['resumen'], g['alerta_asig'], g['fecha']
+                    g['gafete'], g['agente'], g['resumen'], g['alerta_asig'], g['cierre'], g['fecha']
                 ),
                 tags=(tag,)
             )
@@ -1609,6 +1655,19 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         box = self.txt_detail
         box.configure(state="normal")
         box.delete("1.0", "end")
+        cierre = r.get('Cierre_iTop')
+        if cierre:
+            box.insert("end", f"Cerrado en iTop: {cierre.get('estado') or 'Cerrado'}", "cierre")
+            if cierre.get('fecha_dt'):
+                box.insert("end", f" el {cierre['fecha_dt']:%d/%m/%Y %H:%M}", "cierre")
+            box.insert("end", "\n", "cierre")
+            if cierre.get('cerro'):
+                fuente = "" if cierre.get('cerro_fuente') == 'correo' else "  (agente asignado al cerrar)"
+                box.insert("end", f"Lo cerró: {cierre['cerro']}{fuente}\n", "titulo")
+            box.insert("end", f"Motivo: {cierre.get('motivo') or 'El aviso no trae el texto de la solución'}\n", "titulo")
+            if cierre.get('codigo'):
+                box.insert("end", f"Código de solución: {cierre['codigo']}\n", "muted")
+            box.insert("end", "\n")
         box.insert("end", f"Ticket {tnum}  ·  {len(siblings)} renovación(es)\n", "titulo")
         box.insert("end", f"{r.get('Resumen_iTop', '-')}\n\n", "muted")
         for s in siblings:
@@ -1811,8 +1870,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         active_rows = self._lote_activo_o_aviso()
         if not active_rows:
             return
-        tsv_text = build_lote_tsv(active_rows, self.validated_row_ids)
-        html = build_lote_html(active_rows, self.validated_row_ids)
+        tsv_text = build_ticket_unico_tsv(active_rows)
+        html = build_ticket_unico_html(active_rows, url_fn=self._itop_url)
         como_tabla = set_clipboard_html(html, tsv_text)
         if not como_tabla:
             self.clipboard_clear()
@@ -1836,22 +1895,23 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             return
         self._save_config()
         pendientes = sum(1 for r in active_rows if r['Row_ID'] not in self.validated_row_ids)
-        if pendientes and not messagebox.askyesno(
-            "Renovaciones sin validar",
-            f"{pendientes} de {len(active_rows)} renovaciones aún no están validadas.\n\n¿Crear el correo de todas formas?"
-        ):
+        cerradas = sorted({r['Numero_Ticket'] for r in active_rows if r.get('Cerrado_iTop')})
+        avisos = []
+        if pendientes:
+            avisos.append(f"{pendientes} de {len(active_rows)} renovaciones aún no están validadas.")
+        if cerradas:
+            avisos.append(f"{len(cerradas)} ticket(s) ya están cerrados en iTop: {', '.join(cerradas[:8])}"
+                          + ("…" if len(cerradas) > 8 else "") + ". Revisa el motivo antes de enviarlos (vista «Cerradas en iTop»).")
+        if avisos and not messagebox.askyesno("Antes de crear el correo", "\n\n".join(avisos) + "\n\n¿Crear el correo de todas formas?"):
             return
 
         fecha = self.cal_end.get_date()
         plantilla = self.config_data.get("asunto_borrador") or ASUNTO_BORRADOR_DEFAULT
         try:
-            asunto = plantilla.format(fecha=fecha.strftime('%d/%m/%Y'))
+            asunto = plantilla.format(fecha=fecha.strftime('%d-%m-%Y'))
         except (KeyError, IndexError, ValueError):
             asunto = plantilla
-        html = build_lote_html(
-            active_rows, self.validated_row_ids,
-            titulo=f"Relación de cancelación de renovaciones – {fecha.strftime('%d/%m/%Y')}"
-        )
+        html = build_ticket_unico_html(active_rows, intro=self._texto_correo(), url_fn=self._itop_url)
         try:
             self.engine.create_draft_email(
                 asunto, html, self.config_data.get("correo_para", ""), self.config_data.get("correo_cc", "")
@@ -1909,6 +1969,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "Estado / Alerta de Renovación": plain_text(r['Alerta_Renovacion']),
                 "Estado Asignación": plain_text(r['Alerta_Asignacion']),
                 "Historial Asignaciones": plain_text(r.get('Historial_Asignaciones', '')),
+                "Cierre iTop - Estado": (r.get('Cierre_iTop') or {}).get('estado', ''),
+                "Cierre iTop - Fecha": (
+                    r['Cierre_iTop']['fecha_dt'].strftime('%d/%m/%Y %H:%M') if (r.get('Cierre_iTop') or {}).get('fecha_dt') else ''
+                ),
+                "Cierre iTop - Lo cerró": (r.get('Cierre_iTop') or {}).get('cerro', ''),
+                "Cierre iTop - Motivo": (r.get('Cierre_iTop') or {}).get('motivo', ''),
                 "Motivo / Observación": r['Motivo'],
                 "Sucursal / Localidad": r.get('Sucursal', ''),
                 "Resumen iTop": r.get('Resumen_iTop', ''),
@@ -2018,6 +2084,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             fill_mult = PatternFill(start_color="FFFBEB", end_color="FFFBEB", fill_type="solid")
             fill_inc = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
             fill_rez = PatternFill(start_color="EEF2FF", end_color="EEF2FF", fill_type="solid")
+            fill_cerr = PatternFill(start_color="F5F3FF", end_color="F5F3FF", fill_type="solid")
 
             for ws in wb.worksheets:
                 for cell in ws[1]:
@@ -2047,6 +2114,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     row_fill = None
                     if r_orig.get("Datos_Incompletos"):
                         row_fill = fill_inc
+                    elif r_orig.get("Cerrado_iTop"):
+                        row_fill = fill_cerr
                     elif r_orig.get("Lote_Estado") == LOTE_REZAGADA:
                         row_fill = fill_rez
                     elif r_orig.get("Es_Multiple"):
