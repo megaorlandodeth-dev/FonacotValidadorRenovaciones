@@ -11,6 +11,7 @@ from datetime import datetime, date, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core_renovaciones import (  # noqa: E402
+    first_digits,
     RenovacionTicketParser as P,
     expand_abbreviated_labels,
     build_itop_url,
@@ -22,6 +23,8 @@ from core_renovaciones import (  # noqa: E402
     clasificar_lotes,
     LOTE_HOY, LOTE_REZAGADA, LOTE_ENVIADA, LOTE_EN_CONCENTRADO, LOTE_SIGUIENTE,
     LOTE_CERRADA_SIN_ENVIO, LOTE_SIN_COMPROBAR,
+    set_dias_inhabiles, parse_dias_inhabiles, feriados_oficiales, next_business_day, cortes_reales,
+    normalizar_fechas_concentrados,
 )
 
 
@@ -182,14 +185,15 @@ class TestClasificarLotes(unittest.TestCase):
         self.assertEqual(info['metodo'], 'concentrado')
         self.assertEqual(info['ultima_considerada']['ticket'], "I-361001")
 
-    def test_sin_concentrado_usa_horario(self):
+    def test_sin_concentrado_no_se_da_por_enviada(self):
+        # Sin ticket único del día anterior no hay prueba: queda «sin comprobar» (antes se daba por enviada)
         rows = [
             fila("I-361001", "5864479", "56572", datetime(2026, 10, 22, 17, 49)),
             fila("I-361002", "4530500", "91258", datetime(2026, 10, 22, 17, 51)),
         ]
         info = clasificar_lotes(rows, self.HOY, self.HOY, self.CORTE, [])
         self.assertEqual(info['metodo'], 'horario')
-        self.assertEqual([r['Lote_Estado'] for r in rows], [LOTE_ENVIADA, LOTE_REZAGADA])
+        self.assertEqual([r['Lote_Estado'] for r in rows], [LOTE_SIN_COMPROBAR, LOTE_REZAGADA])
 
     def test_marca_local(self):
         rows = [
@@ -292,6 +296,163 @@ class TestRevisionEnvios(unittest.TestCase):
                 fila("I-362501", "1234567", "11111", datetime(2026, 10, 23, 18, 0))]
         self.revisar(rows, [self.CONC_30()])
         self.assertEqual([r['Lote_Estado'] for r in rows], [LOTE_HOY, LOTE_HOY])
+
+
+class TestDatosEquivocados(unittest.TestCase):
+    """El ticket único trae el incidente pero con el cliente (o crédito, o folio) de otro."""
+    AHORA = datetime(2026, 10, 23, 10, 0)
+
+    @staticmethod
+    def conc_tabla(fecha, recibido, filas):
+        return {'asunto': f"Ticket único {fecha:%d-%m-%Y}", 'fecha_asunto': fecha, 'recibido': recibido,
+                'remitente': '', 'carpeta': 'Enviados', 'tickets': {first_digits(f[0]) for f in filas},
+                'numeros': {n for f in filas for n in f[1:]},
+                'filas': [{'ticket': f[0], 'fecha': '', 'cliente': f[1], 'credito': f[2]} for f in filas]}
+
+    def test_incidente_con_cliente_de_otro_incidente(self):
+        rows = [fila("I-361001", "5864479", "56572", datetime(2026, 10, 20, 10, 0)),
+                fila("I-361002", "4530500", "91258", datetime(2026, 10, 20, 11, 0))]
+        conc = self.conc_tabla(date(2026, 10, 20), datetime(2026, 10, 20, 17, 50),
+                               [("I-361001", "4530500", "56572"), ("I-361002", "4530500", "91258")])
+        info = clasificar_lotes(rows, date(2026, 10, 19), date(2026, 10, 23), time(17, 50), [conc], ahora=self.AHORA)
+        self.assertTrue(rows[0]['No_Enviada'])
+        self.assertEqual(rows[0]['Error_Envio'],
+                         "salió con Cliente 4530500 en lugar de 5864479 (ese cliente es del incidente I-361002)")
+        self.assertIn("DATOS EQUIVOCADOS", rows[0]['Lote_Etiqueta'])
+        self.assertEqual(rows[1]['Lote_Estado'], LOTE_ENVIADA)
+        self.assertEqual(info['errores_envio'], 1)
+        renglon = info['semana']['filas'][0]
+        self.assertEqual(renglon['incidente'], "I-361001")
+        self.assertIn("salió con Cliente 4530500 en lugar de 5864479", renglon['error'])
+
+    def test_cliente_y_credito_bien_pero_con_otro_folio(self):
+        rows = [fila("I-361001", "5864479", "56572", datetime(2026, 10, 20, 10, 0))]
+        conc = self.conc_tabla(date(2026, 10, 20), datetime(2026, 10, 20, 17, 50), [("I-361009", "5864479", "56572")])
+        info = clasificar_lotes(rows, date(2026, 10, 19), date(2026, 10, 23), time(17, 50), [conc], ahora=self.AHORA)
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_ENVIADA)
+        self.assertEqual(rows[0]['Error_Envio'], "salió con el incidente I-361009 en lugar de I-361001")
+        self.assertIn("es del incidente I-361001", info['semana']['filas'][0]['error'])
+
+
+class TestRevisionSemanal(unittest.TestCase):
+    def test_concentrado_y_solo_cuenta_la_semana(self):
+        rows = [fila("I-360900", "1111111", "11111", datetime(2026, 10, 16, 10, 0)),   # viernes anterior: fuera
+                fila("I-361001", "5864479", "56572", datetime(2026, 10, 19, 10, 0)),   # lunes, enviada martes
+                fila("I-361002", "4530500", "91258", datetime(2026, 10, 20, 10, 0))]   # martes, nunca enviada
+        concs = [TestDatosEquivocados.conc_tabla(date(2026, 10, 16), datetime(2026, 10, 16, 17, 0), [("I-360800", "2222222", "22222")]),
+                 TestDatosEquivocados.conc_tabla(date(2026, 10, 19), datetime(2026, 10, 19, 17, 0), [("I-360999", "3333333", "33333")]),
+                 TestDatosEquivocados.conc_tabla(date(2026, 10, 20), datetime(2026, 10, 20, 17, 0), [("I-361001", "5864479", "56572")])]
+        info = clasificar_lotes(rows, date(2026, 10, 19), date(2026, 10, 23), time(17, 50), concs,
+                                ahora=datetime(2026, 10, 23, 10, 0))
+        self.assertFalse(rows[0]['En_Periodo'])
+        self.assertEqual((info['en_periodo'], info['enviadas'], info['no_enviadas'], info['tarde']), (2, 1, 1, 1))
+        semana = info['semana']['filas']
+        self.assertEqual([(f['ticket'], f['incidente']) for f in semana], [("I-360999", ""), ("I-361001", "I-361001")])
+
+
+class TestLoteDeDiaPasado(unittest.TestCase):
+    def test_lote_del_martes_visto_el_viernes(self):
+        martes = date(2026, 10, 20)
+        rows = [fila("I-361001", "5864479", "56572", datetime(2026, 10, 19, 18, 30)),  # lunes tras el envío -> rezagada
+                fila("I-361002", "4530500", "91258", datetime(2026, 10, 20, 10, 0)),   # en el ticket del martes
+                fila("I-361003", "7239770", "50074", datetime(2026, 10, 20, 11, 0)),   # faltó; salió el jueves
+                fila("I-361004", "6173151", "57137", datetime(2026, 10, 20, 19, 0))]   # tras el envío -> miércoles
+        concs = [TestDatosEquivocados.conc_tabla(date(2026, 10, 19), datetime(2026, 10, 19, 17, 0), [("I-360000", "1000000", "10000")]),
+                 TestDatosEquivocados.conc_tabla(martes, datetime(2026, 10, 20, 17, 30), [("I-361002", "4530500", "91258")]),
+                 TestDatosEquivocados.conc_tabla(date(2026, 10, 22), datetime(2026, 10, 22, 17, 30),
+                                                 [("I-361003", "7239770", "50074"), ("I-361001", "5864479", "56572")])]
+        info = clasificar_lotes(rows, martes, martes, time(17, 50), concs, ahora=datetime(2026, 10, 23, 10, 0),
+                                revision=False, dia_lote=martes)
+        self.assertFalse(info['revision'])
+        self.assertEqual([r['Lote_Estado'] for r in rows], [LOTE_REZAGADA, LOTE_EN_CONCENTRADO, LOTE_HOY, LOTE_SIGUIENTE])
+        self.assertEqual(rows[1]['Lote_Resumen'], "Ya en el ticket único del 20/10")
+        self.assertIn("Lote del 20/10", rows[2]['Lote_Resumen'])
+        self.assertIn("salió el 22/10", rows[2]['Lote_Resumen'])
+        self.assertTrue(rows[2]['Falta_Hoy'])
+        self.assertEqual(rows[0]['Enviado_Despues'], date(2026, 10, 22))
+        # La rezagada del lunes tampoco vino en el ticket único del martes: también le faltó a ese lote
+        self.assertTrue(rows[0]['Falta_Hoy'])
+        self.assertIn("falta en el de las 17:30", rows[0]['Lote_Resumen'])
+        self.assertEqual(info['faltan_hoy'], 2)
+
+    def test_revision_forzada_en_un_solo_dia(self):
+        rows = [fila("I-361002", "4530500", "91258", datetime(2026, 10, 23, 10, 0))]
+        info = clasificar_lotes(rows, date(2026, 10, 23), date(2026, 10, 23), time(17, 50), [],
+                                ahora=datetime(2026, 10, 23, 12, 0), revision=True)
+        self.assertTrue(info['revision'])
+
+
+class TestAuditoria(unittest.TestCase):
+    """Escenarios encontrados en la auditoría: festivos, fechas de asunto, sin crédito, duplicados."""
+    conc = staticmethod(lambda *a, **k: TestDatosEquivocados.conc_tabla(*a, **k))
+
+    def tearDown(self):
+        set_dias_inhabiles(())
+
+    def test_feriados_y_dias_capturados(self):
+        self.assertIn(date(2026, 11, 16), feriados_oficiales(2026))  # tercer lunes de noviembre
+        self.assertEqual(next_business_day(date(2026, 11, 13)), date(2026, 11, 17))
+        set_dias_inhabiles(parse_dias_inhabiles("02/11/2026, 12-12-2026"))
+        self.assertEqual(next_business_day(date(2026, 10, 30)), date(2026, 11, 3))
+
+    def test_dia_inhabil_con_ticket_unico_si_se_trabajo(self):
+        rows = [fila("I-1", "5864479", "56572", datetime(2026, 11, 16, 10, 0))]
+        concs = [self.conc(date(2026, 11, 16), datetime(2026, 11, 16, 17, 0), [("I-1", "5864479", "56572")])]
+        clasificar_lotes(rows, date(2026, 11, 16), date(2026, 11, 20), time(17, 50), concs,
+                         ahora=datetime(2026, 11, 20, 10, 0))
+        self.assertEqual(rows[0]['Dia_Lote'], date(2026, 11, 16))
+        self.assertEqual(rows[0]['Lote_Resumen'], "Enviada 16/11")
+
+    def test_asunto_con_fecha_de_ayer_por_error(self):
+        concs = [self.conc(date(2026, 10, 21), datetime(2026, 10, 21, 17, 30), []),
+                 self.conc(date(2026, 10, 21), datetime(2026, 10, 22, 17, 52), [])]  # el del 22 dice "21"
+        normalizar_fechas_concentrados(concs)
+        self.assertEqual(concs[1]['fecha_efectiva'], date(2026, 10, 22))
+        self.assertEqual(cortes_reales(concs), {date(2026, 10, 21): datetime(2026, 10, 21, 17, 30),
+                                                date(2026, 10, 22): datetime(2026, 10, 22, 17, 52)})
+
+    def test_complemento_no_mueve_el_corte(self):
+        concs = [self.conc(date(2026, 10, 21), datetime(2026, 10, 21, 17, 30), []),
+                 self.conc(date(2026, 10, 21), datetime(2026, 10, 21, 18, 40), [])]
+        self.assertEqual(cortes_reales(concs)[date(2026, 10, 21)], datetime(2026, 10, 21, 17, 30))
+
+    def test_sin_credito_necesita_su_cliente(self):
+        rows = [fila("I-5", "1111111", "SIN CRÉDITO", datetime(2026, 10, 20, 10, 0), incompleta=True),
+                fila("I-5", "2222222", "33333", datetime(2026, 10, 20, 10, 0))]
+        concs = [self.conc(date(2026, 10, 20), datetime(2026, 10, 20, 17, 30), [("I-5", "2222222", "33333")])]
+        clasificar_lotes(rows, date(2026, 10, 20), date(2026, 10, 23), time(17, 50), concs, ahora=datetime(2026, 10, 23, 10, 0))
+        self.assertTrue(rows[0]['No_Enviada'])
+        self.assertEqual(rows[1]['Lote_Estado'], LOTE_ENVIADA)
+
+    def test_solicitud_repetida_hoy_no_se_autovalida(self):
+        rows = [fila("I-200", "5864479", "56572", datetime(2026, 10, 23, 9, 0))]
+        concs = [self.conc(date(2026, 10, 20), datetime(2026, 10, 20, 17, 30), [("I-100", "5864479", "56572")])]
+        clasificar_lotes(rows, date(2026, 10, 23), date(2026, 10, 23), time(17, 50), concs, ahora=datetime(2026, 10, 23, 10, 0))
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_ENVIADA)
+        self.assertTrue(rows[0]['Posible_Duplicado'])
+        self.assertIn("posible duplicado", rows[0]['Lote_Resumen'])
+
+    def test_dos_incidentes_piden_lo_mismo_no_es_dato_equivocado(self):
+        rows = [fila("I-100", "5864479", "56572", datetime(2026, 10, 20, 9, 0)),
+                fila("I-200", "5864479", "56572", datetime(2026, 10, 20, 11, 0))]
+        concs = [self.conc(date(2026, 10, 20), datetime(2026, 10, 20, 17, 30),
+                           [("I-100", "5864479", "56572"), ("I-200", "5864479", "56572")])]
+        info = clasificar_lotes(rows, date(2026, 10, 19), date(2026, 10, 23), time(17, 50), concs,
+                                ahora=datetime(2026, 10, 23, 10, 0))
+        self.assertEqual([r['Error_Envio'] for r in rows], ['', ''])
+        self.assertEqual([f['error'] for f in info['semana']['filas']], ['', ''])
+        self.assertEqual(info['semana']['filas'][1]['incidente'], "I-200")
+
+    def test_resumen_por_dia(self):
+        rows = [fila("I-1", "5864479", "56572", datetime(2026, 10, 19, 10, 0)),
+                fila("I-2", "4530500", "91258", datetime(2026, 10, 19, 11, 0))]
+        concs = [self.conc(date(2026, 10, 19), datetime(2026, 10, 19, 17, 30), [("I-1", "5864479", "56572")])]
+        info = clasificar_lotes(rows, date(2026, 10, 19), date(2026, 10, 23), time(17, 50), concs,
+                                ahora=datetime(2026, 10, 23, 10, 0))
+        lunes = info['por_dia'][0]
+        self.assertEqual((lunes['dia'], lunes['debian'], lunes['a_tiempo'], lunes['no_enviadas']),
+                         (date(2026, 10, 19), 2, 1, 1))
+        self.assertEqual(len(info['por_dia']), 5)
 
 
 class TestCorteReal(unittest.TestCase):
