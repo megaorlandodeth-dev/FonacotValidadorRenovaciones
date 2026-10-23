@@ -913,18 +913,66 @@ def parse_hora_corte(text: str) -> time:
     return time(hh, mm)
 
 
+# Días inhábiles: los oficiales de la Ley Federal del Trabajo + los que se capturen en la configuración.
+# Un día en que sí salió un ticket único cuenta como hábil aunque esté en la lista.
+_INHABILES_EXTRA = set()
+_USAR_OFICIALES = True
+_HABILES_FORZADOS = set()
+
+
+def _n_lunes(year: int, month: int, n: int) -> date:
+    d = date(year, month, 1)
+    d += timedelta(days=(7 - d.weekday()) % 7)
+    return d + timedelta(weeks=n - 1)
+
+
+def feriados_oficiales(year: int) -> set:
+    """1 ene, 1er lunes de feb, 3er lunes de mar, 1 may, 16 sep, 3er lunes de nov, 25 dic."""
+    return {date(year, 1, 1), _n_lunes(year, 2, 1), _n_lunes(year, 3, 3), date(year, 5, 1),
+            date(year, 9, 16), _n_lunes(year, 11, 3), date(year, 12, 25)}
+
+
+def parse_dias_inhabiles(texto: str) -> set:
+    """'16/11/2026, 25-12-2026; 02/11' -> {date, ...} (sin año = año actual)."""
+    dias = set()
+    for tok in re.split(r'[,;\s]+', str(texto or '')):
+        d = parse_fecha_asunto(tok) if tok else None
+        if d:
+            dias.add(d)
+    return dias
+
+
+def set_dias_inhabiles(dias=(), oficiales: bool = True):
+    """Configura los días inhábiles que usan next/previous_business_day y el corte de cada día."""
+    global _USAR_OFICIALES
+    _INHABILES_EXTRA.clear()
+    _INHABILES_EXTRA.update(dias or ())
+    _USAR_OFICIALES = bool(oficiales)
+
+
+def es_inhabil(d: date) -> bool:
+    """Feriado oficial o día capturado como inhábil (no cuenta fines de semana)."""
+    return d in _INHABILES_EXTRA or (_USAR_OFICIALES and d in feriados_oficiales(d.year))
+
+
+def es_habil(d: date) -> bool:
+    if d in _HABILES_FORZADOS:
+        return True
+    return d.weekday() < 5 and not es_inhabil(d)
+
+
 def previous_business_day(d: date) -> date:
-    """Día hábil anterior (lunes -> viernes). No considera días festivos."""
+    """Día hábil anterior (lunes -> viernes; se salta fines de semana y días inhábiles)."""
     prev = d - timedelta(days=1)
-    while prev.weekday() >= 5:
+    while not es_habil(prev):
         prev -= timedelta(days=1)
     return prev
 
 
 def next_business_day(d: date) -> date:
-    """Día hábil siguiente (viernes -> lunes). No considera días festivos."""
+    """Día hábil siguiente (viernes -> lunes; se salta fines de semana y días inhábiles)."""
     nxt = d + timedelta(days=1)
-    while nxt.weekday() >= 5:
+    while not es_habil(nxt):
         nxt += timedelta(days=1)
     return nxt
 
@@ -937,7 +985,7 @@ def dia_de_lote(llegada: datetime, corte=None) -> date:
     d = llegada.date()
     if isinstance(corte, time):
         corte = datetime.combine(d, corte)
-    if d.weekday() >= 5 or (corte is not None and llegada > corte):
+    if not es_habil(d) or (corte is not None and llegada > corte):
         d = next_business_day(d)
     return d
 
@@ -947,13 +995,46 @@ def es_respuesta(asunto: str) -> bool:
     return bool(re.match(r'\s*(re|rv|fw|fwd)\s*:', asunto or '', re.I))
 
 
+def normalizar_fechas_concentrados(concentrados: list):
+    """
+    Decide de qué día es cada ticket único ('fecha_efectiva'): la fecha del asunto, salvo que sea un error evidente:
+    - fechada en el futuro (después de cuando se envió) -> el día en que se envió;
+    - fechada en un día que ya tiene su propio ticket único enviado ese mismo día, y el día del envío no tiene
+      ninguno -> era el de ese día con la fecha mal escrita.
+    Deja 'aviso_fecha' con la explicación cuando corrige.
+    """
+    originales = [c for c in concentrados if c.get('recibido') and not es_respuesta(c.get('asunto'))]
+    mismo_dia = {c['fecha_asunto'] for c in originales if c.get('fecha_asunto') == c['recibido'].date()}
+    for c in concentrados:
+        c.pop('fecha_efectiva', None)
+        c.pop('aviso_fecha', None)
+        f, rec = c.get('fecha_asunto'), c.get('recibido')
+        if not f or not rec or es_respuesta(c.get('asunto')):
+            continue
+        dia_envio = rec.date()
+        if f > dia_envio:
+            c['fecha_efectiva'] = dia_envio
+            c['aviso_fecha'] = f"el asunto dice {f:%d/%m} pero se envió el {dia_envio:%d/%m}: se tomó como del {dia_envio:%d/%m}"
+        elif f < dia_envio and f in mismo_dia and dia_envio not in mismo_dia and rec.time() >= time(6, 0):
+            c['fecha_efectiva'] = dia_envio
+            c['aviso_fecha'] = (f"el asunto dice {f:%d/%m} (que ya tiene su ticket único) pero se envió el "
+                                f"{dia_envio:%d/%m}: se tomó como del {dia_envio:%d/%m}")
+
+
 def cortes_reales(concentrados: list) -> dict:
-    """{día: hora en que salió el último ticket único original de ese día}. Ignora respuestas y reenvíos."""
-    cortes = {}
+    """
+    {día: hora en que salió el PRIMER ticket único original de ese día}. Los que salen después (complementos)
+    cuentan como evidencia de envío pero no mueven el corte. Ignora respuestas y reenvíos.
+    """
+    cortes, tardios = {}, {}
     for c in concentrados or []:
         dia, rec = _fecha_concentrado(c), c.get('recibido')
-        if dia and rec and not es_respuesta(c.get('asunto')) and rec.date() >= dia:
-            cortes[dia] = max(cortes.get(dia, rec), rec)
+        if not dia or not rec or es_respuesta(c.get('asunto')) or rec.date() < dia:
+            continue
+        destino = cortes if rec.date() == dia else tardios  # tardío: enviado pasada la medianoche o días después
+        destino[dia] = min(destino.get(dia, rec), rec)
+    for dia, rec in tardios.items():
+        cortes.setdefault(dia, rec)
     return cortes
 
 
@@ -1070,7 +1151,7 @@ def _row_match_concentrado(row: dict, concentrados: list):
     - Si la fila tiene Cliente y Crédito, solo cuenta como enviada si AMBOS aparecen en el concentrado
       (que esté el ticket no basta: un ticket con 3 renovaciones pudo enviarse con solo 2).
       Si el concentrado trae su tabla (INCIDENTE | FECHA | CLIENTE | CREDITO), se compara renglón por renglón;
-      también cuenta el mismo ticket con el mismo crédito (un dígito mal capturado en el cliente no la vuelve rezagada).
+      el mismo ticket con el mismo crédito pero OTRO cliente NO cuenta: se envió con datos equivocados.
     - Si a la fila le falta el cliente o el crédito, basta con que aparezca el ticket.
     Retorna (tipo_match, concentrado) con tipo_match en {'PAR', 'TICKET', None}.
     """
@@ -1096,8 +1177,10 @@ def _match_en_concentrado(row: dict, conc: dict):
         for f in filas:
             if cli and cred and f['cliente'] == cli and f['credito'] == cred:
                 return 'PAR'
-            if ticket and cred and f['credito'] == cred and first_digits(f['ticket']) == ticket:
+            if not cli and ticket and cred and f['credito'] == cred and first_digits(f['ticket']) == ticket:
                 return 'PAR'
+            if cli and not cred and ticket and f['cliente'] == cli and first_digits(f['ticket']) == ticket:
+                return 'PAR'  # Sin crédito: basta su ticket con su mismo cliente (no cualquier renglón del ticket)
     elif cli and cred and cli in conc['numeros'] and cred in conc['numeros']:
         return 'PAR'
     if ticket and ticket in conc['tickets']:
@@ -1105,8 +1188,31 @@ def _match_en_concentrado(row: dict, conc: dict):
     return None
 
 
+def _num(valor) -> str:
+    """Dígitos de un cliente/crédito, '' si es 'SIN CLIENTE' / 'SIN CRÉDITO'."""
+    return '' if str(valor or '').startswith('SIN') else first_digits(valor)
+
+
+def error_en_ticket_unico(row: dict, filas_del_ticket: list, incidentes_de_cliente: dict) -> str:
+    """
+    El ticket único trae el incidente de la renovación pero con otros datos: explica qué está mal
+    ("salió con Cliente 4530500 en lugar de 5864479 (ese cliente es del incidente I-361002)"). '' si no aplica.
+    """
+    cli, cred = _num(row.get('Numero_Cliente')), _num(row.get('Credito_Renovado_Hijo'))
+    propio = row.get('Numero_Ticket')
+    partes = []
+    for f in filas_del_ticket:
+        if cred and f['credito'] == cred and cli and f['cliente'] != cli:
+            otro = sorted(t for t in incidentes_de_cliente.get(f['cliente'], ()) if t != propio)
+            partes.append(f"salió con Cliente {f['cliente']} en lugar de {cli}"
+                          + (f" (ese cliente es del incidente {', '.join(otro)})" if otro else ""))
+        elif cli and f['cliente'] == cli and cred and f['credito'] != cred:
+            partes.append(f"salió con Crédito {f['credito']} en lugar de {cred}")
+    return "; ".join(partes)
+
+
 def _fecha_concentrado(c: dict):
-    return c.get('fecha_asunto') or (c['recibido'].date() if c.get('recibido') else None)
+    return c.get('fecha_efectiva') or c.get('fecha_asunto') or (c['recibido'].date() if c.get('recibido') else None)
 
 
 def _buscar_envio(row: dict, concentrados: list, llegada: datetime):
@@ -1120,7 +1226,8 @@ def _buscar_envio(row: dict, concentrados: list, llegada: datetime):
     envios, ticket_hit = [], None
     for c in concentrados:
         tipo = _match_en_concentrado(row, c)
-        if tipo == 'PAR' or (tipo == 'TICKET' and incompleta):
+        # Con tabla legible, una renovación incompleta necesita su renglón (PAR); sin tabla basta el ticket
+        if tipo == 'PAR' or (tipo == 'TICKET' and incompleta and not c.get('filas')):
             envios.append(c)
         elif tipo == 'TICKET' and ticket_hit is None:
             ticket_hit = c
@@ -1133,6 +1240,84 @@ def _buscar_envio(row: dict, concentrados: list, llegada: datetime):
     return (posteriores[0], False, ticket_hit) if posteriores else (envios[-1], True, ticket_hit)
 
 
+def concentrado_semanal(concentrados: list, rows: list, fecha_inicio: date, fecha_fin: date) -> dict:
+    """
+    Junta en una sola lista todo lo que salió en los tickets únicos desde `fecha_inicio` (incluye los posteriores al
+    periodo: ahí llegan las que se mandaron tarde). Cada renglón dice si se encontró el correo del incidente en Outlook
+    y si el mismo Cliente+Crédito salió en más de un ticket único. Ignora respuestas y reenvíos (RE:/FW:).
+    Regresa {'filas': [...], 'sin_tabla': [asuntos de concentrados sin tabla legible]}.
+    """
+    pares, por_ticket, incidentes_de_cliente = {}, {}, {}
+    for r in rows:
+        cli, cred = _num(r.get('Numero_Cliente')), _num(r.get('Credito_Renovado_Hijo'))
+        if cli and cred:
+            pares.setdefault((cli, cred), [])
+            if r['Numero_Ticket'] not in pares[(cli, cred)]:
+                pares[(cli, cred)].append(r['Numero_Ticket'])
+        if cli:
+            incidentes_de_cliente.setdefault(cli, set()).add(r['Numero_Ticket'])
+        por_ticket.setdefault(first_digits(r.get('Numero_Ticket')), []).append(r)
+
+    filas, sin_tabla, vistos = [], [], {}
+    for c in sorted(concentrados or [], key=lambda x: x.get('recibido') or datetime.min):
+        dia = _fecha_concentrado(c)
+        if not dia or dia < fecha_inicio or es_respuesta(c.get('asunto')):
+            continue
+        if not c.get('filas'):
+            sin_tabla.append(c.get('asunto', ''))
+            continue
+        for f in c['filas']:
+            solicitantes, error = pares.get((f['cliente'], f['credito']), []), ''
+            num_ticket = first_digits(f['ticket'])
+            propio = [t for t in solicitantes if first_digits(t) == num_ticket]
+            incidente = (propio or solicitantes or [''])[0]
+            if solicitantes and num_ticket and not propio:
+                error = f"este Cliente+Crédito es del incidente {', '.join(solicitantes)}, no del {f['ticket']}"
+            elif not incidente and num_ticket in por_ticket:
+                incidente = por_ticket[num_ticket][0]['Numero_Ticket']
+                for r in por_ticket[num_ticket]:
+                    error = error_en_ticket_unico(r, [f], incidentes_de_cliente)
+                    if error:
+                        break
+                error = error or f"el incidente {incidente} no tiene Cliente {f['cliente']} Crédito {f['credito']}"
+            clave = (f['cliente'], f['credito'])
+            vistos[clave] = vistos.get(clave, 0) + 1
+            filas.append({
+                'fecha': dia, 'recibido': c.get('recibido'), 'asunto': c.get('asunto', ''),
+                'ticket': f['ticket'], 'cliente': f['cliente'], 'credito': f['credito'],
+                'incidente': incidente, 'error': error, 'en_periodo': dia <= fecha_fin,
+                'duplicada': [t for t in solicitantes if t != incidente],
+            })
+    for f in filas:
+        f['veces'] = vistos[(f['cliente'], f['credito'])]
+    return {'filas': filas, 'sin_tabla': sin_tabla}
+
+
+def resumen_por_dia(rows: list, concentrados: list, fecha_inicio: date, fecha_fin: date) -> list:
+    """Por cada día entre semana del periodo: ticket(s) único(s) que salieron y cómo quedó lo que debía ir en ellos."""
+    dias, d = [], fecha_inicio
+    while d <= fecha_fin:
+        if d.weekday() < 5 or d in _HABILES_FORZADOS:
+            envios = [c for c in concentrados if _fecha_concentrado(c) == d and not es_respuesta(c.get('asunto'))]
+            suyas = [r for r in rows if r.get('Dia_Lote') == d]
+            dias.append({
+                'dia': d,
+                'habil': es_habil(d),
+                'envios': [(c['recibido'], c.get('remitente') or c.get('carpeta') or '', len(c.get('filas') or []))
+                           for c in envios if c.get('recibido')],
+                'debian': len(suyas),
+                'a_tiempo': sum(1 for r in suyas if r['Lote_Estado'] in (LOTE_ENVIADA, LOTE_EN_CONCENTRADO)
+                                and not r.get('Dias_Retraso') and not r.get('Posible_Duplicado')),
+                'tarde': sum(1 for r in suyas if r.get('Dias_Retraso')),
+                'no_enviadas': sum(1 for r in suyas if r.get('No_Enviada')),
+                'errores': sum(1 for r in suyas if r.get('Error_Envio')),
+                'sin_comprobar': sum(1 for r in suyas if r['Lote_Estado'] == LOTE_SIN_COMPROBAR),
+                'pendientes': sum(1 for r in suyas if r['Lote_Estado'] in (LOTE_HOY, LOTE_REZAGADA) and not r.get('No_Enviada')),
+            })
+        d += timedelta(days=1)
+    return dias
+
+
 def clasificar_lotes(
     rows: list,
     fecha_inicio: date,
@@ -1140,7 +1325,9 @@ def clasificar_lotes(
     hora_corte: time,
     concentrados: list = None,
     ultimo_lote: dict = None,
-    ahora: datetime = None
+    ahora: datetime = None,
+    revision: bool = None,
+    dia_lote: date = None
 ) -> dict:
     """
     Concilia cada renovación contra TODOS los correos "Ticket Único" encontrados y le asigna
@@ -1159,11 +1346,22 @@ def clasificar_lotes(
         * Llegó ayer después del envío (o en fin de semana) -> rezagada que va hoy.
         * Sin ticket único del día anterior: marca local "último lote copiado/exportado" o, sin marca, la hora habitual.
         * Días más viejos sin ticket único encontrado -> sin comprobar.
-    Con un periodo de varios días (fecha_inicio < fecha_fin) funciona como revisión de envíos.
+    Con un periodo de varios días (fecha_inicio < fecha_fin) funciona como revisión de envíos; `revision` lo fuerza.
+    `dia_lote`: arma el lote de un día pasado tal como debía salir ese día (se compara solo contra los ticket únicos
+    hasta ese día; si se mandó después, se anota).
     """
     concentrados = sorted(concentrados or [], key=lambda c: c.get('recibido') or datetime.min)
+    normalizar_fechas_concentrados(concentrados)
+    # Si salió un ticket único un día marcado como inhábil, ese día sí se trabajó
+    _HABILES_FORZADOS.clear()
+    _HABILES_FORZADOS.update(_fecha_concentrado(c) for c in concentrados
+                             if c.get('recibido') and not es_respuesta(c.get('asunto'))
+                             and c['recibido'].date() == _fecha_concentrado(c))
+    pasado = dia_lote is not None
+    if pasado:
+        ahora = datetime.combine(dia_lote, time(23, 59, 59))
     ahora = ahora or datetime.combine(fecha_fin, time(0, 0))
-    lote_actual = ahora.date() if ahora.weekday() < 5 else next_business_day(ahora.date())
+    lote_actual = ahora.date() if es_habil(ahora.date()) else next_business_day(ahora.date())
     inicio_actual = datetime.combine(lote_actual, time(0, 0))
     hoy_real = lote_actual == datetime.now().date()
     corte_fin = datetime.combine(fecha_fin, hora_corte)
@@ -1172,6 +1370,13 @@ def clasificar_lotes(
     corte_hoy = cortes.get(lote_actual)
     corte_anterior = cortes.get(dia_anterior) or datetime.combine(dia_anterior, hora_corte)
     hc = hora_corte.strftime('%H:%M')
+    if revision is None:
+        revision = fecha_inicio < fecha_fin or fecha_fin < lote_actual
+    de_hoy = f"del {lote_actual:%d/%m}" if pasado else "de hoy"
+    va_hoy = f"va el {lote_actual:%d/%m}" if pasado else "va hoy"
+    # El lote de un día pasado se compara solo contra lo enviado hasta ese día
+    posteriores = [c for c in concentrados if pasado and (_fecha_concentrado(c) or date.max) > lote_actual]
+    para_buscar = [c for c in concentrados if c not in posteriores]
 
     def corte_del(d: date):
         if d in cortes:
@@ -1206,6 +1411,13 @@ def clasificar_lotes(
     def poner(r, estado, etiqueta, resumen):
         r['Lote_Estado'], r['Lote_Etiqueta'], r['Lote_Resumen'] = estado, etiqueta, resumen
 
+    incidentes_de_cliente, incidentes_del_par = {}, {}
+    for r in rows:
+        if _num(r.get('Numero_Cliente')):
+            incidentes_de_cliente.setdefault(_num(r.get('Numero_Cliente')), set()).add(r.get('Numero_Ticket'))
+            incidentes_del_par.setdefault((_num(r.get('Numero_Cliente')), _num(r.get('Credito_Renovado_Hijo'))),
+                                          set()).add(first_digits(r.get('Numero_Ticket')))
+
     ultima_considerada = None
     for r in rows:
         llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
@@ -1213,19 +1425,41 @@ def clasificar_lotes(
         dia = dia_de_lote(llegada, corte_del(llegada.date()))
         r['Enviado_En'], r['Enviado_Fecha'], r['Dias_Retraso'], r['No_Enviada'] = '', None, 0, False
         r['Falta_Hoy'] = False
+        r['Error_Envio'] = ''
+        r['Posible_Duplicado'] = False
+        r['Enviado_Despues'] = None
 
-        conc, antes, ticket_hit = _buscar_envio(r, concentrados, llegada)
+        conc, antes, ticket_hit = _buscar_envio(r, para_buscar, llegada)
         junto_al_envio = None
         if not conc and dia == llegada.date() and dia in cortes and llegada > cortes[dia] - MARGEN_ENVIO:
             # Llegó mientras se armaba el ticket único: no es un olvido, le toca el siguiente
             junto_al_envio = cortes[dia]
             dia = next_business_day(dia)
         r['Dia_Lote'] = dia
+        r['En_Periodo'] = fecha_inicio <= dia <= fecha_fin
         if conc:
             f_env = _fecha_concentrado(conc)
             r['Enviado_En'], r['Enviado_Fecha'] = conc['asunto'], f_env
+            # Cliente+Crédito correctos pero con el número de otro incidente
+            propio = first_digits(r.get('Numero_Ticket'))
+            par = (_num(r.get('Numero_Cliente')), _num(r.get('Credito_Renovado_Hijo')))
+            # Otro folio que pide lo mismo (solicitud duplicada) no es un error del ticket único
+            ajenos = sorted({f['ticket'] for f in conc.get('filas') or []
+                             if (f['cliente'], f['credito']) == par and f.get('ticket')
+                             and first_digits(f['ticket']) not in incidentes_del_par.get(par, {propio})})
+            if ajenos and not any(first_digits(f['ticket']) == propio for f in conc.get('filas') or []
+                                  if f['credito'] == _num(r.get('Credito_Renovado_Hijo'))):
+                r['Error_Envio'] = f"salió con el incidente {', '.join(ajenos)} en lugar de {r.get('Numero_Ticket')}"
+            if antes:
+                # Ya había salido antes de que llegara: solicitud repetida, no entra al lote ni se da por validada
+                r['Posible_Duplicado'] = True
+                poner(r, LOTE_ENVIADA,
+                      f"📨 Ya se había enviado en {asunto(conc)} del {f_env:%d/%m}, antes de que llegara este ticket "
+                      f"(posible solicitud duplicada)",
+                      f"Ya enviada antes ({f_env:%d/%m})  ·  posible duplicado")
+                continue
             if llegada >= inicio_actual:
-                poner(r, LOTE_EN_CONCENTRADO, f"📨 Ya en {asunto(conc)}", "Ya en el ticket único de hoy")
+                poner(r, LOTE_EN_CONCENTRADO, f"📨 Ya en {asunto(conc)}", f"Ya en el ticket único {de_hoy}")
                 continue
             if antes:
                 poner(r, LOTE_ENVIADA,
@@ -1246,32 +1480,39 @@ def clasificar_lotes(
         # No viene en ningún ticket único
         motivo_ticket = ''
         if ticket_hit:
-            motivo_ticket = "el ticket está en el concentrado pero NO este Cliente+Crédito"
             en_conc = _concentrado_filas_del_ticket(ticket_hit, first_digits(r.get('Numero_Ticket')))
-            if en_conc:
-                motivo_ticket += "; ahí viene " + ", ".join(f"Cliente {f['cliente']} Crédito {f['credito']}" for f in en_conc)
+            r['Error_Envio'] = error_en_ticket_unico(r, en_conc, incidentes_de_cliente)
+            if r['Error_Envio']:
+                motivo_ticket = (f"DATOS EQUIVOCADOS en el ticket único del {_fecha_concentrado(ticket_hit):%d/%m}: "
+                                 f"{r['Error_Envio']}")
+            else:
+                motivo_ticket = "el ticket está en el concentrado pero NO este Cliente+Crédito"
+                if en_conc:
+                    motivo_ticket += "; ahí viene " + ", ".join(f"Cliente {f['cliente']} Crédito {f['credito']}" for f in en_conc)
+        equivocada = "datos equivocados  ·  " if r['Error_Envio'] else ""
 
         if dia > lote_actual:
             if junto_al_envio:
                 poner(r, LOTE_SIGUIENTE,
-                      f"➡️ Llegó a las {llegada:%H:%M}, mientras se enviaba el ticket único de hoy ({junto_al_envio:%H:%M}); "
+                      f"➡️ Llegó a las {llegada:%H:%M}, mientras se enviaba el ticket único {de_hoy} ({junto_al_envio:%H:%M}); "
                       f"va al lote del {dia:%d/%m}",
                       f"Llegó junto al envío  ·  va el {dia:%d/%m}")
             elif corte_hoy and llegada.date() == lote_actual:
                 poner(r, LOTE_SIGUIENTE,
-                      f"➡️ Llegó después del ticket único de hoy ({corte_hoy:%H:%M}); va al lote del {dia:%d/%m}",
+                      f"➡️ Llegó después del ticket único {de_hoy} ({corte_hoy:%H:%M}); va al lote del {dia:%d/%m}",
                       f"Después del envío  ·  va el {dia:%d/%m}")
             else:
                 poner(r, LOTE_SIGUIENTE, f"➡️ Va al lote del {dia:%d/%m}", f"Va el {dia:%d/%m}")
         elif llegada >= inicio_actual:
-            texto = "Lote de hoy" if hoy_real or lote_actual == fecha_fin else f"Lote del {lote_actual:%d/%m}"
+            texto = "Lote de hoy" if not pasado and (hoy_real or lote_actual == fecha_fin) else f"Lote del {lote_actual:%d/%m}"
             if corte_hoy:
                 # El ticket único de hoy ya salió y no la trae (llegó bastante antes del envío)
                 r['Falta_Hoy'] = True
+                detalle = motivo_ticket or f"llegó a las {llegada:%H:%M}"
                 poner(r, LOTE_HOY,
                       f"⚠️ {texto}: falta en el ticket único que salió a las {corte_hoy:%H:%M} "
-                      f"(llegó a las {llegada:%H:%M}; agrégala o mándala en el siguiente)",
-                      f"{texto}  ·  falta en el de las {corte_hoy:%H:%M}")
+                      f"({detalle}; agrégala o mándala en el siguiente)",
+                      f"{texto}  ·  {equivocada or 'falta '}en el de las {corte_hoy:%H:%M}")
             else:
                 poner(r, LOTE_HOY, f"🟢 {texto}", texto)
         elif dia == lote_actual:
@@ -1282,11 +1523,12 @@ def clasificar_lotes(
                     ultima_considerada = r
                 continue
             if motivo_ticket:
-                motivo, corto = motivo_ticket, "otros datos en el concentrado"
+                motivo, corto = motivo_ticket, ("datos equivocados en el ticket único" if r['Error_Envio']
+                                                else "otros datos en el concentrado")
             elif junto_al_envio:
                 motivo, corto = f"llegó mientras se enviaba el ticket único ({junto_al_envio:%H:%M})", "llegó junto al envío"
-            elif llegada.weekday() >= 5:
-                motivo, corto = "llegó en fin de semana", "fin de semana"
+            elif not es_habil(llegada.date()):
+                motivo, corto = ("llegó en fin de semana" if llegada.weekday() >= 5 else "llegó en día inhábil"), "día inhábil"
             elif llegada.date() in cortes:
                 motivo, corto = f"llegó después del envío del ticket único ({cortes[llegada.date()]:%H:%M})", "después del envío"
             elif metodo == 'concentrado':
@@ -1307,11 +1549,11 @@ def clasificar_lotes(
                 cuando = f" el {f_c:%d/%m}" if f_c else ""
                 poner(r, LOTE_CERRADA_SIN_ENVIO,
                       f"❌ NO SE ENVIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}) y el incidente ya se cerró{cuando}",
-                      f"NO ENVIADA ({dia:%d/%m})  ·  cerrado{cuando}")
+                      f"NO ENVIADA ({dia:%d/%m})  ·  {equivocada}cerrado{cuando}")
             else:
                 poner(r, LOTE_REZAGADA,
-                      f"❌ NO SE ENVIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}); se suma al lote de hoy",
-                      f"NO ENVIADA ({dia:%d/%m})  ·  va hoy")
+                      f"❌ NO SE ENVIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}); se suma al lote {de_hoy}",
+                      f"NO ENVIADA ({dia:%d/%m})  ·  {equivocada}{va_hoy}")
         elif dia == dia_anterior and metodo == 'marca':
             if llegada <= marca:
                 poner(r, LOTE_ENVIADA, f"📨 Enviada (antes de la marca {marca:%d/%m %H:%M})", "Enviada (marca local)")
@@ -1321,20 +1563,38 @@ def clasificar_lotes(
                 poner(r, LOTE_REZAGADA, f"⏰ Rezagada {llegada:%d/%m %H:%M} (después de la última marca)",
                       f"Rezagada {llegada:%d/%m %H:%M}  ·  después de la marca")
         elif dia == dia_anterior:
-            poner(r, LOTE_ENVIADA, f"📨 Enviada (llegó antes de las {hc}, hora habitual; no se encontró el ticket único del {dia:%d/%m})",
-                  f"Enviada {dia:%d/%m} (sin concentrado)")
-            if ultima_considerada is None or llegada > ultima_considerada['Fecha_Llegada_DT']:
-                ultima_considerada = r
+            poner(r, LOTE_SIN_COMPROBAR,
+                  f"❔ Sin comprobar: no se encontró el ticket único del {dia:%d/%m} (llegó antes de las {hc}); "
+                  f"no hay prueba de que saliera. Revísalo o usa «Restaurar» para sumarla al lote",
+                  f"Sin comprobar ({dia:%d/%m})  ·  sin ticket único")
         else:
             poner(r, LOTE_SIN_COMPROBAR,
                   f"❔ Sin comprobar: no se encontró el ticket único del {dia:%d/%m} y no viene en ningún otro",
                   f"Sin comprobar ({dia:%d/%m})")
 
-    conteos = {}
+    # El ticket único del lote ya salió: las rezagadas que no trae también le faltan
+    if corte_hoy and not revision:
+        for r in rows:
+            if r['Lote_Estado'] == LOTE_REZAGADA and not r['Falta_Hoy']:
+                r['Falta_Hoy'] = True
+                r['Lote_Etiqueta'] += f" — tampoco viene en el ticket único {de_hoy} ({corte_hoy:%H:%M})"
+                r['Lote_Resumen'] += f"  ·  falta en el de las {corte_hoy:%H:%M}"
+
+    # Lote de un día pasado: lo que no salió ese día pero sí después se anota (no deja de ser un faltante de ese día)
     for r in rows:
-        conteos[r['Lote_Estado']] = conteos.get(r['Lote_Estado'], 0) + 1
+        if posteriores and r['Lote_Estado'] not in (LOTE_ENVIADA, LOTE_EN_CONCENTRADO, LOTE_SIGUIENTE):
+            post, _, _ = _buscar_envio(r, posteriores, r['Fecha_Llegada_DT'])
+            if post:
+                r['Enviado_Despues'] = _fecha_concentrado(post)
+                r['Lote_Etiqueta'] += f" — se mandó después, en el ticket único del {r['Enviado_Despues']:%d/%m}"
+                r['Lote_Resumen'] += f"  ·  salió el {r['Enviado_Despues']:%d/%m}"
 
     conc_ref = max(conc_previos, key=lambda c: c.get('recibido') or datetime.min) if conc_previos else None
+    # En una revisión solo cuenta lo que debía ir en algún ticket único del periodo (no lo de la semana anterior)
+    base = [r for r in rows if r['En_Periodo']] if revision else rows
+    conteos = {}
+    for r in base:
+        conteos[r['Lote_Estado']] = conteos.get(r['Lote_Estado'], 0) + 1
     return {
         'metodo': metodo,
         'dia_anterior': dia_anterior,
@@ -1347,7 +1607,11 @@ def clasificar_lotes(
         'fecha_inicio': fecha_inicio,
         'fecha_fin': fecha_fin,
         'lote_actual': lote_actual,
-        'revision': fecha_inicio < fecha_fin or fecha_fin < lote_actual,
+        'pasado': pasado,
+        'revision': revision,
+        'semana': concentrado_semanal(concentrados, rows, fecha_inicio, fecha_fin),
+        'en_periodo': sum(1 for r in rows if r['En_Periodo']),
+        'enviadas': sum(1 for r in base if r['Lote_Estado'] in (LOTE_ENVIADA, LOTE_EN_CONCENTRADO)),
         'concentrados': concentrados,
         'concentrado_previo': conc_ref,
         'marca': marca,
@@ -1360,10 +1624,14 @@ def clasificar_lotes(
             } if ultima_considerada else None
         ),
         'conteos': conteos,
-        'tarde': sum(1 for r in rows if r.get('Dias_Retraso')),
-        'no_enviadas': sum(1 for r in rows if r.get('No_Enviada')),
-        'cerradas_sin_envio': conteos.get(LOTE_CERRADA_SIN_ENVIO, 0),
-        'sin_comprobar': conteos.get(LOTE_SIN_COMPROBAR, 0),
+        'tarde': sum(1 for r in base if r.get('Dias_Retraso')),
+        'no_enviadas': sum(1 for r in base if r.get('No_Enviada')),
+        'errores_envio': sum(1 for r in base if r.get('Error_Envio')),
+        'duplicadas': sum(1 for r in base if r.get('Posible_Duplicado')),
+        'por_dia': resumen_por_dia(base, concentrados, fecha_inicio, min(fecha_fin, lote_actual)) if revision else [],
+        'avisos_fecha': [f"«{c['asunto']}»: {c['aviso_fecha']}" for c in concentrados if c.get('aviso_fecha')],
+        'cerradas_sin_envio': sum(1 for r in base if r['Lote_Estado'] == LOTE_CERRADA_SIN_ENVIO),
+        'sin_comprobar': sum(1 for r in base if r['Lote_Estado'] == LOTE_SIN_COMPROBAR),
     }
 
 
