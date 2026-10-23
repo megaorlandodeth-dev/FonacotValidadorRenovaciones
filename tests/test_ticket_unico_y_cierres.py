@@ -101,12 +101,15 @@ class TestConcentradoReal(unittest.TestCase):
         r = fila("I-362386", "3499810", "89651", datetime(2026, 10, 22, 14, 53))
         clasificar_lotes([r], date(2026, 10, 23), date(2026, 10, 23), time(17, 50), [concentrado()])
         self.assertEqual(r['Lote_Estado'], LOTE_REZAGADA)
-        self.assertIn("Cliente 3499810 Crédito 89615", r['Lote_Etiqueta'])
+        self.assertIn("salió con Crédito 89615 en lugar de 89651", r['Lote_Etiqueta'])
 
-    def test_mismo_ticket_y_credito_con_cliente_mal_capturado(self):
+    def test_mismo_ticket_y_credito_con_otro_cliente_es_error(self):
+        # Antes se toleraba como "dígito mal capturado"; ahora se marca: el ticket único salió con otro cliente
         r = fila("I-362277", "4826406", "82508", datetime(2026, 10, 22, 9, 0))
         clasificar_lotes([r], date(2026, 10, 23), date(2026, 10, 23), time(17, 50), [concentrado()])
-        self.assertEqual(r['Lote_Estado'], LOTE_ENVIADA)
+        self.assertEqual(r['Lote_Estado'], LOTE_REZAGADA)
+        self.assertEqual(r['Error_Envio'], "salió con Cliente 4826460 en lugar de 4826406")
+        self.assertIn("datos equivocados", r['Lote_Resumen'])
 
     def test_intro_reutilizable(self):
         intro = extract_concentrado_intro(CONCENTRADO_PLAIN)

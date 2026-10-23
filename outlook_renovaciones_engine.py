@@ -46,6 +46,9 @@ from core_renovaciones import (
     RenovacionTicketParser
 )
 
+# Días hábiles hacia atrás que revisa el lote del día (lo no enviado sigue apareciendo una semana)
+DIAS_ATRAS_LOTE = 5
+
 
 class FonacotRenovacionesEngine:
     """Motor principal para validación y concentrado diario de cancelaciones de renovación."""
@@ -977,15 +980,22 @@ class FonacotRenovacionesEngine:
 
     @staticmethod
     def _attachments_text(msg) -> str:
-        """Texto de los adjuntos Excel/CSV del concentrado (a veces la relación viene en un .xlsx)."""
-        chunks = []
+        return FonacotRenovacionesEngine._attachments_content(msg)[0]
+
+    @staticmethod
+    def _attachments_content(msg) -> tuple:
+        """
+        (texto, html) de los adjuntos Excel/CSV del concentrado (a veces la relación viene en un .xlsx).
+        El html trae cada hoja como tabla para leerla renglón por renglón igual que la tabla del correo.
+        """
+        chunks, tablas = [], []
         try:
             attachments = msg.Attachments
             count = attachments.Count
         except Exception:
-            return ""
+            return "", ""
         if not count:
-            return ""
+            return "", ""
         tmp_dir = tempfile.mkdtemp(prefix="fonacot_conc_")
         try:
             for i in range(1, count + 1):
@@ -1000,15 +1010,21 @@ class FonacotRenovacionesEngine:
                     if ext in ('.csv', '.txt'):
                         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                             chunks.append(f.read())
+                        try:
+                            df = pd.read_csv(path, header=None, dtype=str, sep=None, engine='python', encoding_errors='ignore')
+                            tablas.append(df.fillna('').to_html(header=False, index=False))
+                        except Exception:
+                            pass
                     else:
                         sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
                         for df in sheets.values():
                             chunks.append(df.fillna('').to_csv(sep=' ', index=False, header=False))
+                            tablas.append(df.fillna('').to_html(header=False, index=False))
                 except Exception:
                     continue
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        return "\n".join(chunks)
+        return "\n".join(chunks), "\n".join(tablas)
 
     def find_concentrado_emails(
         self,
@@ -1073,9 +1089,11 @@ class FonacotRenovacionesEngine:
                         continue
 
                     # El mismo correo puede estar en Enviados y en la Bandeja de varios compañeros
-                    dedup_key = (normalize_text(subject), rec.strftime('%Y%m%d%H%M'))
-                    if dedup_key in found:
+                    # (con uno o dos minutos de diferencia): mismo asunto a menos de 5 min = mismo correo
+                    asunto_norm = normalize_text(subject)
+                    if any(k[0] == asunto_norm and abs((k[1] - rec).total_seconds()) <= 300 for k in found):
                         continue
+                    dedup_key = (asunto_norm, rec)
 
                     body = str(getattr(msg, 'Body', '') or '')
                     try:
@@ -1083,9 +1101,15 @@ class FonacotRenovacionesEngine:
                         html_txt = make_soup(html).get_text(" ", strip=True) if html else ""
                     except Exception:
                         html_txt = ""
-                    full_text = f"{body}\n{html_txt}\n{self._attachments_text(msg)}"
+                    adj_texto, adj_html = self._attachments_content(msg)
+                    full_text = f"{body}\n{html_txt}\n{adj_texto}"
                     tickets, numeros = extract_concentrado_tokens(full_text)
-                    filas = extract_concentrado_rows(html)
+                    filas, vistas = [], set()
+                    for f in extract_concentrado_rows(html) + extract_concentrado_rows(adj_html):
+                        clave = (f['ticket'], f['cliente'], f['credito'])
+                        if clave not in vistas:  # la misma relación en el cuerpo y en el adjunto
+                            vistas.add(clave)
+                            filas.append(f)
                     tickets.update(f['ticket'].split('-', 1)[-1] for f in filas if f['ticket'])
 
                     found[dedup_key] = {
@@ -1115,7 +1139,9 @@ class FonacotRenovacionesEngine:
         aplicar_corte: bool = True,
         hora_corte: str = HORA_CORTE_DEFAULT,
         asunto_concentrado: str = ASUNTO_CONCENTRADO_DEFAULT,
-        ultimo_lote: dict = None
+        ultimo_lote: dict = None,
+        revision: bool = None,
+        dias_atras: int = DIAS_ATRAS_LOTE
     ) -> list:
         """
         Envoltorio compatible con la GUI principal.
@@ -1138,7 +1164,12 @@ class FonacotRenovacionesEngine:
 
         scan_start = start_dt
         if aplicar_corte:
-            scan_start = datetime.combine(previous_business_day(start_dt.date()), datetime.min.time())
+            # Lote del día: se revisan varios días hábiles atrás para que lo que no se envió no se pierda después de
+            # un día. Revisión: basta el día anterior al periodo (por lo que llegó tras el corte)
+            dia = start_dt.date()
+            for _ in range(1 if revision else max(1, int(dias_atras))):
+                dia = previous_business_day(dia)
+            scan_start = datetime.combine(dia, datetime.min.time())
 
         self.lote_info = None
         rows, _summary = self.search_and_validate_renewals(
@@ -1165,6 +1196,8 @@ class FonacotRenovacionesEngine:
                 asunto_concentrado,
                 progress_callback=(lambda m: progress_callback(m, 0.97)) if progress_callback else None
             )
+            # Lote del día de una fecha pasada: se arma como debía salir ese día
+            dia_lote = end_dt.date() if revision is False and end_dt.date() < datetime.now().date() else None
             self.lote_info = clasificar_lotes(
                 rows,
                 fecha_inicio=start_dt.date(),
@@ -1172,7 +1205,9 @@ class FonacotRenovacionesEngine:
                 hora_corte=parse_hora_corte(hora_corte),
                 concentrados=concentrados,
                 ultimo_lote=ultimo_lote,
-                ahora=datetime.now()
+                ahora=datetime.now(),
+                revision=revision,
+                dia_lote=dia_lote
             )
         return rows
 

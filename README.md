@@ -53,7 +53,7 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
    - Orden natural por columna (folios, fechas y números ordenan como número), colores suaves por estado y mensaje cuando la tabla está vacía.
 
 7. **Formato real del "Ticket Único" (v2.2):**
-   - Detecta el correo *"Cancelación de renovaciones – ticket único 22-10-2026"* y lee su tabla **INCIDENTE | FECHA | CLIENTE | CREDITO (HIJO)** renglón por renglón (incluye créditos cortos como `681`). Cuenta como enviada si coincide Cliente + Crédito, o el mismo ticket con el mismo crédito.
+   - Detecta el correo *"Cancelación de renovaciones – ticket único 22-10-2026"* y lee su tabla **INCIDENTE | FECHA | CLIENTE | CREDITO (HIJO)** renglón por renglón (incluye créditos cortos como `681`). Cuenta como enviada solo si coincide **Cliente + Crédito** (si al incidente le falta el cliente, basta el mismo ticket con el mismo crédito). Si el ticket único trae el incidente con otro cliente o crédito, se marca como **datos equivocados** (ver punto 11).
    - Si el ticket sí viene en el concentrado pero con otros datos, la rezagada lo dice: *"ahí viene Cliente X Crédito Y"*.
    - **Crear correo** arma el borrador con ese mismo formato: asunto `Cancelación de renovaciones – ticket único dd-mm-aaaa`, el saludo *Se envía "N" solicitudes…* y el texto *FAVOR DE BLOQUEAR…* copiados del último concentrado, y la tabla con el incidente ligado a iTop. *Copiar lote* copia esa misma tabla.
 
@@ -75,11 +75,32 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
      - con el incidente **abierto** → *NO ENVIADA (30/09) · va hoy*, se suma al lote de hoy;
      - con el incidente **cerrado** en iTop → *NO ENVIADA (30/09) · cerrado el 01/10*, en rojo y fuera del lote (*Restaurar* la mete);
      - si de ese día no se encontró ticket único → *Sin comprobar*.
-   - Para revisar varios días elige el periodo (*Del / Al*) o usa **7 días**. El título cambia a *Revisión de envíos del dd/mm al dd/mm/aaaa* con el resumen (enviadas, tarde, no enviadas, sin comprobar).
+   - Para revisar varios días usa **Revisión semanal** (punto 11) o elige el periodo (*Del / Al*). El título cambia a *Revisión de envíos del dd/mm al dd/mm/aaaa* con el resumen (enviadas, tarde, no enviadas, sin comprobar).
    - **Aviso rojo** clicable con las no enviadas, y vistas *Otras vistas → No enviadas en su día / Enviadas tarde / Sin comprobar*. El detalle del ticket dice en rojo en qué ticket único debía ir.
    - El Excel agrega la hoja **5_Revision_de_Envios** (resultado, día que debía ir, en qué ticket único salió, días de retraso y cierre en iTop).
 
-11. **Funciones nuevas:**
+11. **Lote del día o revisión semanal (v2.4):**
+   - Arriba del panel lateral, **¿Qué quieres revisar?**: *Lote del día* o *Revisión semanal*. Se elige el modo, ya no depende de las fechas.
+   - **Lote del día para cualquier fecha:** con *Lote del día* elige el día en *Del* o *Al* (las dos fechas se mueven juntas). Si es un día pasado, la app arma el lote **como debía salir ese día**: lo compara solo contra el ticket único de ese día, marca *falta en el de las hh:mm* lo que no venía y anota *salió el dd/mm* si se mandó después. *Hoy* regresa al lote de hoy.
+   - **Revisión semanal** (*Esta semana* / *Semana pasada*): revisa de lunes a viernes, abre directo la vista *No enviadas en su día* y cuenta solo lo que debía salir esa semana (lo de la semana anterior que se escaneó para las rezagadas no se suma).
+   - **Pestaña «Tickets únicos»:** junta en una sola lista todo lo que salió en los tickets únicos del periodo (y los posteriores, donde llegan las que se mandaron tarde) y revisa cada renglón contra los incidentes de Outlook: *Bien*, **DATOS EQUIVOCADOS**, *no se encontró el correo del incidente*, *repetida en N tickets únicos*. Doble clic abre el incidente en iTop.
+   - **Datos equivocados en el ticket único:** si el ticket único trae un incidente con el cliente de otro incidente (o con otro crédito), esa renovación **no cuenta como enviada**: sale en rojo *NO ENVIADA · datos equivocados* con el detalle (*salió con Cliente 5864479 en lugar de 4530500 (ese cliente es del incidente I-361001)*). Si Cliente + Crédito están bien pero con el folio de otro incidente, cuenta como enviada pero se marca el error. Vista *Otras vistas → Datos equivocados en el ticket único* y aviso rojo.
+   - El Excel agrega la hoja **6_Enviado_en_Tickets_Unicos** y la columna *Datos equivocados en el ticket único* en la hoja 5.
+   - **Pestaña «Por día»** (en la revisión): un renglón por día hábil con el ticket único que salió (hora, quién, renglones) y cuántas debían ir, a tiempo, tarde, NO enviadas, datos equivocados, sin comprobar y pendientes. Rojo = faltó algo, ámbar = día sin ticket único encontrado. Doble clic en un día abre su *Lote del día* tal como debía salir. El encabezado avisa los *Días sin ticket único encontrado*.
+
+**Mejoras de la auditoría (v2.4):**
+   - **Días festivos:** los feriados oficiales (1 ene, 1er lunes de feb, 3er lunes de mar, 1 may, 16 sep, 3er lunes de nov, 25 dic) y los que captures en *Días inhábiles* (`02/11/2026, 12/12/2026`) no cuentan como día hábil: lo que llega en festivo va al siguiente día hábil. Si ese día sí salió un ticket único, se toma como día trabajado.
+   - **Sin comprobar en vez de dar por enviada:** si no se encontró el ticket único de un día, sus renovaciones ya no se dan por enviadas; salen como *Sin comprobar* para que las revises.
+   - **Fecha del asunto corregida:** si el asunto trae una fecha futura o la de un día que ya tenía su ticket único (p. ej. el del 22 dice "21-10"), se toma el día en que se envió y se avisa *Fecha corregida*.
+   - **Lo no enviado no se pierde:** el lote del día revisa 5 días hábiles hacia atrás (`dias_atras_lote`), así una renovación que no salió sigue apareciendo hasta que se envíe.
+   - **Rezagadas que tampoco vinieron:** si el ticket único del día ya salió y no trae una rezagada, también se marca *falta en el de las hh:mm* y cuenta en *faltaron*.
+   - **Adjuntos:** si la relación del ticket único viene en un Excel/CSV adjunto, se lee renglón por renglón igual que la tabla del correo.
+   - **Copias del mismo correo** (Enviados y Bandeja de varios compañeros, con uno o dos minutos de diferencia) cuentan una sola vez.
+   - **Solicitudes duplicadas:** si una renovación ya había salido en otro ticket único antes de que llegara el incidente, se avisa *posible duplicado*; dos incidentes que piden lo mismo no se marcan como datos equivocados.
+   - **El rojo gana:** una renovación que no se envió o salió mal se ve en rojo aunque la hayas validado antes.
+   - La marca *última considerada* solo la deja el lote de hoy al copiarlo o crear el correo (no el Excel, ni una revisión, ni un lote pasado).
+
+12. **Funciones nuevas:**
    - **Validaciones guardadas:** las validaciones, descartes y filas incluidas a mano se guardan en disco (`%USERPROFILE%\.fonacot_validador_renovaciones_estado.json`, 30 días). No se pierden al volver a escanear ni al cerrar la app.
    - **Actualización automática** cada 5/10/15/30/60 min: vuelve a escanear Outlook, conserva tus marcas y avisa las renovaciones nuevas (filtro *Nuevas*).
    - **Crear correo Ticket Único:** abre en Outlook un borrador (no lo envía) con el formato del ticket único (punto 7), destinatarios configurables, conservando tu firma. Antes avisa si hay renovaciones pendientes o tickets ya cerrados en iTop. Así el siguiente día la app encuentra ese concentrado.
@@ -121,7 +142,9 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 
 Se guarda en `%USERPROFILE%\.fonacot_validador_renovaciones_config.json`. Además de lo que se captura en pantalla:
 - `itop_url_template`: para otro servidor de iTop, p. ej. `https://servidor/pages/UI.php?operation=details&class={clase}&id={id}` (admite `{id}`, `{ref}`, `{clase}`). Vacío = servidor de FONACOT.
-- `ultimo_lote`: marca de la última renovación considerada (se actualiza al copiar/exportar el lote).
+- `ultimo_lote`: marca de la última renovación considerada (se actualiza al copiar el lote o crear el correo de hoy).
+- `dias_inhabiles` / `feriados_oficiales`: días inhábiles capturados en pantalla y si se suman los feriados oficiales.
+- `dias_atras_lote`: días hábiles hacia atrás que revisa el lote del día (5 por omisión).
 - `columnas_ocultas` y `vista`: columnas y zonas de la pantalla elegidas en *Vista*.
 - `texto_correo`: texto fijo del correo del ticket único (admite `{total}`). Vacío = usar el aprendido.
 - `texto_correo_aprendido`: saludo y avisos copiados del último concentrado encontrado (se actualiza solo).

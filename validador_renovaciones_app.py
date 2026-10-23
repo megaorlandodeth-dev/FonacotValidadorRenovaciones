@@ -12,12 +12,14 @@ import customtkinter as ctk
 from tkcalendar import DateEntry
 import pandas as pd
 
-from outlook_renovaciones_engine import OutlookRenovacionesEngine
+from outlook_renovaciones_engine import OutlookRenovacionesEngine, DIAS_ATRAS_LOTE
 from core_renovaciones import (
     build_itop_url,
     build_itop_search_url,
     parse_hora_corte,
     previous_business_day,
+    parse_dias_inhabiles,
+    set_dias_inhabiles,
     HORA_CORTE_DEFAULT,
     ASUNTO_CONCENTRADO_DEFAULT,
     LOTE_REZAGADA,
@@ -41,7 +43,7 @@ from lote_utils import (
 )
 
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"),
@@ -98,13 +100,15 @@ FILTRO_CERRADAS = "Cerradas en iTop"
 FILTRO_NO_ENVIADAS = "No enviadas en su día"
 FILTRO_TARDE = "Enviadas tarde"
 FILTRO_SIN_COMPROBAR = "Sin comprobar"
+FILTRO_ERRORES = "Datos equivocados en el ticket único"
 OTRAS_VISTAS = "Otras vistas"
 
 FILTROS_PRINCIPALES = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_MULTIPLES, FILTRO_REZAGADAS, FILTRO_NUEVAS]
-FILTROS_SECUNDARIOS = [FILTRO_NO_ENVIADAS, FILTRO_TARDE, FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS,
+FILTROS_SECUNDARIOS = [FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_TARDE, FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS,
                        FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_PAPELERA]
 # Vistas que muestran filas aunque estén fuera del lote de hoy (revisión de envíos)
-FILTROS_REVISION = (FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_NO_ENVIADAS, FILTRO_TARDE, FILTRO_SIN_COMPROBAR)
+FILTROS_REVISION = (FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_TARDE, FILTRO_SIN_COMPROBAR)
+TIPOS_REVISION = ("Lote del día", "Revisión semanal")
 
 MODOS = {"CONCENTRADO": "Concentrado", "AGENTE": "Por compañero"}
 
@@ -398,6 +402,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "aplicar_corte": True,
             "hora_corte": HORA_CORTE_DEFAULT,
             "asunto_concentrado": ASUNTO_CONCENTRADO_DEFAULT,
+            # Días inhábiles además de los feriados oficiales ("02/11/2026, 12/12/2026")
+            "dias_inhabiles": "",
+            "feriados_oficiales": True,
+            # Días hábiles hacia atrás que revisa el lote del día para no perder lo que no se envió
+            "dias_atras_lote": DIAS_ATRAS_LOTE,
             # Correo del lote ("Crear correo Ticket Único"); {fecha} se reemplaza por dd/mm/aaaa
             "asunto_borrador": ASUNTO_BORRADOR_DEFAULT,
             "correo_para": "",
@@ -437,6 +446,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "aplicar_corte": bool(self.var_aplicar_corte.get()),
                 "hora_corte": parse_hora_corte(self.ent_hora_corte.get()).strftime("%H:%M"),
                 "asunto_concentrado": self.ent_asunto_conc.get().strip() or ASUNTO_CONCENTRADO_DEFAULT,
+                "dias_inhabiles": self.ent_inhabiles.get().strip(),
+                "feriados_oficiales": bool(self.var_oficiales.get()),
                 "asunto_borrador": self.ent_asunto_borrador.get().strip() or ASUNTO_BORRADOR_DEFAULT,
                 "correo_para": self.ent_correo_para.get().strip(),
                 "correo_cc": self.ent_correo_cc.get().strip(),
@@ -603,8 +614,25 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         side.grid(row=1, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
         self.sidebar_config = side
 
+        # Qué se revisa: el lote de hoy o los envíos de una semana
+        sec = self._section(side, "¿Qué quieres revisar?", first=True)
+        self.seg_tipo = ctk.CTkSegmentedButton(sec, values=list(TIPOS_REVISION), font=F(12), height=32,
+                                               command=self._on_tipo_revision)
+        self.seg_tipo.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.seg_tipo.set(TIPOS_REVISION[0])
+        semanas = ctk.CTkFrame(sec, fg_color="transparent")
+        semanas.grid(row=1, column=0, columnspan=2, pady=(6, 0), sticky="w")
+        for txt, atras in (("Esta semana", 0), ("Semana pasada", 1)):
+            self._btn(semanas, txt, lambda a=atras: self._revisar_semana(a), "link", height=26).pack(
+                side="left", padx=(0, 4), ipadx=2)
+        ctk.CTkLabel(
+            sec, text="La revisión semanal junta todo lo que salió en los tickets únicos de la semana y te dice "
+                      "qué renovaciones no se mandaron o salieron con datos equivocados.",
+            font=F(11), text_color=COL["faint"], justify="left", anchor="w", wraplength=250
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         # Modo
-        sec = self._section(side, "Modo de validación", first=True)
+        sec = self._section(side, "Modo de validación")
         self.var_modo = tk.StringVar(value=self.config_data.get("modo_operacion", "CONCENTRADO"))
         self.seg_modo = ctk.CTkSegmentedButton(
             sec, values=list(MODOS.values()), font=F(12), height=32, command=self._on_modo_seg
@@ -639,13 +667,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.cal_start.grid(row=1, column=0, sticky="ew", padx=(0, 6), ipady=3)
         self.cal_end = DateEntry(sec, **cal_opts)
         self.cal_end.grid(row=1, column=1, sticky="ew", padx=(6, 0), ipady=3)
+        self.cal_start.bind("<<DateEntrySelected>>", lambda e: self._sincronizar_fechas(self.cal_start, self.cal_end))
+        self.cal_end.bind("<<DateEntrySelected>>", lambda e: self._sincronizar_fechas(self.cal_end, self.cal_start))
         quick = ctk.CTkFrame(sec, fg_color="transparent")
         quick.grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky="w")
-        for txt, cmd in (("Hoy", self._set_today), ("Día hábil anterior", self._set_prev_business_day),
-                         ("7 días", self._set_last_week)):
+        for txt, cmd in (("Hoy", self._set_today), ("Día hábil anterior", self._set_prev_business_day)):
             self._btn(quick, txt, cmd, "link", height=26).pack(side="left", padx=(0, 4), ipadx=2)
         ctk.CTkLabel(
-            sec, text="Con varios días se revisa si cada renovación salió en algún ticket único (aunque haya sido días después).",
+            sec, text="Un solo día de hoy = lote del día. Varios días o días pasados = revisión de envíos.",
             font=F(11), text_color=COL["faint"], justify="left", anchor="w", wraplength=250
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
@@ -667,6 +696,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                       "para recordarte y en días sin ticket único encontrado.",
             font=F(11), text_color=COL["muted"], justify="left", anchor="w", wraplength=230
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.ent_inhabiles = self._field(sec, 6, "Días inhábiles (además de fines de semana)",
+                                         self.config_data.get("dias_inhabiles", ""), "Ej. 02/11/2026, 12/12/2026")
+        self.var_oficiales = tk.BooleanVar(value=self.config_data.get("feriados_oficiales", True))
+        ctk.CTkCheckBox(
+            sec, text="Incluir feriados oficiales", variable=self.var_oficiales,
+            font=F(12), checkbox_width=18, checkbox_height=18
+        ).grid(row=8, column=0, columnspan=2, pady=(8, 0), sticky="w")
+        self._aplicar_inhabiles()
 
         # Correo del lote
         sec = self._section(side, "Correo del lote")
@@ -876,14 +913,19 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         body = ctk.CTkFrame(top, fg_color="transparent", corner_radius=0)
         body.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self.tabs = PestanasSubrayadas(tabs_box, body)
-        self.tabs_names = {"desglose": "desglose", "tickets": "tickets", "agentes": "agentes"}
+        self.tabs_names = {"desglose": "desglose", "tickets": "tickets", "agentes": "agentes", "enviado": "enviado",
+                           "dias": "dias"}
         self.tab_desglose = self.tabs.add("desglose", "Desglose")
         self.tab_tickets = self.tabs.add("tickets", "Por ticket")
         self.tab_agentes = self.tabs.add("agentes", "Por compañero")
+        self.tab_enviado = self.tabs.add("enviado", "Tickets únicos")
+        self.tab_dias = self.tabs.add("dias", "Por día")
 
         self._build_tab_desglose()
         self._build_tab_tickets()
         self._build_tab_agentes()
+        self._build_tab_enviado()
+        self._build_tab_dias()
         self._build_detail_panel(bottom)
         for tree in (self.tree_desglose, self.tree_tickets):
             self._aplicar_columnas(tree)
@@ -1037,6 +1079,104 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "pendientes": ("Pendientes", 110, "center"),
         }, selectmode="browse")
 
+    def _build_tab_enviado(self):
+        """Todo lo que salió en los tickets únicos del periodo, renglón por renglón, contra los incidentes de Outlook."""
+        self.tree_enviado = self._make_tree(self.tab_enviado, {
+            "fecha": ("Ticket único del", 120, "center"),
+            "ticket": ("Incidente enviado", 130, "center"),
+            "cliente": ("No. cliente", 115, "center"),
+            "credito": ("Crédito", 110, "center"),
+            "incidente": ("Incidente en Outlook", 150, "center"),
+            "revision": ("Revisión", 620, "w"),
+        }, selectmode="browse")
+        self.tree_enviado.bind("<Double-1>", lambda e: self._abrir_enviado_en_itop())
+        self.tree_enviado.bind("<Return>", lambda e: self._abrir_enviado_en_itop())
+        TooltipCeldas(self.tree_enviado, self._celdas_completas)
+
+    def _build_tab_dias(self):
+        """Revisión día por día: qué ticket único salió y cómo quedó lo que debía ir en él."""
+        self.tree_dias = self._make_tree(self.tab_dias, {
+            "dia": ("Día", 120, "w"),
+            "envios": ("Ticket único enviado", 330, "w"),
+            "debian": ("Debían ir", 90, "center"),
+            "a_tiempo": ("A tiempo", 90, "center"),
+            "tarde": ("Tarde", 80, "center"),
+            "no_enviadas": ("NO enviadas", 110, "center"),
+            "errores": ("Datos equivocados", 140, "center"),
+            "sin_comprobar": ("Sin comprobar", 120, "center"),
+            "pendientes": ("Pendientes", 100, "center"),
+        }, selectmode="browse")
+        self.tree_dias.bind("<Double-1>", lambda e: self._ver_dia())
+        TooltipCeldas(self.tree_dias, self._celdas_completas)
+
+    def _ver_dia(self):
+        """Doble clic en un día: abre su «Lote del día» tal como debía salir."""
+        sel = self.tree_dias.selection()
+        if not sel:
+            return
+        dia = datetime.strptime(sel[0].split("_", 1)[1], "%Y%m%d")
+        self.seg_tipo.set(TIPOS_REVISION[0])
+        self.cal_start.set_date(dia)
+        self.cal_end.set_date(dia)
+        self._start_extraction()
+
+    def _llenar_dias(self) -> int:
+        self.tree_dias.delete(*self.tree_dias.get_children())
+        nombres = ("Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom")
+        dias = (self.lote_info or {}).get('por_dia') or []
+        for d in dias:
+            envios = "  ·  ".join(f"{rec:%H:%M} {rem} ({n} renglones)" for rec, rem, n in d['envios'])
+            if not envios:
+                envios = "Día inhábil" if not d['habil'] else ("No se encontró ticket único" if d['debian'] else "Sin ticket único")
+            iid = f"DIA_{d['dia']:%Y%m%d}"
+            self._celdas_completas[(iid, "envios")] = envios
+            malos = d['no_enviadas'] or d['errores']
+            tag = ("no_enviada" if malos else "multiple" if (d['sin_comprobar'] or (d['debian'] and not d['envios']))
+                   else "descartado" if not d['habil'] else "validado" if d['debian'] else "normal")
+            self.tree_dias.insert("", "end", iid=iid, tags=(tag,), values=(
+                f"{nombres[d['dia'].weekday()]} {d['dia']:%d/%m}", envios, d['debian'], d['a_tiempo'], d['tarde'],
+                d['no_enviadas'], d['errores'], d['sin_comprobar'], d['pendientes']))
+        return len(dias)
+
+    def _abrir_enviado_en_itop(self):
+        sel = self.tree_enviado.selection()
+        if sel:
+            ticket = self.tree_enviado.set(sel[0], "incidente") or self.tree_enviado.set(sel[0], "ticket")
+            if ticket.upper().startswith("I-"):
+                webbrowser.open(self._itop_url(ticket))
+
+    @staticmethod
+    def _revision_enviado(f: dict) -> tuple:
+        """(texto, tag) de un renglón del concentrado semanal."""
+        if f.get('error'):
+            return f"DATOS EQUIVOCADOS: {f['error']}", "no_enviada"
+        if not f.get('incidente'):
+            return "No se encontró el correo de este incidente en Outlook (revisa el buzón o el periodo)", "multiple"
+        if f.get('duplicada'):
+            return f"Bien (solicitud duplicada: también la pidió {', '.join(f['duplicada'])})", "reasignado"
+        if f.get('veces', 1) > 1:
+            return f"Bien, pero salió en {f['veces']} tickets únicos (repetida)", "reasignado"
+        if not f.get('en_periodo'):
+            return "Bien (se mandó después del periodo revisado)", "normal"
+        return "Bien", "normal"
+
+    def _llenar_enviado(self, search_txt: str) -> int:
+        self.tree_enviado.delete(*self.tree_enviado.get_children())
+        semana = (self.lote_info or {}).get('semana') or {}
+        n = 0
+        for i, f in enumerate(semana.get('filas') or []):
+            texto, tag = self._revision_enviado(f)
+            valores = (f"{f['fecha']:%d/%m/%Y}", f['ticket'] or "-", f['cliente'], f['credito'], f['incidente'] or "-", texto)
+            if search_txt and search_txt not in " ".join(valores).lower():
+                continue
+            iid = f"ENV_{i}"
+            self._celdas_completas[(iid, "revision")] = texto
+            self.tree_enviado.insert("", "end", iid=iid, values=valores,
+                                     tags=(tag if tag != "normal" else ("normal_alt" if n % 2 else "normal"),))
+            n += 1
+        self._reapply_sort(self.tree_enviado)
+        return n
+
     def _build_detail_panel(self, parent):
         parent.grid_columnconfigure(0, weight=2)
         parent.grid_columnconfigure(1, weight=3)
@@ -1141,10 +1281,34 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.cal_start.set_date(prev)
         self.cal_end.set_date(prev)
 
-    def _set_last_week(self):
-        now = datetime.now()
-        self.cal_start.set_date(now - timedelta(days=7))
-        self.cal_end.set_date(now)
+    def _aplicar_inhabiles(self):
+        set_dias_inhabiles(parse_dias_inhabiles(self.ent_inhabiles.get()), bool(self.var_oficiales.get()))
+
+    def _es_revision(self) -> bool:
+        return self.seg_tipo.get() == TIPOS_REVISION[1]
+
+    def _sincronizar_fechas(self, origen, otro):
+        """En «Lote del día» el periodo es un solo día: elegir una fecha mueve la otra."""
+        if not self._es_revision():
+            otro.set_date(origen.get_date())
+
+    def _on_tipo_revision(self, tipo: str):
+        if tipo == TIPOS_REVISION[0]:
+            # El lote del día que marca «Al» (hoy o cualquier día pasado)
+            self.cal_start.set_date(self.cal_end.get_date())
+            self._start_extraction()
+        else:
+            self._revisar_semana(0)
+
+    def _revisar_semana(self, semanas_atras: int = 0):
+        """Lunes a viernes de la semana (la actual llega hasta hoy) y extrae."""
+        hoy = datetime.now().date()
+        lunes = hoy - timedelta(days=hoy.weekday() + 7 * semanas_atras)
+        viernes = lunes + timedelta(days=4)
+        self.cal_start.set_date(lunes)
+        self.cal_end.set_date(min(viernes, hoy) if semanas_atras == 0 else viernes)
+        self.seg_tipo.set(TIPOS_REVISION[1])
+        self._start_extraction()
 
     def _focus_search(self):
         self.ent_search.focus_set()
@@ -1301,6 +1465,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if account in ("Sin conexión a Outlook", "Cargando cuentas..."):
             account = ""
 
+        self._aplicar_inhabiles()
+        revision = self._es_revision()
+        if not revision and self.cal_start.get_date() != self.cal_end.get_date():
+            self.cal_start.set_date(self.cal_end.get_date())
         d_start = datetime.combine(self.cal_start.get_date(), datetime.min.time())
         d_end = datetime.combine(self.cal_end.get_date(), datetime.max.time())
         if d_start > d_end:
@@ -1319,7 +1487,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "aplicar_corte": bool(self.var_aplicar_corte.get()),
             "hora_corte": self.config_data.get("hora_corte", HORA_CORTE_DEFAULT),
             "asunto_concentrado": self.config_data.get("asunto_concentrado", ASUNTO_CONCENTRADO_DEFAULT),
-            "ultimo_lote": self.config_data.get("ultimo_lote")
+            "ultimo_lote": self.config_data.get("ultimo_lote"),
+            "revision": revision,
+            "dias_atras": int(self.config_data.get("dias_atras_lote") or DIAS_ATRAS_LOTE)
         }
         self.ent_hora_corte.delete(0, "end")
         self.ent_hora_corte.insert(0, corte_opts["hora_corte"])
@@ -1381,6 +1551,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.new_keys = (current_keys - self._prev_keys) if self._prev_keys is not None else set()
         self._prev_keys = current_keys
 
+        revision = bool(lote_info and lote_info.get('revision'))
+        self.seg_tipo.set(TIPOS_REVISION[1] if revision else TIPOS_REVISION[0])
+        if not auto:
+            if revision:
+                self.cmb_quick_filter.set(FILTRO_NO_ENVIADAS)
+            elif self.cmb_quick_filter.get() in FILTROS_REVISION:
+                self.cmb_quick_filter.set(FILTRO_TODAS)
         self._refresh_views()
         self._actualizar_encabezado()
 
@@ -1466,11 +1643,17 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 f" ({conc['remitente'] or conc['carpeta']})"
             )
         if revision:
-            enviadas = c.get(LOTE_ENVIADA, 0) + c.get(LOTE_EN_CONCENTRADO, 0)
+            semana = info.get('semana') or {}
+            n_tu = len({f['asunto'] for f in semana.get('filas') or []})
             lineas.append(
-                f"Comparadas contra {len(info.get('concentrados') or [])} ticket(s) único(s) enviados hasta hoy  ·  "
-                f"enviadas: {enviadas} (tarde: {info.get('tarde', 0)})  ·  no enviadas en su día: {info.get('no_enviadas', 0)}  ·  "
-                f"sin comprobar: {info.get('sin_comprobar', 0)}"
+                f"{info.get('en_periodo', 0)} renovaciones debían salir en el periodo  ·  enviadas: {info.get('enviadas', 0)} "
+                f"(tarde: {info.get('tarde', 0)})  ·  NO enviadas: {info.get('no_enviadas', 0)}  ·  "
+                f"datos equivocados: {info.get('errores_envio', 0)}  ·  sin comprobar: {info.get('sin_comprobar', 0)}"
+            )
+            lineas.append(
+                f"Concentrado: {len(semana.get('filas') or [])} renglones de {n_tu} ticket(s) único(s) "
+                f"(pestaña «Tickets únicos»)"
+                + (f"  ·  {len(semana['sin_tabla'])} sin tabla legible" if semana.get('sin_tabla') else "")
             )
         else:
             ult = info.get('ultima_considerada')
@@ -1479,12 +1662,27 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     f"Última considerada: {ult['ticket']} del {ult['fecha']:%d/%m %H:%M}  ·  "
                     f"cliente {ult['cliente']}, crédito {ult['credito']}"
                 )
-        envio_hoy = (f"Ticket único de hoy enviado a las {info['corte_hoy']:%H:%M}" if info.get('corte_hoy')
-                     else "Ticket único de hoy: pendiente")
-        lineas.append(
-            f"Rezagadas sumadas hoy: {c.get(LOTE_REZAGADA, 0)}  ·  Ya enviadas: {c.get(LOTE_ENVIADA, 0)}  ·  "
-            f"{envio_hoy}  ·  Para el siguiente lote: {c.get(LOTE_SIGUIENTE, 0)}"
-        )
+        dia_txt = f"del {info['lote_actual']:%d/%m}" if info.get('pasado') else "de hoy"
+        envio_hoy = (f"Ticket único {dia_txt} enviado a las {info['corte_hoy']:%H:%M}" if info.get('corte_hoy')
+                     else (f"No se encontró el ticket único {dia_txt}" if info.get('pasado')
+                           else "Ticket único de hoy: pendiente"))
+        if info.get('pasado') and not revision:
+            en_el = c.get(LOTE_EN_CONCENTRADO, 0)
+            lineas.append(f"Lote como debía salir el {info['lote_actual']:%d/%m}: {en_el} venían en su ticket único, "
+                          f"{info.get('faltan_hoy', 0)} faltaron"
+                          + (f" ({sum(1 for r in self.all_rows if r.get('Enviado_Despues'))} se mandaron después)"
+                             if any(r.get('Enviado_Despues') for r in self.all_rows) else ""))
+        if revision:
+            dias_sin = [f"{d['dia']:%d/%m}" for d in info.get('por_dia') or [] if d['habil'] and not d['envios']]
+            lineas.append(f"{envio_hoy}  ·  "
+                          + (f"Días sin ticket único encontrado: {', '.join(dias_sin)}" if dias_sin
+                             else "Todos los días tienen su ticket único")
+                          + "  ·  detalle en la pestaña «Por día»")
+        else:
+            lineas.append(
+                f"Rezagadas sumadas al lote: {c.get(LOTE_REZAGADA, 0)}  ·  Ya enviadas: {c.get(LOTE_ENVIADA, 0)}  ·  "
+                f"{envio_hoy}  ·  Para el siguiente lote: {c.get(LOTE_SIGUIENTE, 0)}"
+            )
         self.lbl_lote_info.configure(text="\n".join(lineas))
 
         avisos, rojo, filtro = [], False, None
@@ -1495,18 +1693,29 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             texto = f"{n_no} renovación(es) NO se enviaron en el ticket único del día que les tocaba"
             detalle = []
             if n_no - cerradas:
-                detalle.append(f"{n_no - cerradas} con el incidente abierto se suman al lote de hoy")
+                detalle.append(f"{n_no - cerradas} con el incidente abierto se suman al lote {dia_txt}")
             if cerradas:
                 detalle.append(f"{cerradas} ya tienen el incidente cerrado en iTop (no entran al lote; «Restaurar» las incluye)")
             avisos.append(f"{texto}: {'; '.join(detalle)}.  Clic aquí para verlas.")
+        n_err = info.get('errores_envio', 0)
+        if n_err:
+            rojo = True
+            avisos.append(f"{n_err} renovación(es) salieron en el ticket único con datos equivocados (cliente, crédito o "
+                          f"folio de otro incidente): revisa «{FILTRO_ERRORES}».")
+            filtro = filtro or FILTRO_ERRORES
         if info.get('faltan_hoy'):
-            avisos.append(f"{info['faltan_hoy']} renovación(es) de hoy no vienen en el ticket único que salió a las "
+            avisos.append(f"{info['faltan_hoy']} renovación(es) {dia_txt} no vienen en el ticket único que salió a las "
                           f"{info['corte_hoy']:%H:%M}: agrégalas o mándalas en el siguiente.")
             filtro = filtro or FILTRO_ALERTAS
+        if info.get('avisos_fecha'):
+            avisos.append("Fecha corregida: " + "  ·  ".join(info['avisos_fecha']))
+        if info.get('duplicadas'):
+            avisos.append(f"{info['duplicadas']} renovación(es) ya habían salido antes en otro ticket único "
+                          f"(posible solicitud duplicada): están en «{FILTRO_ENVIADAS}».")
         if info.get('sin_comprobar'):
             avisos.append(f"{info['sin_comprobar']} renovación(es) son de días sin ticket único encontrado: revisa «{FILTRO_SIN_COMPROBAR}».")
             filtro = filtro or FILTRO_SIN_COMPROBAR
-        if not (info['metodo'] == 'concentrado' and conc):
+        if not revision and not (info['metodo'] == 'concentrado' and conc):
             aviso = f"No se encontró el correo concentrado del {info['dia_anterior']:%d/%m}. "
             if info['metodo'] == 'marca':
                 aviso += f"Se usó la marca local ({info['marca']:%d/%m %H:%M}) para decidir qué faltó enviar."
@@ -1519,7 +1728,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             self.notice.grid_remove()
 
     def _guardar_marca_lote(self, rows: list):
-        """Guarda la renovación más reciente del lote copiado/exportado como 'última considerada'."""
+        """Guarda la renovación más reciente del lote copiado o del correo creado como 'última considerada'."""
+        if self.lote_info and (self.lote_info.get('revision') or self.lote_info.get('pasado')):
+            return
         en_lote = [r for r in rows if r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')]
         if not en_lote:
             return
@@ -1549,6 +1760,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             or r.get('Cerrado_iTop')
             or r.get('No_Enviada')
             or r.get('Falta_Hoy')
+            or r.get('Error_Envio')
+            or r.get('Posible_Duplicado')
             or "DISCREPANCIA" in r.get('Alerta_Renovacion', '')
         )
 
@@ -1560,6 +1773,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         q_filter = self.cmb_quick_filter.get()
         search_txt = self.ent_search.get().strip().lower()
 
+        revision = bool(self.lote_info and self.lote_info.get('revision'))
         active_rows = []
         visible_rows = []
         for r in self.all_rows:
@@ -1569,13 +1783,18 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             lote = r.get('Lote_Estado')
             fuera = self._fuera_de_lote(r)
 
-            if not is_disc and not fuera:
+            fuera_periodo = revision and not r.get('En_Periodo', True)
+            if not is_disc and not fuera and not fuera_periodo:
                 active_rows.append(r)
 
             if q_filter == FILTRO_PAPELERA:
                 if not is_disc:
                     continue
             elif q_filter in FILTROS_REVISION:
+                if revision and not r.get('En_Periodo', True):
+                    continue  # De la semana anterior: solo se escaneó para sumar rezagadas
+                if q_filter == FILTRO_ERRORES and not r.get('Error_Envio'):
+                    continue
                 if q_filter == FILTRO_ENVIADAS and lote != LOTE_ENVIADA:
                     continue
                 if q_filter == FILTRO_SIGUIENTE and lote != LOTE_SIGUIENTE:
@@ -1587,7 +1806,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 if q_filter == FILTRO_SIN_COMPROBAR and lote != LOTE_SIN_COMPROBAR:
                     continue
             else:
-                if is_disc or fuera:
+                if is_disc or fuera or fuera_periodo:
                     continue
                 if q_filter == FILTRO_REZAGADAS and lote != LOTE_REZAGADA:
                     continue
@@ -1622,8 +1841,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         rid = r['Row_ID']
         if rid in self.discarded_row_ids:
             return "descartado"
-        if r.get('No_Enviada') and rid not in self.validated_row_ids:
+        if r.get('No_Enviada') or r.get('Error_Envio'):
             return "no_enviada"
+        if r.get('Falta_Hoy'):
+            return "rezagada"
         if self._fuera_de_lote(r):
             return "fuera_lote"
         if rid in self.validated_row_ids:
@@ -1781,6 +2002,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.tabs.set_label("desglose", f"Desglose  {len(visible_rows)}")
         self.tabs.set_label("tickets", f"Por ticket  {len(tickets_grouped)}")
         self.tabs.set_label("agentes", f"Por compañero  {len(agentes)}")
+        self.tabs.set_label("enviado", f"Tickets únicos  {self._llenar_enviado(self.ent_search.get().strip().lower())}")
+        n_dias = self._llenar_dias()
+        self.tabs.set_label("dias", f"Por día  {n_dias}" if n_dias else "Por día")
 
     # ================= ORDENAMIENTO =================
 
@@ -1838,8 +2062,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         box = self.txt_detail
         box.configure(state="normal")
         box.delete("1.0", "end")
-        if r.get('No_Enviada') or r.get('Dias_Retraso') or r.get('Falta_Hoy'):
-            box.insert("end", f"{plain_text(r.get('Lote_Etiqueta', ''))}\n\n", "error" if r.get('No_Enviada') else "warn")
+        if r.get('No_Enviada') or r.get('Dias_Retraso') or r.get('Falta_Hoy') or r.get('Error_Envio'):
+            etiqueta = plain_text(r.get('Lote_Etiqueta', ''))
+            box.insert("end", f"{etiqueta}\n", "error" if r.get('No_Enviada') or r.get('Error_Envio') else "warn")
+            if r.get('Error_Envio') and r['Error_Envio'] not in etiqueta:
+                box.insert("end", f"DATOS EQUIVOCADOS en el ticket único: {r['Error_Envio']}\n", "error")
+            box.insert("end", "\n")
         cierre = r.get('Cierre_iTop')
         if cierre:
             box.insert("end", f"Cerrado en iTop: {cierre.get('estado') or 'Cerrado'}", "cierre")
@@ -2219,7 +2447,6 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         try:
             self._write_excel_report(filepath, active_rows)
-            self._guardar_marca_lote(active_rows)
             self.lbl_status.configure(text=f"Reporte de Excel guardado en: {filepath}")
             if messagebox.askyesno("Reporte generado", f"El archivo se guardó correctamente:\n{filepath}\n\n¿Deseas abrirlo ahora?"):
                 os.startfile(filepath)
@@ -2365,12 +2592,26 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "Fecha de envío": r['Enviado_Fecha'].strftime('%d/%m/%Y') if r.get('Enviado_Fecha') else '',
                 "Días de retraso": r.get('Dias_Retraso') or '',
                 "Detalle": plain_text(r.get('Lote_Etiqueta', '')),
+                "Datos equivocados en el ticket único": r.get('Error_Envio', ''),
                 "Cierre iTop": resumen_cierre(r.get('Cierre_iTop')),
                 "Gafete": r['Gafete'],
                 "Agente": r['Nombre_Asignado'],
                 "Descartada": "SÍ" if r['Row_ID'] in self.discarded_row_ids else "",
             }
             for r in sorted(self.all_rows, key=lambda x: (not x.get('No_Enviada'), x.get('Fecha_Llegada_DT') or datetime.min))
+            if not (self.lote_info and self.lote_info.get('revision')) or r.get('En_Periodo', True)
+        ]
+        enviado_data = [
+            {
+                "Ticket único del": f['fecha'].strftime('%d/%m/%Y'),
+                "Asunto": f['asunto'],
+                "Incidente enviado": f['ticket'],
+                "No. Cliente": f['cliente'],
+                "Crédito": f['credito'],
+                "Incidente en Outlook": f['incidente'],
+                "Revisión": self._revision_enviado(f)[0],
+            }
+            for f in ((self.lote_info or {}).get('semana') or {}).get('filas') or []
         ]
 
         with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
@@ -2385,6 +2626,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 pd.DataFrame(descartados_data).to_excel(writer, sheet_name="4_Descartados_Excluidos", index=False)
             if revision_data and self.lote_info:
                 pd.DataFrame(revision_data).to_excel(writer, sheet_name="5_Revision_de_Envios", index=False)
+            if enviado_data:
+                pd.DataFrame(enviado_data).to_excel(writer, sheet_name="6_Enviado_en_Tickets_Unicos", index=False)
 
             from openpyxl.styles import PatternFill, Font, Alignment
             wb = writer.book
@@ -2397,6 +2640,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             fill_cerr = PatternFill(start_color="F5F3FF", end_color="F5F3FF", fill_type="solid")
             fill_no_env = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
             fill_tarde = PatternFill(start_color="FFFBEB", end_color="FFFBEB", fill_type="solid")
+
+            if "6_Enviado_en_Tickets_Unicos" in wb.sheetnames:
+                for row in wb["6_Enviado_en_Tickets_Unicos"].iter_rows(min_row=2):
+                    rev = str(row[-1].value or "")
+                    fill = fill_no_env if rev.startswith("DATOS") else (fill_tarde if rev.startswith("No se encontró") else None)
+                    if fill:
+                        for cell in row:
+                            cell.fill = fill
 
             if "5_Revision_de_Envios" in wb.sheetnames:
                 ws5 = wb["5_Revision_de_Envios"]
