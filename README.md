@@ -31,20 +31,24 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 4. **Abreviaturas de una letra:** Reconoce `C5864479`, `C-56572`, `T 4530500`, `R 91258`, `Cte. 3386153`, `Cred. 61116`, `CANC REN`, etc., tanto en texto como en celdas de tablas. La letra `C` se decide por longitud: 7+ dígitos = Cliente, menos = Crédito.
 
 5. **Corte diario y rezagadas del día anterior:**
-   - El lote se envía hasta la **hora de corte** (por defecto `17:50`). Lo que llega después se marca *Después del corte* y queda fuera del lote de hoy.
+   - **El corte de cada día es la hora en que realmente salió su ticket único**, no una hora fija: si un día se mandó a las 16:00, lo que llegó después va al día siguiente; si se mandó a las 19:10, lo que llegó a las 18:30 sí debía ir en él.
+   - Mientras el ticket único de hoy no sale, todo lo que llega entra en el lote de hoy. Cuando la app lo encuentra, lo que llega después se marca *Después del envío · va el dd/mm*, y lo de hoy que no venga en él se avisa como *falta en el de las hh:mm*.
+   - Lo que llegó en los 30 minutos previos al envío y no viene en él se toma como *llegó junto al envío* (va al día siguiente, sin marcarse como NO ENVIADA).
+   - Las respuestas o reenvíos del concentrado (*RE:*, *RV:*, *FW:*) no cambian la hora de envío.
+   - La **hora habitual de envío** (por defecto `17:50`) solo se usa como recordatorio y para los días en que no se encuentra el ticket único.
    - Al extraer, el sistema escanea también el **día hábil anterior** (el lunes incluye viernes y fin de semana) y busca en todos los buzones, incluidos *Elementos enviados*, el correo cuyo asunto contiene **"ticket unico"** (configurable, sin importar acentos ni mayúsculas). Lee el cuerpo y los adjuntos Excel/CSV.
    - Toda renovación del periodo anterior cuyo **Cliente + Crédito** no aparezca en ese concentrado se agrega al lote de hoy como *Rezagada*. Que solo aparezca el número de ticket no basta (un ticket con 3 renovaciones pudo enviarse con 2).
-   - Si no se encuentra el concentrado, se usa la **marca local** (la última renovación del lote que se copió o exportó en este equipo) y, si tampoco existe, la hora de corte.
-   - La línea informativa muestra el concentrado usado, la **última renovación considerada** y cuántas rezagadas se agregaron. Los filtros rápidos permiten ver solo rezagadas, las ya enviadas o las que llegaron después del corte. *Restaurar* mete al lote una fila excluida.
+   - Si no se encuentra el concentrado, se usa la **marca local** (la última renovación del lote que se copió o exportó en este equipo) y, si tampoco existe, la hora habitual.
+   - La línea informativa muestra el concentrado usado, la **última renovación considerada** y cuántas rezagadas se agregaron. Los filtros rápidos permiten ver solo rezagadas, las ya enviadas o las que van en el siguiente lote. *Restaurar* mete al lote una fila excluida.
    - La hora de la fila es la de la **primera asignación** del ticket (no la de una reasignación posterior).
 
 6. **Interfaz v2.1 (diseño corporativo):**
    - Estilo sobrio tipo Windows/Fluent: tipografía **Segoe UI**, superficies blancas, grises neutros y un solo azul institucional; sin emojis en tablas, menús ni reportes.
-   - **Barra superior** con la marca, el **reloj con cuenta regresiva al corte** (verde > 1 h, ámbar < 1 h, rojo < 15 min) y el buzón de Outlook. **Aviso a 15 min del corte** con las renovaciones pendientes.
-   - **Panel lateral** con *Extraer y validar* y la configuración agrupada (modo, periodo, corte, correo, actualización automática).
+   - **Barra superior** con la marca, el **reloj con el estado del ticket único de hoy** (pendiente con cuenta regresiva a la hora habitual, o *enviado a las hh:mm*) y el buzón de Outlook. **Aviso a 15 min de la hora habitual** si el ticket único de hoy aún no sale.
+   - **Panel lateral** con *Extraer y validar* y la configuración agrupada (modo, periodo, envío del ticket único, correo, actualización automática).
    - **Encabezado "Lote del dd/mm/aaaa"** con el concentrado usado y la última renovación considerada; las acciones del lote (*Copiar lote*, *Exportar a Excel*, *Crear correo Ticket Único*) a la derecha. Un aviso ámbar aparece solo si no se encontró el concentrado del día anterior.
    - **Indicadores clicables** (Tickets, Créditos a cancelar, Múltiples, Alertas, Rezagadas, Avance con barra de progreso) que filtran la tabla.
-   - **Pestañas con contador** (Desglose, Por ticket, Por compañero), buscador, filtros rápidos segmentados (Todas, Pendientes, Con alertas, Múltiples, Rezagadas, Nuevas) y menú *Otras vistas* (Validadas, Ya enviadas, Después del corte, Descartadas).
+   - **Pestañas con contador** (Desglose, Por ticket, Por compañero), buscador, filtros rápidos segmentados (Todas, Pendientes, Con alertas, Múltiples, Rezagadas, Nuevas) y menú *Otras vistas* (Validadas, Ya enviadas, Para el siguiente lote, Descartadas).
    - **Detalle en dos paneles:** el desglose del ticket y el correo original con los **números de cliente y crédito resaltados**.
    - Orden natural por columna (folios, fechas y números ordenan como número), colores suaves por estado y mensaje cuando la tabla está vacía.
 
@@ -58,7 +62,24 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
    - Si el aviso no dice quién lo cerró, se muestra el agente que tenía asignado el ticket en ese momento.
    - Columna *Cierre en iTop*, sección en el detalle, vista *Otras vistas → Cerradas en iTop*, cuenta como alerta, aviso al crear el correo y columnas en Excel.
 
-9. **Funciones nuevas:**
+9. **Pantalla configurable (v2.3):**
+   - Botón **Vista** (o clic derecho en el encabezado de la tabla): elige qué columnas se ven y oculta los indicadores, el detalle del ticket o la configuración lateral para dar más espacio a la tabla. Se recuerda entre sesiones; *Restablecer vista* regresa a lo predeterminado.
+   - De inicio se ocultan *Crédito origen*, *Asignación* y *Motivo* (siguen en el detalle y en el Excel).
+   - Textos cortos en la tabla (*Rezagada 22/10 14:53 · otros datos en el concentrado*, *Resuelto 22/10 17:52 · 7353 Sammy*); al pasar el mouse sobre la celda se ve el texto completo.
+   - Reconoce el formato **Cliente\*Crédito** (*"Cancelación de crédito 1184282\*10430"*).
+
+10. **Revisión de envíos de varios días (v2.3):**
+   - Cada renovación se compara contra **todos** los ticket únicos del periodo, no solo el de ayer. Su día de lote es el día en que llegó (o el siguiente día hábil si llegó después de que salió el ticket único de ese día, o en fin de semana).
+   - Si salió en el ticket único de su día, o en uno posterior, ya **no cuenta como faltante** (aunque el incidente se cierre después). Ejemplo: llegó el lunes, no se mandó el lunes pero sí el miércoles → *Enviada tarde 07/10 · debía ir 05/10*.
+   - Si nunca se envió:
+     - con el incidente **abierto** → *NO ENVIADA (30/09) · va hoy*, se suma al lote de hoy;
+     - con el incidente **cerrado** en iTop → *NO ENVIADA (30/09) · cerrado el 01/10*, en rojo y fuera del lote (*Restaurar* la mete);
+     - si de ese día no se encontró ticket único → *Sin comprobar*.
+   - Para revisar varios días elige el periodo (*Del / Al*) o usa **7 días**. El título cambia a *Revisión de envíos del dd/mm al dd/mm/aaaa* con el resumen (enviadas, tarde, no enviadas, sin comprobar).
+   - **Aviso rojo** clicable con las no enviadas, y vistas *Otras vistas → No enviadas en su día / Enviadas tarde / Sin comprobar*. El detalle del ticket dice en rojo en qué ticket único debía ir.
+   - El Excel agrega la hoja **5_Revision_de_Envios** (resultado, día que debía ir, en qué ticket único salió, días de retraso y cierre en iTop).
+
+11. **Funciones nuevas:**
    - **Validaciones guardadas:** las validaciones, descartes y filas incluidas a mano se guardan en disco (`%USERPROFILE%\.fonacot_validador_renovaciones_estado.json`, 30 días). No se pierden al volver a escanear ni al cerrar la app.
    - **Actualización automática** cada 5/10/15/30/60 min: vuelve a escanear Outlook, conserva tus marcas y avisa las renovaciones nuevas (filtro *Nuevas*).
    - **Crear correo Ticket Único:** abre en Outlook un borrador (no lo envía) con el formato del ticket único (punto 7), destinatarios configurables, conservando tu firma. Antes avisa si hay renovaciones pendientes o tickets ya cerrados en iTop. Así el siguiente día la app encuentra ese concentrado.
@@ -101,6 +122,7 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 Se guarda en `%USERPROFILE%\.fonacot_validador_renovaciones_config.json`. Además de lo que se captura en pantalla:
 - `itop_url_template`: para otro servidor de iTop, p. ej. `https://servidor/pages/UI.php?operation=details&class={clase}&id={id}` (admite `{id}`, `{ref}`, `{clase}`). Vacío = servidor de FONACOT.
 - `ultimo_lote`: marca de la última renovación considerada (se actualiza al copiar/exportar el lote).
+- `columnas_ocultas` y `vista`: columnas y zonas de la pantalla elegidas en *Vista*.
 - `texto_correo`: texto fijo del correo del ticket único (admite `{total}`). Vacío = usar el aprendido.
 - `texto_correo_aprendido`: saludo y avisos copiados del último concentrado encontrado (se actualiza solo).
 - El asunto anterior `TICKET UNICO {fecha}` se cambia automáticamente al nuevo `Cancelación de renovaciones – ticket único {fecha}`.

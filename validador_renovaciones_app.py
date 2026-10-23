@@ -6,6 +6,7 @@ import webbrowser
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import tkinter.font as tkfont
 
 import customtkinter as ctk
 from tkcalendar import DateEntry
@@ -23,6 +24,8 @@ from core_renovaciones import (
     LOTE_ENVIADA,
     LOTE_EN_CONCENTRADO,
     LOTE_SIGUIENTE,
+    LOTE_CERRADA_SIN_ENVIO,
+    LOTE_SIN_COMPROBAR,
     resumen_cierre
 )
 from lote_utils import (
@@ -33,11 +36,12 @@ from lote_utils import (
     build_ticket_unico_html,
     set_clipboard_html,
     plain_text,
+    lote_corto,
     INTRO_TICKET_UNICO_DEFAULT
 )
 
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"),
@@ -78,7 +82,7 @@ COL = {
 }
 
 # Estados de lote que NO forman parte del lote a enviar hoy (se ven en su filtro y se pueden "Restaurar")
-LOTE_EXCLUIDOS = (LOTE_ENVIADA, LOTE_SIGUIENTE)
+LOTE_EXCLUIDOS = (LOTE_ENVIADA, LOTE_SIGUIENTE, LOTE_CERRADA_SIN_ENVIO, LOTE_SIN_COMPROBAR)
 
 FILTRO_TODAS = "Todas"
 FILTRO_PENDIENTES = "Pendientes"
@@ -88,19 +92,38 @@ FILTRO_REZAGADAS = "Rezagadas"
 FILTRO_NUEVAS = "Nuevas"
 FILTRO_VALIDADAS = "Validadas"
 FILTRO_ENVIADAS = "Ya enviadas (excluidas)"
-FILTRO_SIGUIENTE = "Después del corte de hoy"
+FILTRO_SIGUIENTE = "Para el siguiente lote"
 FILTRO_PAPELERA = "Descartadas"
 FILTRO_CERRADAS = "Cerradas en iTop"
+FILTRO_NO_ENVIADAS = "No enviadas en su día"
+FILTRO_TARDE = "Enviadas tarde"
+FILTRO_SIN_COMPROBAR = "Sin comprobar"
 OTRAS_VISTAS = "Otras vistas"
 
 FILTROS_PRINCIPALES = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_MULTIPLES, FILTRO_REZAGADAS, FILTRO_NUEVAS]
-FILTROS_SECUNDARIOS = [FILTRO_CERRADAS, FILTRO_VALIDADAS, FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_PAPELERA]
+FILTROS_SECUNDARIOS = [FILTRO_NO_ENVIADAS, FILTRO_TARDE, FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS,
+                       FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_PAPELERA]
+# Vistas que muestran filas aunque estén fuera del lote de hoy (revisión de envíos)
+FILTROS_REVISION = (FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_NO_ENVIADAS, FILTRO_TARDE, FILTRO_SIN_COMPROBAR)
 
 MODOS = {"CONCENTRADO": "Concentrado", "AGENTE": "Por compañero"}
 
 # Mismo asunto que el correo que ya se envía: "Cancelación de renovaciones – ticket único 22-10-2026"
 ASUNTO_BORRADOR_DEFAULT = "Cancelación de renovaciones – ticket único {fecha}"
 ASUNTO_BORRADOR_ANTERIOR = "TICKET UNICO {fecha}"
+
+# Columnas que se ocultan de inicio para no saturar la tabla (se activan en «Columnas» o con clic derecho en el encabezado)
+COLUMNAS_OCULTAS_DEFAULT = {
+    "desglose": ["credito_padre", "alerta_asig", "motivo"],
+    "tickets": ["creditos_padres", "alerta_asig"],
+}
+COLUMNAS_FIJAS = ("validado", "ticket")
+VISTA_DEFAULT = {"indicadores": True, "detalle": True, "configuracion": True}
+VISTA_ZONAS = (
+    ("indicadores", "Indicadores (tarjetas)"),
+    ("detalle", "Detalle del ticket y correo"),
+    ("configuracion", "Configuración (panel izquierdo)"),
+)
 
 ATAJOS = [
     ("F5", "Extraer y validar renovaciones"),
@@ -113,12 +136,63 @@ ATAJOS = [
     ("Ctrl + M", "Crear el correo 'Ticket Único' en Outlook"),
     ("Ctrl + E", "Exportar a Excel"),
     ("Clic derecho", "Más acciones: copiar cliente o crédito, buscar en iTop…"),
+    ("Vista / clic derecho en el encabezado", "Elegir columnas y ocultar indicadores, detalle o configuración"),
     ("Clic en un indicador", "Filtra la tabla por ese indicador"),
 ]
 
 
 def F(size: int = 12, bold: bool = False) -> ctk.CTkFont:
     return ctk.CTkFont(family=FONT_SB if bold else FONT, size=size)
+
+
+class TooltipCeldas:
+    """Al pasar el mouse muestra el texto completo de la celda cuando no cabe o en la tabla va resumido."""
+
+    def __init__(self, tree: ttk.Treeview, completos: dict):
+        self.tree = tree
+        self.completos = completos      # {(iid, columna): texto completo}
+        self.font = tkfont.Font(family=FONT, size=10)
+        self.tip = None
+        self._celda = None
+        self._after = None
+        tree.bind("<Motion>", self._mover, add="+")
+        tree.bind("<Leave>", self._ocultar, add="+")
+        tree.bind("<ButtonPress>", self._ocultar, add="+")
+
+    def _mover(self, e):
+        iid, col = self.tree.identify_row(e.y), self.tree.identify_column(e.x)
+        if (iid, col) == self._celda:
+            return
+        self._ocultar()
+        self._celda = (iid, col)
+        if not iid or not col or col == "#0":
+            return
+        nombre = self.tree.column(col, "id")
+        mostrado = str(self.tree.set(iid, nombre))
+        texto = self.completos.get((iid, nombre)) or mostrado
+        if not texto.strip() or (texto == mostrado and self.font.measure(mostrado) <= self.tree.column(nombre, "width") - 14):
+            return
+        self._after = self.tree.after(350, lambda: self._mostrar(texto, e.x_root, e.y_root))
+
+    def _mostrar(self, texto, x, y):
+        self.tip = tk.Toplevel(self.tree)
+        self.tip.wm_overrideredirect(True)
+        self.tip.attributes("-topmost", True)
+        tk.Label(
+            self.tip, text=texto, justify="left", wraplength=520, font=(FONT, 10), bg="#FFFFFF", fg=COL["text"],
+            relief="solid", borderwidth=1, padx=8, pady=5
+        ).pack()
+        self.tip.wm_geometry(f"+{x + 14}+{y + 18}")
+
+    def _ocultar(self, _e=None):
+        if self._after:
+            self.tree.after_cancel(self._after)
+            self._after = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+        if _e is not None and getattr(_e, "type", None) == tk.EventType.Leave:
+            self._celda = None
 
 
 def _aplicar_tema():
@@ -301,6 +375,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._aviso_corte_dia = None
         self._sort_state = {}
         self._headers = {}
+        self._celdas_completas = {}   # {(iid, columna): texto completo} para el tooltip de celdas resumidas
+        self._vars_columnas = []
 
         self._build_ui()
         self._build_context_menus()
@@ -331,6 +407,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "texto_correo_aprendido": "",
             "auto_refresh": False,
             "auto_refresh_min": "10",
+            # Columnas ocultas por pestaña ("desglose", "tickets"); se eligen en el botón «Columnas»
+            "columnas_ocultas": {k: list(v) for k, v in COLUMNAS_OCULTAS_DEFAULT.items()},
+            # Zonas de la pantalla que se pueden ocultar desde «Vista» para dar más espacio a la tabla
+            "vista": dict(VISTA_DEFAULT),
             # Plantilla opcional para otro servidor de iTop; admite {id}, {ref} y {clase}. Vacío = servidor FONACOT.
             "itop_url_template": "",
             # Marca local de la última renovación incluida en un lote copiado/exportado
@@ -464,7 +544,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.grid(row=0, column=2, padx=20, sticky="e")
-        # Reloj y cuenta regresiva al corte
+        # Reloj y estado del ticket único de hoy
         self.lbl_clock = ctk.CTkLabel(
             right, text="--:--", font=F(12, True), height=28, corner_radius=14,
             fg_color=COL["track"], text_color=COL["text_2"]
@@ -521,6 +601,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             scrollbar_button_color=COL["border"], scrollbar_button_hover_color=COL["border_strong"]
         )
         side.grid(row=1, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        self.sidebar_config = side
 
         # Modo
         sec = self._section(side, "Modo de validación", first=True)
@@ -560,24 +641,30 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.cal_end.grid(row=1, column=1, sticky="ew", padx=(6, 0), ipady=3)
         quick = ctk.CTkFrame(sec, fg_color="transparent")
         quick.grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky="w")
-        for txt, cmd in (("Hoy", self._set_today), ("Día hábil anterior", self._set_prev_business_day)):
+        for txt, cmd in (("Hoy", self._set_today), ("Día hábil anterior", self._set_prev_business_day),
+                         ("7 días", self._set_last_week)):
             self._btn(quick, txt, cmd, "link", height=26).pack(side="left", padx=(0, 4), ipadx=2)
+        ctk.CTkLabel(
+            sec, text="Con varios días se revisa si cada renovación salió en algún ticket único (aunque haya sido días después).",
+            font=F(11), text_color=COL["faint"], justify="left", anchor="w", wraplength=250
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # Corte
-        sec = self._section(side, "Corte diario")
+        sec = self._section(side, "Envío del ticket único")
         self.var_aplicar_corte = tk.BooleanVar(value=self.config_data.get("aplicar_corte", True))
         ctk.CTkSwitch(
             sec, text="Sumar rezagadas del día anterior", variable=self.var_aplicar_corte,
             onvalue=True, offvalue=False, font=F(12), switch_width=36, switch_height=18
         ).grid(row=0, column=0, columnspan=2, sticky="w")
-        self.ent_hora_corte = self._field(sec, 1, "Hora de corte", self.config_data.get("hora_corte", HORA_CORTE_DEFAULT),
+        self.ent_asunto_conc = self._field(
+            sec, 1, "Asunto del correo concentrado", self.config_data.get("asunto_concentrado", ASUNTO_CONCENTRADO_DEFAULT)
+        )
+        self.ent_hora_corte = self._field(sec, 3, "Hora habitual de envío", self.config_data.get("hora_corte", HORA_CORTE_DEFAULT),
                                           "17:50", width=90)
         self.ent_hora_corte.bind("<FocusOut>", lambda e: self._tick_clock(reschedule=False))
-        self.ent_asunto_conc = self._field(
-            sec, 3, "Asunto del correo concentrado", self.config_data.get("asunto_concentrado", ASUNTO_CONCENTRADO_DEFAULT)
-        )
         ctk.CTkLabel(
-            sec, text="Busca en el día hábil anterior lo que no se envió.",
+            sec, text="El corte de cada día es la hora en que salió su ticket único. La hora habitual solo se usa "
+                      "para recordarte y en días sin ticket único encontrado.",
             font=F(11), text_color=COL["muted"], justify="left", anchor="w", wraplength=230
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
@@ -646,10 +733,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         )
 
     def _build_notice(self, parent):
-        """Aviso ámbar: solo aparece cuando no se encontró el correo concentrado del día anterior."""
+        """
+        Aviso bajo el título: rojo si hay renovaciones que no se enviaron en su día (clic = verlas),
+        ámbar si no se encontró el correo concentrado del día anterior o hay días sin comprobar.
+        """
         self.notice = ctk.CTkFrame(parent, fg_color=COL["warning_soft"], corner_radius=8, border_width=1, border_color="#FDE68A")
         self.notice.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        ctk.CTkFrame(self.notice, width=3, corner_radius=2, fg_color="#F59E0B").pack(side="left", fill="y", padx=(10, 0), pady=10)
+        self.notice_bar = ctk.CTkFrame(self.notice, width=3, height=1, corner_radius=2, fg_color="#F59E0B")
+        self.notice_bar.pack(side="left", fill="y", padx=(10, 0), pady=10)
         self.lbl_notice = ctk.CTkLabel(
             self.notice, text="", font=F(12), text_color="#92400E", justify="left", anchor="w", wraplength=900
         )
@@ -658,10 +749,28 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "<Configure>",
             lambda e: self.lbl_notice.configure(wraplength=max(300, int(e.width / self._scaling()) - 60))
         )
+        self._notice_filtro = None
+        for w in (self.notice, self.lbl_notice):
+            w.bind("<Button-1>", lambda e: self._notice_filtro and self._apply_filter(self._notice_filtro))
         self.notice.grid_remove()
 
+    def _mostrar_aviso(self, texto: str, rojo: bool = False, filtro: str = None):
+        if rojo:
+            self.notice.configure(fg_color=COL["danger_soft"], border_color="#FECACA")
+            self.notice_bar.configure(fg_color="#DC2626")
+            self.lbl_notice.configure(text_color="#991B1B")
+        else:
+            self.notice.configure(fg_color=COL["warning_soft"], border_color="#FDE68A")
+            self.notice_bar.configure(fg_color="#F59E0B")
+            self.lbl_notice.configure(text_color="#92400E")
+        self._notice_filtro = filtro
+        cursor = "hand2" if filtro else ""
+        self.notice.configure(cursor=cursor)
+        self.lbl_notice.configure(text=texto, cursor=cursor)
+        self.notice.grid()
+
     def _build_kpis(self, parent):
-        kpi_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        self.kpi_bar = kpi_bar = ctk.CTkFrame(parent, fg_color="transparent")
         kpi_bar.grid(row=2, column=0, sticky="ew", pady=(16, 16))
         for i in range(6):
             kpi_bar.grid_columnconfigure(i, weight=1, uniform="kpi")
@@ -670,7 +779,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.lbl_kpi_renovaciones = self._kpi(kpi_bar, 1, "Créditos a cancelar", "Renovaciones desglosadas", "#0F766E", FILTRO_TODAS)
         self.lbl_kpi_multiples = self._kpi(kpi_bar, 2, "Tickets múltiples", "2 o más créditos", "#D97706", FILTRO_MULTIPLES)
         self.lbl_kpi_alertas = self._kpi(kpi_bar, 3, "Alertas", "Falta dato, duplicado o cerrado", "#DC2626", FILTRO_ALERTAS)
-        self.lbl_kpi_rezagadas = self._kpi(kpi_bar, 4, "Rezagadas", "Del día anterior, sumadas hoy", "#4F46E5", FILTRO_REZAGADAS)
+        self.lbl_kpi_rezagadas = self._kpi(kpi_bar, 4, "Rezagadas", "No enviadas antes, sumadas hoy", "#4F46E5", FILTRO_REZAGADAS)
         self.lbl_kpi_validados = self._kpi(kpi_bar, 5, "Avance", "Clic para ver pendientes", "#16A34A", FILTRO_PENDIENTES,
                                            progreso=True)
 
@@ -716,6 +825,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         bottom = ctk.CTkFrame(paned, fg_color=COL["surface"], corner_radius=10, border_width=1, border_color=COL["border"])
         paned.add(top, weight=5)
         paned.add(bottom, weight=2)
+        self.paned, self.detail_frame = paned, bottom
 
         top.grid_columnconfigure(0, weight=1)
         top.grid_rowconfigure(3, weight=1)
@@ -760,6 +870,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         )
         menu.pack(side="left", padx=(10, 0))
         self.cmb_quick_filter = SelectorFiltro(seg, menu, self._refresh_views)
+        self.btn_columnas = self._btn(bar, "Vista  ▾", self._abrir_menu_columnas)
+        self.btn_columnas.pack(side="left", padx=(8, 0), ipadx=6)
 
         body = ctk.CTkFrame(top, fg_color="transparent", corner_radius=0)
         body.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
@@ -773,6 +885,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._build_tab_tickets()
         self._build_tab_agentes()
         self._build_detail_panel(bottom)
+        for tree in (self.tree_desglose, self.tree_tickets):
+            self._aplicar_columnas(tree)
+            TooltipCeldas(tree, self._celdas_completas)
+        self._aplicar_vista()
 
     def _build_status_bar(self):
         bar = ctk.CTkFrame(self, fg_color=COL["surface"], corner_radius=0)
@@ -839,7 +955,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         for col, (text, width, anchor) in headers.items():
             self._headers[(str(tree), col)] = text
             tree.heading(col, text=text, anchor=anchor, command=lambda c=col, t=tree: self._on_heading_click(t, c))
-            tree.column(col, width=width, minwidth=50, anchor=anchor, stretch=False)
+            # Los anchos de ttk no siguen el zoom de Windows (la fuente sí): se escalan para que el texto quepa
+            tree.column(col, width=int(width * self._scaling()), minwidth=50, anchor=anchor, stretch=False)
 
         # Colores por estado, suaves (los de alerta ganan a la franja alterna porque cada fila lleva un solo tag)
         tree.tag_configure("normal", background="#FFFFFF", foreground=COL["text"])
@@ -853,6 +970,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         tree.tag_configure("validado", background="#F0FDF4", foreground="#166534")      # Verde: validada
         tree.tag_configure("cerrado", background="#F5F3FF", foreground="#5B21B6")       # Violeta: ya cerrado en iTop
         tree.tag_configure("descartado", background=COL["subtle"], foreground=COL["faint"])  # Gris: descartada
+        tree.tag_configure("no_enviada", background="#FEE2E2", foreground="#991B1B")    # Rojo fuerte: no se envió en su día
 
         vsb = ctk.CTkScrollbar(parent, orientation="vertical", command=tree.yview, width=12)
         hsb = ctk.CTkScrollbar(parent, orientation="horizontal", command=tree.xview, height=12)
@@ -870,8 +988,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "cliente": ("No. cliente", 115, "center"),
             "credito_hijo": ("Crédito a cancelar", 135, "center"),
             "credito_padre": ("Crédito origen", 120, "center"),
-            "lote": ("Lote / corte", 270, "w"),
-            "cierre": ("Cierre en iTop", 300, "w"),
+            "lote": ("Lote / envío", 300, "w"),
+            "cierre": ("Cierre en iTop", 210, "w"),
             "gafete": ("Gafete", 70, "center"),
             "agente": ("Agente responsable", 190, "w"),
             "alerta_reno": ("Alerta de renovación", 290, "w"),
@@ -899,7 +1017,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "agente": ("Agente responsable", 200, "w"),
             "resumen": ("Resumen del ticket", 320, "w"),
             "alerta_asig": ("Asignación", 240, "w"),
-            "cierre": ("Cierre en iTop", 300, "w"),
+            "cierre": ("Cierre en iTop", 210, "w"),
             "fecha": ("Llegada", 135, "center"),
         }, selectmode="browse")
         self.tree_tickets.bind("<<TreeviewSelect>>", self._on_select_ticket_row)
@@ -948,13 +1066,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.txt_detail.tag_config("warn", foreground=COL["warning"])
         self.txt_detail.tag_config("muted", foreground=COL["muted"])
         self.txt_detail.tag_config("cierre", foreground="#5B21B6")
+        self.txt_detail.tag_config("error", foreground="#B91C1C")
 
         self.txt_body = ctk.CTkTextbox(parent, font=F(12), wrap="word")
         self.txt_body.grid(row=2, column=1, padx=(6, 16), pady=(0, 16), sticky="nsew")
         self.txt_body.tag_config("hl", background="#FEF08A", foreground="#713F12")
 
     def _build_context_menus(self):
-        opts = dict(
+        self._menu_opts = opts = dict(
             tearoff=0, font=(FONT, 10), bg=COL["surface"], fg=COL["text"], activebackground=COL["primary_soft"],
             activeforeground=COL["text"], relief="flat", borderwidth=1
         )
@@ -1022,6 +1141,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.cal_start.set_date(prev)
         self.cal_end.set_date(prev)
 
+    def _set_last_week(self):
+        now = datetime.now()
+        self.cal_start.set_date(now - timedelta(days=7))
+        self.cal_end.set_date(now)
+
     def _focus_search(self):
         self.ent_search.focus_set()
         return "break"
@@ -1088,17 +1212,21 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
     # ================= RELOJ, CUENTA REGRESIVA Y AUTO-ACTUALIZACIÓN =================
 
     def _tick_clock(self, reschedule: bool = True):
+        # El corte real es el envío del ticket único de hoy; la hora habitual solo sirve de recordatorio
         now = datetime.now()
-        corte = parse_hora_corte(self.ent_hora_corte.get())
-        corte_dt = datetime.combine(now.date(), corte)
+        habitual = parse_hora_corte(self.ent_hora_corte.get())
+        habitual_dt = datetime.combine(now.date(), habitual)
+        enviado = ((self.lote_info or {}).get('cortes') or {}).get(now.date())
         neutro = (COL["track"], COL["text_2"])
         if now.weekday() >= 5:
             text, (bg, fg) = f"{now:%H:%M}  ·  Fin de semana: entra como rezagada el lunes", neutro
-        elif now < corte_dt:
-            mins = int((corte_dt - now).total_seconds() // 60)
+        elif enviado:
+            text, (bg, fg) = f"{now:%H:%M}  ·  Ticket único de hoy enviado a las {enviado:%H:%M}: lo nuevo va al siguiente", neutro
+        elif now < habitual_dt:
+            mins = int((habitual_dt - now).total_seconds() // 60)
             h, m = divmod(mins, 60)
             restante = f"{h} h {m:02d} min" if h else f"{m} min"
-            text = f"{now:%H:%M}  ·  Corte de las {corte:%H:%M} en {restante}"
+            text = f"{now:%H:%M}  ·  Ticket único de hoy pendiente  ·  habitual {habitual:%H:%M} (en {restante})"
             if mins > 60:
                 bg, fg = COL["success_soft"], "#047857"
             elif mins > 15:
@@ -1109,7 +1237,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 self._aviso_corte_dia = now.date()
                 self._aviso_corte(mins)
         else:
-            text, (bg, fg) = f"{now:%H:%M}  ·  Corte de las {corte:%H:%M} cerrado: lo nuevo va al lote siguiente", neutro
+            text = f"{now:%H:%M}  ·  Ticket único de hoy pendiente: lo que llegue aún entra hoy"
+            bg, fg = COL["warning_soft"], COL["warning"]
         self.lbl_clock.configure(text=text, fg_color=bg, text_color=fg)
         if reschedule:
             self.after(20000, self._tick_clock)
@@ -1119,7 +1248,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         pendientes = sum(1 for r in active_rows if r['Row_ID'] not in self.validated_row_ids)
         self.bell()
         self._toast(
-            f"Faltan {mins} min para el corte.\n"
+            f"Faltan {mins} min para la hora habitual del ticket único.\n"
             + (f"Hay {pendientes} de {len(active_rows)} renovaciones sin validar." if self.all_rows
                else "Aún no se han extraído las renovaciones de hoy (F5)."),
             color="#EF4444", ms=12000
@@ -1239,6 +1368,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         self.all_rows = rows
         self.lote_info = lote_info
+        self._tick_clock(reschedule=False)
         self._key_by_rid = {r['Row_ID']: row_key(r) for r in rows}
 
         # Recuperar lo que el usuario ya había marcado (en escaneos anteriores o antes de cerrar la app)
@@ -1262,9 +1392,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if lote_info:
             conteos = lote_info['conteos']
             if conteos.get(LOTE_REZAGADA):
-                msg += f"  ·  {conteos[LOTE_REZAGADA]} rezagada(s) del día anterior"
+                msg += f"  ·  {conteos[LOTE_REZAGADA]} rezagada(s)"
+            if lote_info.get('no_enviadas'):
+                msg += f"  ·  {lote_info['no_enviadas']} no enviada(s) en su día"
             if conteos.get(LOTE_SIGUIENTE):
-                msg += f"  ·  {conteos[LOTE_SIGUIENTE]} después del corte"
+                msg += f"  ·  {conteos[LOTE_SIGUIENTE]} para el siguiente lote"
         cerradas = {r['Numero_Ticket'] for r in active_rows if r.get('Cerrado_iTop')}
         if cerradas:
             msg += f"  ·  {len(cerradas)} ticket(s) ya cerrados en iTop"
@@ -1317,7 +1449,15 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             return
 
         hc = info['hora_corte'].strftime('%H:%M')
-        self.lbl_page_title.configure(text=f"Lote del {info['corte_fin']:%d/%m/%Y}")
+        c = info['conteos']
+        revision = info.get('revision')
+        if revision:
+            ini, fin = info['fecha_inicio'], info['fecha_fin']
+            self.lbl_page_title.configure(
+                text=f"Revisión de envíos del {fin:%d/%m/%Y}" if ini == fin else f"Revisión de envíos del {ini:%d/%m} al {fin:%d/%m/%Y}"
+            )
+        else:
+            self.lbl_page_title.configure(text=f"Lote del {info['corte_fin']:%d/%m/%Y}")
         lineas = []
         conc = info.get('concentrado_previo')
         if info['metodo'] == 'concentrado' and conc:
@@ -1325,29 +1465,58 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 f"Concentrado anterior: «{conc['asunto']}», recibido {conc['recibido']:%d/%m %H:%M}"
                 f" ({conc['remitente'] or conc['carpeta']})"
             )
-        ult = info.get('ultima_considerada')
-        if ult:
+        if revision:
+            enviadas = c.get(LOTE_ENVIADA, 0) + c.get(LOTE_EN_CONCENTRADO, 0)
             lineas.append(
-                f"Última considerada: {ult['ticket']} del {ult['fecha']:%d/%m %H:%M}  ·  "
-                f"cliente {ult['cliente']}, crédito {ult['credito']}"
+                f"Comparadas contra {len(info.get('concentrados') or [])} ticket(s) único(s) enviados hasta hoy  ·  "
+                f"enviadas: {enviadas} (tarde: {info.get('tarde', 0)})  ·  no enviadas en su día: {info.get('no_enviadas', 0)}  ·  "
+                f"sin comprobar: {info.get('sin_comprobar', 0)}"
             )
-        c = info['conteos']
+        else:
+            ult = info.get('ultima_considerada')
+            if ult:
+                lineas.append(
+                    f"Última considerada: {ult['ticket']} del {ult['fecha']:%d/%m %H:%M}  ·  "
+                    f"cliente {ult['cliente']}, crédito {ult['credito']}"
+                )
+        envio_hoy = (f"Ticket único de hoy enviado a las {info['corte_hoy']:%H:%M}" if info.get('corte_hoy')
+                     else "Ticket único de hoy: pendiente")
         lineas.append(
-            f"Rezagadas agregadas: {c.get(LOTE_REZAGADA, 0)}  ·  Ya enviadas: {c.get(LOTE_ENVIADA, 0)}  ·  "
-            f"Después del corte de las {hc}: {c.get(LOTE_SIGUIENTE, 0)}"
+            f"Rezagadas sumadas hoy: {c.get(LOTE_REZAGADA, 0)}  ·  Ya enviadas: {c.get(LOTE_ENVIADA, 0)}  ·  "
+            f"{envio_hoy}  ·  Para el siguiente lote: {c.get(LOTE_SIGUIENTE, 0)}"
         )
         self.lbl_lote_info.configure(text="\n".join(lineas))
 
-        if info['metodo'] == 'concentrado' and conc:
-            self.notice.grid_remove()
-            return
-        aviso = f"No se encontró el correo concentrado del {info['dia_anterior']:%d/%m}. "
-        if info['metodo'] == 'marca':
-            aviso += f"Se usó la marca local ({info['marca']:%d/%m %H:%M}) para decidir qué faltó enviar."
+        avisos, rojo, filtro = [], False, None
+        n_no = info.get('no_enviadas', 0)
+        if n_no:
+            rojo, filtro = True, FILTRO_NO_ENVIADAS
+            cerradas = info.get('cerradas_sin_envio', 0)
+            texto = f"{n_no} renovación(es) NO se enviaron en el ticket único del día que les tocaba"
+            detalle = []
+            if n_no - cerradas:
+                detalle.append(f"{n_no - cerradas} con el incidente abierto se suman al lote de hoy")
+            if cerradas:
+                detalle.append(f"{cerradas} ya tienen el incidente cerrado en iTop (no entran al lote; «Restaurar» las incluye)")
+            avisos.append(f"{texto}: {'; '.join(detalle)}.  Clic aquí para verlas.")
+        if info.get('faltan_hoy'):
+            avisos.append(f"{info['faltan_hoy']} renovación(es) de hoy no vienen en el ticket único que salió a las "
+                          f"{info['corte_hoy']:%H:%M}: agrégalas o mándalas en el siguiente.")
+            filtro = filtro or FILTRO_ALERTAS
+        if info.get('sin_comprobar'):
+            avisos.append(f"{info['sin_comprobar']} renovación(es) son de días sin ticket único encontrado: revisa «{FILTRO_SIN_COMPROBAR}».")
+            filtro = filtro or FILTRO_SIN_COMPROBAR
+        if not (info['metodo'] == 'concentrado' and conc):
+            aviso = f"No se encontró el correo concentrado del {info['dia_anterior']:%d/%m}. "
+            if info['metodo'] == 'marca':
+                aviso += f"Se usó la marca local ({info['marca']:%d/%m %H:%M}) para decidir qué faltó enviar."
+            else:
+                aviso += f"Se usó la hora habitual ({hc}); revisa las rezagadas antes de enviar el lote."
+            avisos.append(aviso)
+        if avisos:
+            self._mostrar_aviso("\n".join(avisos), rojo, filtro)
         else:
-            aviso += f"Se usó la hora de corte ({hc}); revisa las rezagadas antes de enviar el lote."
-        self.lbl_notice.configure(text=aviso)
-        self.notice.grid()
+            self.notice.grid_remove()
 
     def _guardar_marca_lote(self, rows: list):
         """Guarda la renovación más reciente del lote copiado/exportado como 'última considerada'."""
@@ -1378,6 +1547,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             or r.get('Ticket_Duplicado')
             or r.get('Requiere_Validacion_Agente')
             or r.get('Cerrado_iTop')
+            or r.get('No_Enviada')
+            or r.get('Falta_Hoy')
             or "DISCREPANCIA" in r.get('Alerta_Renovacion', '')
         )
 
@@ -1404,11 +1575,16 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             if q_filter == FILTRO_PAPELERA:
                 if not is_disc:
                     continue
-            elif q_filter == FILTRO_ENVIADAS:
-                if lote != LOTE_ENVIADA:
+            elif q_filter in FILTROS_REVISION:
+                if q_filter == FILTRO_ENVIADAS and lote != LOTE_ENVIADA:
                     continue
-            elif q_filter == FILTRO_SIGUIENTE:
-                if lote != LOTE_SIGUIENTE:
+                if q_filter == FILTRO_SIGUIENTE and lote != LOTE_SIGUIENTE:
+                    continue
+                if q_filter == FILTRO_NO_ENVIADAS and not r.get('No_Enviada'):
+                    continue
+                if q_filter == FILTRO_TARDE and not r.get('Dias_Retraso'):
+                    continue
+                if q_filter == FILTRO_SIN_COMPROBAR and lote != LOTE_SIN_COMPROBAR:
                     continue
             else:
                 if is_disc or fuera:
@@ -1446,13 +1622,15 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         rid = r['Row_ID']
         if rid in self.discarded_row_ids:
             return "descartado"
+        if r.get('No_Enviada') and rid not in self.validated_row_ids:
+            return "no_enviada"
         if self._fuera_de_lote(r):
             return "fuera_lote"
         if rid in self.validated_row_ids:
             return "validado"
         if r.get('Cerrado_iTop'):
             return "cerrado"
-        if r.get('Lote_Estado') == LOTE_REZAGADA:
+        if r.get('Lote_Estado') == LOTE_REZAGADA or r.get('Falta_Hoy'):
             return "rezagada"
         if r.get('Datos_Incompletos'):
             return "incompleto"
@@ -1489,11 +1667,15 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         # 2. Pestaña Desglose
         prev_sel = set(self.tree_desglose.selection())
         self.tree_desglose.delete(*self.tree_desglose.get_children())
+        self._celdas_completas.clear()
         for i, r in enumerate(visible_rows):
             rid = r['Row_ID']
             estado = "✓  Validada" if rid in self.validated_row_ids else "Pendiente"
             if self._es_nueva(r):
                 estado += "  ·  Nueva"
+            lote = plain_text(r.get('Lote_Etiqueta', ''))
+            self._celdas_completas[(rid, "lote")] = lote
+            self._celdas_completas[(rid, "cierre")] = resumen_cierre(r.get('Cierre_iTop'))
             self.tree_desglose.insert(
                 "", "end", iid=rid,
                 values=(
@@ -1503,8 +1685,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     r['Numero_Cliente'],
                     r['Credito_Renovado_Hijo'],
                     r['Credito_Origen_Padre'],
-                    plain_text(r.get('Lote_Etiqueta', '')),
-                    resumen_cierre(r.get('Cierre_iTop')),
+                    r.get('Lote_Resumen') or lote_corto(lote),
+                    resumen_cierre(r.get('Cierre_iTop'), corto=True),
                     r['Gafete'],
                     r['Nombre_Asignado'],
                     plain_text(r['Alerta_Renovacion']),
@@ -1537,8 +1719,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 'clientes': [], 'creditos_hijos': [], 'creditos_padres': [],
                 'gafete': r['Gafete'], 'agente': r['Nombre_Asignado'], 'resumen': r['Resumen_iTop'],
                 'alerta_asig': plain_text(r['Alerta_Asignacion']), 'fecha': self._fecha_llegada_str(r), 'has_missing': False,
-                'cierre': resumen_cierre(r.get('Cierre_iTop'))
+                'cierre': resumen_cierre(r.get('Cierre_iTop'), corto=True)
             })
+            self._celdas_completas[(f"TKT_{r['Numero_Ticket']}", "cierre")] = resumen_cierre(r.get('Cierre_iTop'))
             if r['Numero_Cliente'] not in g['clientes']:
                 g['clientes'].append(r['Numero_Cliente'])
             g['creditos_hijos'].append(r['Credito_Renovado_Hijo'])
@@ -1655,6 +1838,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         box = self.txt_detail
         box.configure(state="normal")
         box.delete("1.0", "end")
+        if r.get('No_Enviada') or r.get('Dias_Retraso') or r.get('Falta_Hoy'):
+            box.insert("end", f"{plain_text(r.get('Lote_Etiqueta', ''))}\n\n", "error" if r.get('No_Enviada') else "warn")
         cierre = r.get('Cierre_iTop')
         if cierre:
             box.insert("end", f"Cerrado en iTop: {cierre.get('estado') or 'Cerrado'}", "cierre")
@@ -1681,7 +1866,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             )
             box.insert("end", f"     {plain_text(s['Alerta_Renovacion'])}\n", "muted")
         box.insert("end", f"\nLote: {plain_text(r.get('Lote_Etiqueta', '')) or '-'}\n", "titulo")
-        box.insert("end", f"Llegó: {self._fecha_llegada_str(r)}\n", "muted")
+        box.insert("end", f"Llegó: {self._fecha_llegada_str(r)}", "muted")
+        if r.get('Dia_Lote'):
+            box.insert("end", f"  ·  debía ir en el ticket único del {r['Dia_Lote']:%d/%m/%Y}", "muted")
+        box.insert("end", "\n", "muted")
         box.insert("end", f"\nAsignación: {plain_text(r.get('Alerta_Asignacion', '-'))}\n", "titulo")
         box.insert("end", f"{plain_text(r.get('Historial_Asignaciones', '-'))}\n", "muted")
         box.configure(state="disabled")
@@ -1769,6 +1957,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._refresh_views()
 
     def _popup_menu(self, event, tree, menu):
+        if tree.identify_region(event.x, event.y) == "heading":
+            self._menu_columnas(tree, event.x_root, event.y_root)
+            return
         iid = tree.identify_row(event.y)
         if iid and iid not in tree.selection():
             tree.selection_set(iid)
@@ -1778,6 +1969,91 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    # ---------- Columnas visibles ----------
+
+    def _clave_columnas(self, tree) -> str:
+        return "tickets" if tree is self.tree_tickets else "desglose"
+
+    def _aplicar_columnas(self, tree):
+        ocultas = set(self.config_data.get("columnas_ocultas", {}).get(self._clave_columnas(tree), []))
+        tree["displaycolumns"] = [c for c in tree["columns"] if c not in ocultas or c in COLUMNAS_FIJAS]
+
+    def _abrir_menu_columnas(self):
+        tree = self.tree_tickets if self.tabs.get() == self.tabs_names["tickets"] else self.tree_desglose
+        b = self.btn_columnas
+        self._menu_columnas(tree, b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+
+    def _menu_columnas(self, tree, x, y):
+        clave = self._clave_columnas(tree)
+        ocultas = set(self.config_data.get("columnas_ocultas", {}).get(clave, []))
+        m = tk.Menu(self, **self._menu_opts)
+        m.add_command(label="Columnas de la tabla", state="disabled")
+        self._vars_columnas = []
+        for col in tree["columns"]:
+            if col in COLUMNAS_FIJAS:
+                continue
+            var = tk.BooleanVar(value=col not in ocultas)
+            self._vars_columnas.append(var)
+            m.add_checkbutton(
+                label=self._headers[(str(tree), col)], variable=var,
+                command=lambda c=col, v=var: self._mostrar_columna(tree, c, v.get())
+            )
+        m.add_separator()
+        m.add_command(label="Mostrar en pantalla", state="disabled")
+        vista = self.config_data.get("vista", {})
+        for zona, texto in VISTA_ZONAS:
+            var = tk.BooleanVar(value=vista.get(zona, True))
+            self._vars_columnas.append(var)
+            m.add_checkbutton(label=texto, variable=var, command=lambda z=zona, v=var: self._mostrar_zona(z, v.get()))
+        m.add_separator()
+        m.add_command(label="Restablecer vista", command=lambda: self._restablecer_columnas(tree))
+        try:
+            m.tk_popup(x, y)
+        finally:
+            m.grab_release()
+
+    def _mostrar_columna(self, tree, col, visible: bool):
+        clave = self._clave_columnas(tree)
+        ocultas = self.config_data.setdefault("columnas_ocultas", {}).setdefault(clave, [])
+        if visible and col in ocultas:
+            ocultas.remove(col)
+        elif not visible and col not in ocultas:
+            ocultas.append(col)
+        self._aplicar_columnas(tree)
+        self._save_config()
+
+    def _restablecer_columnas(self, tree):
+        clave = self._clave_columnas(tree)
+        self.config_data.setdefault("columnas_ocultas", {})[clave] = list(COLUMNAS_OCULTAS_DEFAULT[clave])
+        self.config_data["vista"] = dict(VISTA_DEFAULT)
+        self._aplicar_columnas(tree)
+        self._aplicar_vista()
+        self._save_config()
+
+    def _mostrar_zona(self, zona: str, visible: bool):
+        self.config_data.setdefault("vista", dict(VISTA_DEFAULT))[zona] = visible
+        self._aplicar_vista()
+        self._save_config()
+
+    def _aplicar_vista(self):
+        """Muestra u oculta indicadores, panel de detalle y configuración lateral según «Vista»."""
+        vista = self.config_data.get("vista", {})
+        if vista.get("indicadores", True):
+            self.kpi_bar.grid()
+            self.paned.grid_configure(pady=0)
+        else:
+            self.kpi_bar.grid_remove()
+            self.paned.grid_configure(pady=(14, 0))
+        if vista.get("configuracion", True):
+            self.sidebar_config.grid()
+        else:
+            self.sidebar_config.grid_remove()   # queda solo «Extraer y validar»
+        en_paned = str(self.detail_frame) in [str(p) for p in self.paned.panes()]
+        if vista.get("detalle", True) and not en_paned:
+            self.paned.add(self.detail_frame, weight=2)
+        elif not vista.get("detalle", True) and en_paned:
+            self.paned.forget(self.detail_frame)
 
     def _to_clipboard(self, text: str, aviso: str):
         self.clipboard_clear()
@@ -2065,6 +2341,38 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             if (r['Row_ID'] in self.discarded_row_ids) or (auto_excl and r.get('Reasignado_A_Otro')) or self._fuera_de_lote(r)
         ]
 
+        # 5. Revisión de envíos: cada renovación contra los tickets únicos (en qué día debía ir y si salió)
+        def resultado(r):
+            estado = r.get('Lote_Estado')
+            if r.get('No_Enviada'):
+                return "NO ENVIADA - incidente cerrado" if estado == LOTE_CERRADA_SIN_ENVIO else "NO ENVIADA - va en el lote de hoy"
+            if r.get('Dias_Retraso'):
+                return "Enviada tarde"
+            return {
+                LOTE_ENVIADA: "Enviada", LOTE_EN_CONCENTRADO: "Enviada", LOTE_SIN_COMPROBAR: "Sin comprobar",
+                LOTE_SIGUIENTE: "Lote siguiente", LOTE_REZAGADA: "Rezagada (va hoy)",
+            }.get(estado, "Lote de hoy")
+
+        revision_data = [
+            {
+                "Resultado": resultado(r),
+                "Ticket iTop": r['Numero_Ticket'],
+                "Llegó": self._fecha_llegada_str(r),
+                "Debía ir en el ticket único del": r['Dia_Lote'].strftime('%d/%m/%Y') if r.get('Dia_Lote') else '',
+                "No. Cliente": r['Numero_Cliente'],
+                "Crédito a cancelar": r['Credito_Renovado_Hijo'],
+                "Enviada en": r.get('Enviado_En', ''),
+                "Fecha de envío": r['Enviado_Fecha'].strftime('%d/%m/%Y') if r.get('Enviado_Fecha') else '',
+                "Días de retraso": r.get('Dias_Retraso') or '',
+                "Detalle": plain_text(r.get('Lote_Etiqueta', '')),
+                "Cierre iTop": resumen_cierre(r.get('Cierre_iTop')),
+                "Gafete": r['Gafete'],
+                "Agente": r['Nombre_Asignado'],
+                "Descartada": "SÍ" if r['Row_ID'] in self.discarded_row_ids else "",
+            }
+            for r in sorted(self.all_rows, key=lambda x: (not x.get('No_Enviada'), x.get('Fecha_Llegada_DT') or datetime.min))
+        ]
+
         with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
             df1 = pd.DataFrame(desglose_data) if desglose_data else pd.DataFrame(columns=["Sin datos"])
             df2 = pd.DataFrame(tickets_data) if tickets_data else pd.DataFrame(columns=["Sin datos"])
@@ -2075,6 +2383,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             df3.to_excel(writer, sheet_name="3_Resumen_Por_Agente", index=False)
             if descartados_data:
                 pd.DataFrame(descartados_data).to_excel(writer, sheet_name="4_Descartados_Excluidos", index=False)
+            if revision_data and self.lote_info:
+                pd.DataFrame(revision_data).to_excel(writer, sheet_name="5_Revision_de_Envios", index=False)
 
             from openpyxl.styles import PatternFill, Font, Alignment
             wb = writer.book
@@ -2085,6 +2395,17 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             fill_inc = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
             fill_rez = PatternFill(start_color="EEF2FF", end_color="EEF2FF", fill_type="solid")
             fill_cerr = PatternFill(start_color="F5F3FF", end_color="F5F3FF", fill_type="solid")
+            fill_no_env = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+            fill_tarde = PatternFill(start_color="FFFBEB", end_color="FFFBEB", fill_type="solid")
+
+            if "5_Revision_de_Envios" in wb.sheetnames:
+                ws5 = wb["5_Revision_de_Envios"]
+                for row in ws5.iter_rows(min_row=2):
+                    res = str(row[0].value or "")
+                    fill = fill_no_env if res.startswith("NO ENVIADA") else (fill_tarde if res == "Enviada tarde" else None)
+                    if fill:
+                        for cell in row:
+                            cell.fill = fill
 
             for ws in wb.worksheets:
                 for cell in ws[1]:
@@ -2112,7 +2433,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                         t_cell.font = link_font
 
                     row_fill = None
-                    if r_orig.get("Datos_Incompletos"):
+                    if r_orig.get("No_Enviada"):
+                        row_fill = fill_no_env
+                    elif r_orig.get("Datos_Incompletos"):
                         row_fill = fill_inc
                     elif r_orig.get("Cerrado_iTop"):
                         row_fill = fill_cerr
