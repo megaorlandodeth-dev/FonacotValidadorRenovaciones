@@ -21,7 +21,7 @@ from core_renovaciones import (  # noqa: E402
     ticket_key,
     LOTE_ENVIADA, LOTE_REZAGADA,
 )
-from lote_utils import build_ticket_unico_html, build_ticket_unico_tsv, INTRO_TICKET_UNICO_DEFAULT  # noqa: E402
+from lote_utils import build_ticket_unico_html, build_ticket_unico_tsv, lote_corto, INTRO_TICKET_UNICO_DEFAULT  # noqa: E402
 from outlook_renovaciones_engine import FonacotRenovacionesEngine  # noqa: E402
 
 # Reproduce el correo "Cancelación de renovaciones – ticket único 22-10-2026"
@@ -171,6 +171,14 @@ class TestCierreItop(unittest.TestCase):
         self.assertFalse(rows[1]['Cerrado_iTop'])
         texto = resumen_cierre(rows[0]['Cierre_iTop'])
         self.assertTrue(texto.startswith("Resuelto 22/10 17:48  ·  7353 Sammy"))
+        self.assertEqual(resumen_cierre(rows[0]['Cierre_iTop'], corto=True), "Resuelto 22/10 17:48  ·  7353 Sammy")
+
+    def test_textos_cortos_de_la_tabla(self):
+        self.assertEqual(
+            lote_corto("Rezagada 22/10 14:53 (el ticket está en el concentrado pero NO este Cliente+Crédito; ahí viene Cliente 1 Crédito 2)"),
+            "Rezagada 22/10 14:53  ·  otros datos en el concentrado")
+        self.assertEqual(lote_corto("Rezagada 22/10 12:56 (no está en el concentrado)"), "Rezagada 22/10 12:56  ·  no se envió")
+        self.assertEqual(lote_corto("Lote de hoy"), "Lote de hoy")
 
 
 if __name__ == "__main__":

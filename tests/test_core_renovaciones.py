@@ -21,6 +21,7 @@ from core_renovaciones import (  # noqa: E402
     extract_concentrado_tokens,
     clasificar_lotes,
     LOTE_HOY, LOTE_REZAGADA, LOTE_ENVIADA, LOTE_EN_CONCENTRADO, LOTE_SIGUIENTE,
+    LOTE_CERRADA_SIN_ENVIO, LOTE_SIN_COMPROBAR,
 )
 
 
@@ -98,6 +99,14 @@ class TestCasosHistoricos(unittest.TestCase):
     def test_signos_mas(self):
         self.assertEqual(pares("CANCELACION DE RENOVACION + 7239770+50074"), [('7239770', '50074')])
 
+    def test_asterisco_i362479(self):
+        desc = ("Buenas tardes,\nSolicito su apoyo para la cancelación de la renovación siguiente:\nSaludos.\n"
+                "Cancelación de renovación\n1\nEnviar por correo electrónico al 111\n"
+                "El asunto en el correo electrónico que contenga:\n“Cancelación de crédito 1184282*10430\n"
+                "Redacción sugerida:\nSolicito su apoyo para la cancelación de la renovación siguiente")
+        self.assertEqual(pares("Cancelación de renovación", desc), [('1184282', '10430')])
+        self.assertEqual(pares("1184282 * 10430 * 10431"), [('1184282', '10430'), ('1184282', '10431')])
+
 
 class TestItop(unittest.TestCase):
     def test_incident(self):
@@ -163,12 +172,12 @@ class TestClasificarLotes(unittest.TestCase):
             fila("I-361001", "5864479", "56574", datetime(2026, 10, 22, 10, 0)),   # mismo ticket pero NO enviada
             fila("I-361002", "4530500", "91258", datetime(2026, 10, 22, 18, 5)),   # después del corte de ayer
             fila("I-361003", "3386153", "61116", datetime(2026, 10, 23, 9, 0)),    # hoy
-            fila("I-361004", "6173151", "57137", datetime(2026, 10, 23, 18, 1)),   # hoy después del corte
+            fila("I-361004", "6173151", "57137", datetime(2026, 10, 23, 18, 1)),   # hoy 18:01, aún no sale el de hoy
         ]
         conc = concentrado("TICKET UNICO 22/10/2026", datetime(2026, 10, 22, 17, 52), "I-361001 5864479 56572")
         info = clasificar_lotes(rows, self.HOY, self.HOY, self.CORTE, [conc])
         self.assertEqual([r['Lote_Estado'] for r in rows],
-                         [LOTE_ENVIADA, LOTE_REZAGADA, LOTE_REZAGADA, LOTE_HOY, LOTE_SIGUIENTE])
+                         [LOTE_ENVIADA, LOTE_REZAGADA, LOTE_REZAGADA, LOTE_HOY, LOTE_HOY])
         self.assertIn("NO este Cliente+Crédito", rows[1]['Lote_Etiqueta'])
         self.assertEqual(info['metodo'], 'concentrado')
         self.assertEqual(info['ultima_considerada']['ticket'], "I-361001")
@@ -212,6 +221,133 @@ class TestClasificarLotes(unittest.TestCase):
         conc = concentrado("TICKET UNICO 22/10/2026", datetime(2026, 10, 22, 17, 52), "I-361009")
         clasificar_lotes(rows, self.HOY, self.HOY, self.CORTE, [conc])
         self.assertEqual(rows[0]['Lote_Estado'], LOTE_ENVIADA)
+
+
+class TestRevisionEnvios(unittest.TestCase):
+    """Periodo de varios días: cada renovación contra todos los tickets únicos enviados después."""
+    CORTE = time(17, 50)
+    AHORA = datetime(2026, 10, 23, 10, 0)
+    CONC_30 = staticmethod(lambda: concentrado(
+        "Cancelación de renovaciones – ticket único 30-09-2026", datetime(2026, 9, 30, 17, 45), "I-359504 5864479 56572"))
+
+    def revisar(self, rows, concs, inicio=date(2026, 9, 30), fin=date(2026, 10, 23)):
+        return clasificar_lotes(rows, inicio, fin, self.CORTE, concs, ahora=self.AHORA)
+
+    def test_i359504_no_enviada_y_cerrada(self):
+        rows = [fila("I-359504", "5864479", "56572", datetime(2026, 9, 30, 10, 0)),
+                fila("I-359504", "5864479", "56574", datetime(2026, 9, 30, 10, 0))]
+        rows[1].update(Cerrado_iTop=True, Cierre_iTop={'estado': 'Resuelto', 'fecha_dt': datetime(2026, 10, 1, 11, 6)})
+        info = self.revisar(rows, [self.CONC_30()])
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_ENVIADA)
+        self.assertEqual(rows[0]['Lote_Resumen'], "Enviada 30/09")
+        self.assertEqual(rows[1]['Lote_Estado'], LOTE_CERRADA_SIN_ENVIO)
+        self.assertTrue(rows[1]['No_Enviada'])
+        self.assertIn("debía ir en el ticket único del 30/09", rows[1]['Lote_Etiqueta'])
+        self.assertIn("se cerró el 01/10", rows[1]['Lote_Etiqueta'])
+        self.assertEqual((info['no_enviadas'], info['cerradas_sin_envio'], info['revision']), (1, 1, True))
+
+    def test_no_enviada_abierta_va_hoy(self):
+        rows = [fila("I-359504", "5864479", "56574", datetime(2026, 9, 30, 10, 0))]
+        self.revisar(rows, [self.CONC_30()])
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_REZAGADA)
+        self.assertTrue(rows[0]['No_Enviada'])
+        self.assertEqual(rows[0]['Lote_Resumen'], "NO ENVIADA (30/09)  ·  va hoy")
+
+    def test_lunes_enviada_el_martes_no_cuenta_como_faltante(self):
+        rows = [fila("I-362001", "4530500", "91258", datetime(2026, 10, 19, 11, 0))]
+        concs = [concentrado("Ticket único 19-10-2026", datetime(2026, 10, 19, 17, 50), "I-362000 1111111 22222"),
+                 concentrado("Ticket único 20-10-2026", datetime(2026, 10, 20, 17, 50), "I-362001 4530500 91258")]
+        info = self.revisar(rows, concs, date(2026, 10, 19), date(2026, 10, 19))
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_ENVIADA)
+        self.assertFalse(rows[0]['No_Enviada'])
+        self.assertEqual(rows[0]['Dias_Retraso'], 1)
+        self.assertIn("Enviada tarde", rows[0]['Lote_Etiqueta'])
+        self.assertEqual(info['tarde'], 1)
+
+    def test_lunes_sin_enviar_en_ningun_dia(self):
+        rows = [fila("I-362001", "4530500", "91258", datetime(2026, 10, 19, 11, 0))]
+        concs = [concentrado("Ticket único 19-10-2026", datetime(2026, 10, 19, 17, 50), "I-362000 1111111 22222"),
+                 concentrado("Ticket único 21-10-2026", datetime(2026, 10, 21, 17, 50), "I-362100 3333333 44444")]
+        self.revisar(rows, concs, date(2026, 10, 19), date(2026, 10, 19))
+        self.assertTrue(rows[0]['No_Enviada'])
+        self.assertEqual(rows[0]['Dia_Lote'], date(2026, 10, 19))
+
+    def test_dia_sin_ticket_unico_queda_sin_comprobar(self):
+        rows = [fila("I-361500", "4530500", "91258", datetime(2026, 10, 14, 11, 0))]
+        concs = [concentrado("Ticket único 22-10-2026", datetime(2026, 10, 22, 17, 50), "I-362100 3333333 44444")]
+        self.revisar(rows, concs)
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_SIN_COMPROBAR)
+        self.assertFalse(rows[0]['No_Enviada'])
+
+    def test_ya_enviada_antes_en_otro_ticket(self):
+        rows = [fila("I-362300", "4530500", "91258", datetime(2026, 10, 21, 9, 0))]
+        concs = [concentrado("Ticket único 20-10-2026", datetime(2026, 10, 20, 17, 50), "I-362001 4530500 91258"),
+                 concentrado("Ticket único 21-10-2026", datetime(2026, 10, 21, 17, 50), "I-362100 3333333 44444")]
+        self.revisar(rows, concs)
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_ENVIADA)
+        self.assertIn("antes de que llegara", rows[0]['Lote_Etiqueta'])
+
+    def test_hoy_sigue_siendo_lote_de_hoy_en_revision(self):
+        rows = [fila("I-362500", "4530500", "91258", datetime(2026, 10, 23, 9, 0)),
+                fila("I-362501", "1234567", "11111", datetime(2026, 10, 23, 18, 0))]
+        self.revisar(rows, [self.CONC_30()])
+        self.assertEqual([r['Lote_Estado'] for r in rows], [LOTE_HOY, LOTE_HOY])
+
+
+class TestCorteReal(unittest.TestCase):
+    """El corte de cada día es la hora en que salió su ticket único, no una hora fija."""
+    CORTE = time(17, 50)
+    AHORA = datetime(2026, 10, 23, 20, 0)
+
+    def clasificar(self, rows, concs):
+        return clasificar_lotes(rows, date(2026, 10, 23), date(2026, 10, 23), self.CORTE, concs, ahora=self.AHORA)
+
+    def test_ticket_de_ayer_salio_tarde(self):
+        # Ayer el ticket único salió a las 19:10: lo de las 18:30 sí debía ir (y va), lo de las 19:30 va hoy
+        rows = [fila("I-361001", "5864479", "56572", datetime(2026, 10, 22, 18, 30)),
+                fila("I-361002", "4530500", "91258", datetime(2026, 10, 22, 19, 30))]
+        conc = concentrado("Ticket único 22-10-2026", datetime(2026, 10, 22, 19, 10), "I-361001 5864479 56572")
+        info = self.clasificar(rows, [conc])
+        self.assertEqual([r['Lote_Estado'] for r in rows], [LOTE_ENVIADA, LOTE_REZAGADA])
+        self.assertIn("después del envío del ticket único (19:10)", rows[1]['Lote_Etiqueta'])
+        self.assertEqual(info['corte_anterior'], datetime(2026, 10, 22, 19, 10))
+
+    def test_ticket_de_ayer_salio_temprano(self):
+        # Salió a las 16:00: lo de las 17:00 no es un olvido, va hoy (antes, con 17:50 fijo, se daba por enviada)
+        rows = [fila("I-361002", "4530500", "91258", datetime(2026, 10, 22, 17, 0))]
+        conc = concentrado("Ticket único 22-10-2026", datetime(2026, 10, 22, 16, 0), "I-361001 5864479 56572")
+        self.clasificar(rows, [conc])
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_REZAGADA)
+        self.assertFalse(rows[0]['No_Enviada'])
+
+    def test_llego_mientras_se_armaba(self):
+        # 10 min antes del envío y no viene: llegó mientras se armaba, no se marca como NO ENVIADA
+        rows = [fila("I-361002", "4530500", "91258", datetime(2026, 10, 22, 17, 40))]
+        conc = concentrado("Ticket único 22-10-2026", datetime(2026, 10, 22, 17, 50), "I-361001 5864479 56572")
+        self.clasificar(rows, [conc])
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_REZAGADA)
+        self.assertFalse(rows[0]['No_Enviada'])
+        self.assertIn("junto al envío", rows[0]['Lote_Resumen'])
+
+    def test_hoy_antes_y_despues_del_envio(self):
+        rows = [fila("I-362500", "4530500", "91258", datetime(2026, 10, 23, 9, 0)),   # viene en el de hoy
+                fila("I-362501", "1234567", "11111", datetime(2026, 10, 23, 10, 0)),  # no viene: falta
+                fila("I-362502", "7654321", "22222", datetime(2026, 10, 23, 19, 0))]  # después del envío
+        conc = concentrado("Ticket único 23-10-2026", datetime(2026, 10, 23, 18, 40), "I-362500 4530500 91258")
+        info = self.clasificar(rows, [conc])
+        self.assertEqual([r['Lote_Estado'] for r in rows], [LOTE_EN_CONCENTRADO, LOTE_HOY, LOTE_SIGUIENTE])
+        self.assertTrue(rows[1]['Falta_Hoy'])
+        self.assertIn("falta en el de las 18:40", rows[1]['Lote_Resumen'])
+        self.assertEqual(rows[2]['Dia_Lote'], date(2026, 10, 26))  # viernes después del envío -> lunes
+        self.assertEqual((info['corte_hoy'], info['faltan_hoy']), (datetime(2026, 10, 23, 18, 40), 1))
+
+    def test_respuesta_no_mueve_el_corte(self):
+        rows = [fila("I-361002", "4530500", "91258", datetime(2026, 10, 22, 19, 0))]
+        concs = [concentrado("Ticket único 22-10-2026", datetime(2026, 10, 22, 17, 50), "I-361001 5864479 56572"),
+                 concentrado("RE: Ticket único 22-10-2026", datetime(2026, 10, 23, 9, 0), "I-361001 5864479 56572")]
+        self.clasificar(rows, concs)
+        self.assertEqual(rows[0]['Lote_Estado'], LOTE_REZAGADA)
+        self.assertFalse(rows[0]['No_Enviada'])
 
 
 if __name__ == "__main__":
