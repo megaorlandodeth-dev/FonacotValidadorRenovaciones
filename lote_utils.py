@@ -154,6 +154,58 @@ def build_lote_html(rows: list, validados: set, titulo: str = "") -> str:
     return "\n".join(partes)
 
 
+# ======================= FORMATO "TICKET ÚNICO" (el correo que se envía cada día) =======================
+
+TICKET_UNICO_COLUMNAS = ('INCIDENTE', 'FECHA', 'CLIENTE', 'CREDITO (HIJO)')
+
+INTRO_TICKET_UNICO_DEFAULT = (
+    "Hola,\n\n"
+    "Se envía “{total}” solicitudes de cancelaciones para su atención, favor de asignar a incidentes."
+)
+
+
+def _fila_ticket_unico(r: dict) -> tuple:
+    llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
+    fecha = llegada.strftime('%d/%m/%Y') if llegada else str(r.get('Fecha', ''))[:10]
+    return (str(r.get('Numero_Ticket', '')), fecha,
+            str(r.get('Numero_Cliente', '') or ''), str(r.get('Credito_Renovado_Hijo', '') or ''))
+
+
+def build_ticket_unico_tsv(rows: list) -> str:
+    lines = ["\t".join(TICKET_UNICO_COLUMNAS)]
+    lines += ["\t".join(v.replace("\t", " ") for v in _fila_ticket_unico(r)) for r in rows]
+    return "\n".join(lines)
+
+
+def build_ticket_unico_html(rows: list, intro: str = "", url_fn=None) -> str:
+    """
+    Cuerpo del correo con el mismo formato del "ticket único" que ya se envía:
+    saludo con el total, y tabla INCIDENTE (con liga a iTop) | FECHA | CLIENTE | CREDITO (HIJO).
+    `intro` admite {total}; vacío = sin texto (solo la tabla, para pegar).
+    """
+    font = "font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000000"
+    celda = f"{font};border:1px solid #000000;padding:2px 10px;text-align:center"
+    partes = []
+    if intro:
+        try:
+            texto = intro.format(total=len(rows))
+        except (KeyError, IndexError, ValueError):
+            texto = intro
+        for parrafo in re.split(r'\n\s*\n', texto.strip()):
+            partes.append(f'<p style="{font};margin:0 0 10pt 0">{escape(parrafo).replace(chr(10), "<br>")}</p>')
+    partes.append('<table style="border-collapse:collapse" cellspacing="0" cellpadding="0">')
+    partes.append("<tr>" + "".join(f'<td style="{celda};font-weight:bold">{escape(h)}</td>' for h in TICKET_UNICO_COLUMNAS) + "</tr>")
+    for r in rows:
+        ticket, fecha, cli, cred = (escape(v) for v in _fila_ticket_unico(r))
+        url = url_fn(r.get('Numero_Ticket', '')) if url_fn else ''
+        if url:
+            ticket = f'<a href="{escape(url)}" style="color:#000000">{ticket}</a>'
+        partes.append(f'<tr><td style="{celda}">{ticket}</td><td style="{celda}">{fecha}</td>'
+                      f'<td style="{celda}">{cli}</td><td style="{celda}">{cred}</td></tr>')
+    partes.append("</table><p></p>")
+    return "\n".join(partes)
+
+
 def make_cf_html(fragment: str) -> bytes:
     """Empaqueta un fragmento HTML con el encabezado de offsets que exige el formato 'HTML Format' de Windows."""
     header_tpl = (

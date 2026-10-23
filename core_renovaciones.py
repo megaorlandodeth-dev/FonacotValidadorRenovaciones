@@ -950,11 +950,85 @@ def extract_concentrado_tokens(text: str) -> tuple:
     return tickets, numeros
 
 
+def ticket_key(ticket: str) -> str:
+    """Forma canónica de un folio para comparar: 'i-0362386' -> 'I-362386'."""
+    prefix, num = _split_ticket_ref(ticket)
+    return f"{prefix}-{num}" if num else ''
+
+
+def extract_concentrado_rows(html: str) -> list:
+    """
+    Filas de la tabla del correo "Ticket Único" (INCIDENTE | FECHA | CLIENTE | CREDITO (HIJO)):
+    [{'ticket': 'I-362277', 'fecha': '13/10/2026', 'cliente': '4826460', 'credito': '82508'}].
+    Solo lee tablas sin tablas anidadas (las de diseño del correo envuelven a la de datos).
+    """
+    if not html:
+        return []
+    try:
+        soup = make_soup(html)
+    except Exception:
+        return []
+    filas = []
+    for tbl in soup.find_all('table'):
+        if tbl.find('table'):
+            continue
+        cols = None
+        for tr in tbl.find_all('tr'):
+            raw = [c.get_text(" ", strip=True) for c in tr.find_all(['td', 'th'])]
+            if cols is None:
+                idx = {}
+                for i, cell in enumerate(normalize_text(c) for c in raw):
+                    if 'ticket' not in idx and re.search(r'incidente|ticket|folio', cell):
+                        idx['ticket'] = i
+                    elif 'cliente' not in idx and 'cliente' in cell:
+                        idx['cliente'] = i
+                    elif 'credito' not in idx and 'credito' in cell:
+                        idx['credito'] = i
+                    elif 'fecha' not in idx and 'fecha' in cell:
+                        idx['fecha'] = i
+                if {'cliente', 'credito'} <= idx.keys():
+                    cols = idx
+                continue
+
+            def val(campo):
+                i = cols.get(campo)
+                return raw[i] if i is not None and i < len(raw) else ''
+
+            cli = first_digits(strip_letter_prefixes(val('cliente')))
+            cred = first_digits(strip_letter_prefixes(val('credito')))
+            if not cli and not cred:
+                continue
+            filas.append({'ticket': ticket_key(val('ticket')) if re.search(r'\d', val('ticket')) else '',
+                          'fecha': val('fecha'), 'cliente': cli, 'credito': cred})
+    return filas
+
+
+def extract_concentrado_intro(plain_body: str) -> str:
+    """
+    Texto del concentrado antes de la tabla ("Hola, Se envía “35” solicitudes…  FAVOR DE BLOQUEAR…"),
+    con el número entre comillas cambiado por {total}, para reutilizarlo en el correo del día. '' si no aplica.
+    """
+    texto = str(plain_body or '').replace('\r\n', '\n')
+    m = re.search(r'^\s*(INCIDENTE|TICKET|FOLIO)\b', texto, re.I | re.M) or re.search(r'\bI-\d{3,10}\b', texto)
+    if not m:
+        return ''
+    intro = re.sub(r'\n{3,}', '\n\n', texto[:m.start()]).strip()
+    if not intro or len(intro) > 1500 or 'solicitud' not in normalize_text(intro):
+        return ''
+    return re.sub(r'([“"«])\s*\d+\s*([”"»])', r'\g<1>{total}\g<2>', intro, count=1)
+
+
+def _concentrado_filas_del_ticket(conc: dict, ticket: str) -> list:
+    return [f for f in conc.get('filas') or [] if f.get('ticket') and first_digits(f['ticket']) == ticket]
+
+
 def _row_match_concentrado(row: dict, concentrados: list):
     """
     Busca la renovación en los concentrados. Regla anti-omisión:
     - Si la fila tiene Cliente y Crédito, solo cuenta como enviada si AMBOS aparecen en el concentrado
       (que esté el ticket no basta: un ticket con 3 renovaciones pudo enviarse con solo 2).
+      Si el concentrado trae su tabla (INCIDENTE | FECHA | CLIENTE | CREDITO), se compara renglón por renglón;
+      también cuenta el mismo ticket con el mismo crédito (un dígito mal capturado en el cliente no la vuelve rezagada).
     - Si a la fila le falta el cliente o el crédito, basta con que aparezca el ticket.
     Retorna (tipo_match, concentrado) con tipo_match en {'PAR', 'TICKET', None}.
     """
@@ -963,7 +1037,14 @@ def _row_match_concentrado(row: dict, concentrados: list):
     ticket = first_digits(row.get('Numero_Ticket'))
     ticket_hit = None
     for conc in concentrados:
-        if cli and cred and cli in conc['numeros'] and cred in conc['numeros']:
+        filas = conc.get('filas') or []
+        if filas:
+            for f in filas:
+                if cli and cred and f['cliente'] == cli and f['credito'] == cred:
+                    return 'PAR', conc
+                if ticket and cred and f['credito'] == cred and first_digits(f['ticket']) == ticket:
+                    return 'PAR', conc
+        elif cli and cred and cli in conc['numeros'] and cred in conc['numeros']:
             return 'PAR', conc
         if ticket and ticket in conc['tickets'] and ticket_hit is None:
             ticket_hit = conc
@@ -1049,6 +1130,9 @@ def clasificar_lotes(
                 r['Lote_Estado'] = LOTE_REZAGADA
                 if tipo == 'TICKET':
                     motivo = "el ticket está en el concentrado pero NO este Cliente+Crédito"
+                    en_conc = _concentrado_filas_del_ticket(conc, first_digits(r.get('Numero_Ticket')))
+                    if en_conc:
+                        motivo += "; ahí viene " + ", ".join(f"Cliente {f['cliente']} Crédito {f['credito']}" for f in en_conc)
                 elif metodo == 'concentrado':
                     motivo = "no está en el concentrado"
                 elif metodo == 'marca':
@@ -1090,3 +1174,75 @@ def clasificar_lotes(
         ),
         'conteos': conteos,
     }
+
+
+# ======================= CIERRE EN iTop ("Aviso de solución del Ticket") =======================
+
+_CAMPOS_CIERRE = (
+    ('estado', r'^estado$'),
+    ('codigo', r'^codigo de solucion$'),
+    ('motivo', r'^(solucion|objetivo de solucion|comentario de solucion|respuesta|motivo( de (cierre|solucion))?)$'),
+    ('cerro', r'resuelto por|cerrado por|atendido por|^agente|tecnico|analista|especialista|^asignado a|responsable'),
+    ('fecha', r'^fecha.*(solucion|resolucion|cierre)'),
+    ('solicitante', r'^(nombre|solicitante)$'),
+    ('categoria', r'^categoria$'),
+)
+
+
+def is_aviso_solucion(subject: str) -> str:
+    """Folio si el asunto es un aviso de solución/cierre de iTop ('I-362386 Aviso de solución del Ticket'); '' si no."""
+    s = normalize_text(subject)
+    if not re.search(r'aviso de solucion|solucion del (ticket|reporte|incidente)|(ticket|reporte|incidente) \S+ (fue )?(resuelto|cerrado)', s):
+        return ''
+    m = re.search(r'\b([ir])\s*-\s*(\d{3,10})\b', s)
+    return ticket_key(f"{m.group(1)}-{m.group(2)}") if m else ''
+
+
+def parse_aviso_solucion(html_body: str, plain_body: str = '') -> dict:
+    """
+    Campos del correo de cierre de iTop (tabla Etiqueta | Valor): estado, motivo (Solución / Objetivo de solución),
+    código de solución, quién lo cerró (si el correo lo trae), fecha, solicitante y categoría.
+    """
+    pares = []
+    if html_body:
+        try:
+            for tr in make_soup(html_body).find_all('tr'):
+                tds = tr.find_all(['td', 'th'], recursive=False) or tr.find_all(['td', 'th'])
+                if len(tds) >= 2:
+                    pares.append((tds[0].get_text(" ", strip=True), tds[1].get_text(" ", strip=True)))
+        except Exception:
+            pass
+    if not pares and plain_body:
+        lineas = [ln.strip() for ln in str(plain_body).replace('\r', '').split('\n')]
+        for i, ln in enumerate(lineas):
+            m = re.match(r'([^:\t]{3,40}?)\s*[:\t]\s*(.*)$', ln)
+            if not m:
+                continue
+            valor = m.group(2).strip() or next((x for x in lineas[i + 1:i + 3] if x), '')
+            pares.append((m.group(1), valor))
+
+    campos = {}
+    for etiqueta, valor in pares:
+        clave = normalize_text(etiqueta).strip(' :#')
+        valor = re.sub(r'\s+', ' ', valor).strip()
+        if not valor or len(clave) > 40:
+            continue
+        for campo, patron in _CAMPOS_CIERRE:
+            if campo not in campos and re.search(patron, clave):
+                campos[campo] = valor
+                break
+    return campos
+
+
+def resumen_cierre(cierre: dict) -> str:
+    """'Resuelto 22/10 17:48 · 7353 Sammy Avila · Por instrucciones superiores…' para tablas y reportes."""
+    if not cierre:
+        return ''
+    partes = [cierre.get('estado') or 'Cerrado']
+    if cierre.get('fecha_dt'):
+        partes[0] += f" {cierre['fecha_dt'].strftime('%d/%m %H:%M')}"
+    if cierre.get('cerro'):
+        partes.append(cierre['cerro'])
+    if cierre.get('motivo'):
+        partes.append(cierre['motivo'])
+    return "  ·  ".join(partes)
