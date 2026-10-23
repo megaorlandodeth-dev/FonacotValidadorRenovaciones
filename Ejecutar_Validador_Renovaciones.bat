@@ -8,10 +8,27 @@ if exist "dist\FonacotValidadorRenovaciones_v1\FonacotValidadorRenovaciones_v1.e
     exit
 )
 
-"C:\Users\sammy.avila\AppData\Local\Programs\Python\Python312\python.exe" validador_renovaciones_app.py
+rem Usa el Python instalado en este equipo (antes apuntaba a la ruta de otro usuario)
+set "PYEXE="
+where py >nul 2>nul && set "PYEXE=py -3"
+if not defined PYEXE (
+    where python >nul 2>nul && set "PYEXE=python"
+)
+if not defined PYEXE (
+    echo No se encontro Python. Instala Python 3.10+ desde https://www.python.org/ y marca "Add to PATH".
+    pause
+    exit /b 1
+)
+
+%PYEXE% -c "import customtkinter, tkcalendar, bs4, pandas, openpyxl, win32com" >nul 2>nul
+if errorlevel 1 (
+    echo Instalando dependencias...
+    %PYEXE% -m pip install -r requirements.txt
+)
+
+%PYEXE% validador_renovaciones_app.py
 if errorlevel 1 (
     echo.
     echo Ocurrio un error al iniciar la aplicacion.
     pause
 )
-
