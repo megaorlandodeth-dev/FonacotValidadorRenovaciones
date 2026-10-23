@@ -1,0 +1,8 @@
+customtkinter
+tkcalendar
+babel
+beautifulsoup4
+lxml
+pandas
+openpyxl
+pywin32

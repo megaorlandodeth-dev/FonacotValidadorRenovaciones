@@ -11,8 +11,114 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime
+from datetime import datetime, date, time, timedelta
+from urllib.parse import quote
 from bs4 import BeautifulSoup
+
+
+def make_soup(html: str) -> BeautifulSoup:
+    """BeautifulSoup con lxml si está instalado; si no, el parser nativo de Python (antes fallaba en silencio)."""
+    try:
+        return BeautifulSoup(html, 'lxml')
+    except Exception:
+        return BeautifulSoup(html, 'html.parser')
+
+
+# ======================= ABREVIATURAS DE UNA LETRA / CORTAS =======================
+# Las sucursales escriben "C5864479", "T 4530500", "Cte. 3386153", "Cred. 61116", "R-91258", "C-74544"...
+# Como la letra va pegada al número, los patrones con \b no los veían. Aquí se traducen a etiquetas completas.
+_ABBR_CLIENTE = {'clte', 'cte', 'cli', 'clt', 'cta', 'trab', 'tr', 't'}
+_ABBR_CREDITO = {'cred', 'crd', 'cr', 'cto', 'cdto', 'renov', 'reno', 'ren', 'r', 'pag'}
+_ABBR_PADRE = {'orig', 'org', 'ant'}
+_ABBR_AMBIGUO = {'c'}  # "C" puede ser Cliente o Crédito: se decide por la cantidad de dígitos
+
+_ABBR_RE = re.compile(
+    r'(?<![A-Za-zÁÉÍÓÚÑáéíóúñ\d])'
+    r'(?P<lbl>clte|cte|cli|clt|cta|trab|tr|t|cred|crd|cdto|cto|cr|renov|reno|ren|r|pag|orig|org|ant|c)'
+    r'\s*[\.:#\-]?\s*(?P<num>\d{3,10})(?!\d)',
+    re.I
+)
+
+# Los números de cliente FONACOT tienen 7 dígitos; los créditos/renovaciones, de 3 a 6
+MIN_DIGITOS_CLIENTE_AMBIGUO = 7
+
+
+def _expand_abbr_match(m: re.Match) -> str:
+    lbl = m.group('lbl').lower()
+    num = m.group('num')
+    if num.startswith('0'):
+        # Folios tipo R-012345 (UserRequest de iTop) u otros con ceros a la izquierda: no son clientes ni créditos
+        return m.group(0)
+    n = len(num)
+    if lbl in _ABBR_CLIENTE:
+        return f"Cliente: {num}" if 5 <= n <= 8 else m.group(0)
+    if lbl in _ABBR_CREDITO:
+        return f"Credito: {num}" if n <= 7 else m.group(0)
+    if lbl in _ABBR_PADRE:
+        return f"Credito anterior: {num}" if n <= 7 else m.group(0)
+    if lbl in _ABBR_AMBIGUO:
+        if MIN_DIGITOS_CLIENTE_AMBIGUO <= n <= 8:
+            return f"Cliente: {num}"
+        if n < MIN_DIGITOS_CLIENTE_AMBIGUO:
+            return f"Credito: {num}"
+    return m.group(0)
+
+
+def expand_abbreviated_labels(text: str) -> str:
+    """Convierte 'C5864479 C56572 Y 56574' -> 'Cliente: 5864479 Credito: 56572 Y 56574'."""
+    if not text:
+        return ""
+    return _ABBR_RE.sub(_expand_abbr_match, text)
+
+
+def strip_letter_prefixes(text: str) -> str:
+    """Quita prefijos de letras pegados a números ('C57137' -> '57137', 'T-4530500' -> '4530500'). Para celdas de tablas."""
+    if not text:
+        return ""
+    return re.sub(r'(?<![A-Za-zÁÉÍÓÚÑáéíóúñ])[A-Za-z]{1,5}\s*[\.:#\-]?\s*(?=\d{3,})', '', str(text))
+
+
+def first_digits(value: str) -> str:
+    """Primer bloque numérico de un valor ('5864479 (⚠️ En texto también: 123)' -> '5864479'). '' si no hay."""
+    m = re.search(r'\d+', str(value or ''))
+    return m.group(0).lstrip('0') if m else ''
+
+
+# ======================= ENLACES A iTop =======================
+ITOP_BASE_URL = "https://mservicio.fonacot.gob.mx/pages/UI.php"
+# Prefijo de la referencia de iTop -> clase del objeto (I-xxxxxx es Incident, no UserRequest)
+ITOP_CLASES_POR_PREFIJO = {'I': 'Incident', 'R': 'UserRequest', 'C': 'Change', 'P': 'Problem'}
+
+
+def _split_ticket_ref(ticket: str) -> tuple:
+    m = re.match(r'\s*([A-Za-z]+)\s*-\s*0*(\d+)', str(ticket or ''))
+    if not m:
+        digits = re.sub(r'\D', '', str(ticket or '')).lstrip('0')
+        return 'I', digits
+    return m.group(1).upper(), m.group(2)
+
+
+def build_itop_url(ticket: str, template: str = "") -> str:
+    """
+    URL de detalle del ticket en iTop. `template` (opcional, desde la configuración) admite
+    {id}, {ref} y {clase}, p. ej. 'https://otro-servidor/pages/UI.php?operation=details&class={clase}&id={id}'.
+    """
+    prefix, num = _split_ticket_ref(ticket)
+    if not num:
+        return ""
+    clase = ITOP_CLASES_POR_PREFIJO.get(prefix, 'Ticket')
+    ref = f"{prefix}-{num}"
+    if template and template.strip():
+        return template.strip().format(id=num, num_id=num, ref=quote(ref), clase=clase)
+    return f"{ITOP_BASE_URL}?operation=details&class={clase}&id={num}"
+
+
+def build_itop_search_url(ticket: str) -> str:
+    """Búsqueda global de iTop por referencia (sirve aunque el id interno no coincida con el folio)."""
+    _prefix, num = _split_ticket_ref(ticket)
+    if not num:
+        return ""
+    return f"{ITOP_BASE_URL}?operation=full_text&text={quote(str(ticket).strip().upper())}"
 
 
 def get_app_dir() -> str:
@@ -123,7 +229,7 @@ class RenovacionTicketParser:
 
         if html_body:
             try:
-                soup = BeautifulSoup(html_body, 'lxml')
+                soup = make_soup(html_body)
                 for tag in soup(['script', 'style']):
                     tag.decompose()
 
@@ -208,7 +314,7 @@ class RenovacionTicketParser:
         # 2. Exclusiones estrictas de tickets que mencionan "renovación" pero SON OTRO TRÁMITE
         #    (solo se excluyen si NO piden explícitamente cancelar/reversar la renovación)
         explicit_cancel_renewal = bool(re.search(
-            r'(cancel\w*\s+(de\s+|la\s+|el\s+|las\s+|los\s+)?(credito\s+renovado|renovaci|ren\b)|reversa\s+(de\s+|a\s+la\s+)?renovaci|numero\s+de\s+credito\s*[\(/]\s*renovaci|no\.?\s*de\s+renovaci|numero\s+de\s+renovaci)',
+            r'(canc\w*\.?\s+(de\s+|la\s+|el\s+|las\s+|los\s+)?(credito\s+renovado|renov|reno\b|ren\b)|reversa\s+(de\s+|a\s+la\s+)?renovaci|numero\s+de\s+credito\s*[\(/]\s*renovaci|no\.?\s*de\s+renovaci|numero\s+de\s+renovaci)',
             combined
         ))
 
@@ -228,11 +334,11 @@ class RenovacionTicketParser:
 
         # 3. Verificación positiva de Cancelación / Reversa de Renovación
         has_renewal_word = bool(re.search(
-            r'\b(renovaci\w*|renovad\w*|renovo|renovar|ren)\b|credito\s+padre|credito\s+hijo|credito\s+original|credito\s+anterior|antes\s+de\s+renovar|operacion\s*\(\s*origen\s*\)',
+            r'\b(renov\w*|reno|ren)\b|credito\s+padre|credito\s+hijo|credito\s+original|credito\s+anterior|antes\s+de\s+renovar|operacion\s*\(\s*origen\s*\)',
             combined
         ))
         has_cancel_word = bool(re.search(
-            r'\b(cancel\w*|reversa\w*|sin\s+efecto|baja)\b',
+            r'\b(canc\w*|reversa\w*|sin\s+efecto|baja)\b',
             combined
         ))
         has_capacity_reason = bool(re.search(
@@ -334,9 +440,11 @@ class RenovacionTicketParser:
         records = []
 
         # 1. Buscar en tablas HTML anidadas
-        for tbl in inner_tables:
-            if len(tbl) < 2:
+        for raw_tbl in inner_tables:
+            if len(raw_tbl) < 2:
                 continue
+            # Celdas con letra pegada ("C5864479", "T-4530500", "Cred. 57137") -> solo el número
+            tbl = [[strip_letter_prefixes(c).strip() for c in row] for row in raw_tbl]
 
             # Revisar si es tabla CREDERE (Cuenta | Operación (Origen) | Renovado)
             header_joined = normalize_text(" ".join(" ".join(r) for r in tbl[:2]))
@@ -387,7 +495,7 @@ class RenovacionTicketParser:
 
         # 2. Respaldo en texto plano si la tabla CREDERE venía como texto ("Cuenta Operación (Origen) Renovado Sucursal Fecha ...")
         if plain_desc and re.search(r'Cuenta\s+Operaci[óo]n\s*\(\s*Origen\s*\)\s+Renovado', plain_desc, re.I):
-            after_hdr = re.split(r'Renovado\s+Sucursal\s+Fecha', plain_desc, flags=re.I)[-1]
+            after_hdr = strip_letter_prefixes(re.split(r'Renovado\s+Sucursal\s+Fecha', plain_desc, flags=re.I)[-1])
             row_matches = re.findall(
                 r'\b(\d{5,10})\s+(\d{3,8})\s+(\d{3,8})\s+(\d{2,4})\s+(\d{2}[/-]\d{2}[/-]\d{4})\b',
                 after_hdr
@@ -427,7 +535,9 @@ class RenovacionTicketParser:
             return table_records
 
         clean_desc = cls._clean_user_text_for_extraction(descripcion)
-        full_context = f"{resumen or ''}\n{clean_desc or ''}"
+        # Traducir abreviaturas ("C5864479", "Cte. 3386153", "R 91258") a etiquetas completas antes de aplicar los patrones
+        resumen_exp = expand_abbreviated_labels(resumen or '')
+        full_context = f"{resumen_exp}\n{expand_abbreviated_labels(clean_desc or '')}"
 
         # PASO 2: ¿Vienen múltiples bloques de "Cliente ... Crédito ..." para DIFERENTES clientes en el mismo texto?
         # (Ej. cuando en un mismo correo enlistan Cliente A con Crédito X y abajo Cliente B con Crédito Y)
@@ -543,7 +653,7 @@ class RenovacionTicketParser:
         # Patrón en Resumen tipo: "CANCELACION DE RENOVACION 5042466 57521" o "82377 y 82379 7113273"
         if not clientes_found or not creditos_renovados_found:
             res_nums = [
-                n for n in re.findall(r'\b\d{4,10}\b', resumen or '')
+                n for n in re.findall(r'\b\d{4,10}\b', strip_letter_prefixes(resumen or ''))
                 if cls._is_valid_number_token(n, 4, 10) and not (len(n) == 9 and n.startswith(('507', '508')))
             ]
             for n in res_nums:
@@ -724,7 +834,8 @@ class RenovacionTicketParser:
                 nivel_alerta = "normal"
 
             rows.append({
-                'Row_ID': f"{ticket_num}_{idx}_{cli}_{cred_ren}",
+                # Incluye el gafete: en modo por compañero el mismo ticket puede venir de 2 agentes filtrados
+                'Row_ID': f"{ticket_num}_{gafete}_{idx}_{first_digits(cli) or 'SC'}_{first_digits(cred_ren) or 'SR'}",
                 'Fecha_DT': received_dt,
                 'Fecha': received_dt.strftime('%d/%m/%Y %H:%M'),
                 'Numero_Ticket': ticket_num,
@@ -758,3 +869,224 @@ class RenovacionTicketParser:
             })
 
         return rows
+
+
+# ======================= CORTE DIARIO, CONCENTRADO "TICKET ÚNICO" Y REZAGADAS =======================
+# El lote diario se envía hasta la hora de corte (17:50 por defecto). Lo que llega después, o lo que no
+# quedó en el correo concentrado ("Ticket Único <fecha>") del día hábil anterior, debe sumarse al lote de hoy.
+
+HORA_CORTE_DEFAULT = "17:50"
+ASUNTO_CONCENTRADO_DEFAULT = "ticket unico"
+
+LOTE_HOY = 'HOY'                         # Llegó hoy antes del corte
+LOTE_REZAGADA = 'REZAGADA'               # Del día hábil anterior (o fin de semana) y no se envió -> entra hoy
+LOTE_ENVIADA = 'ENVIADA'                 # Del periodo anterior y ya se envió (aparece en el concentrado)
+LOTE_EN_CONCENTRADO = 'EN_CONCENTRADO'   # Es de hoy y ya aparece en un concentrado enviado
+LOTE_SIGUIENTE = 'SIGUIENTE_LOTE'        # Llegó hoy después del corte -> va al lote de mañana
+
+_MESES_ES = {
+    'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4, 'mayo': 5, 'junio': 6, 'julio': 7,
+    'agosto': 8, 'septiembre': 9, 'setiembre': 9, 'octubre': 10, 'noviembre': 11, 'diciembre': 12
+}
+
+
+def parse_hora_corte(text: str) -> time:
+    """'17:50', '5:50 pm', '1750', '17.50' -> time(17, 50). Si no se entiende, usa 17:50."""
+    t = normalize_text(text or '').replace('.', ':').replace(' ', '')
+    m = re.fullmatch(r'(\d{1,2}):?(\d{2})(am|pm|a:m:|p:m:)?', t)
+    if not m:
+        return time(17, 50)
+    hh, mm = int(m.group(1)), int(m.group(2))
+    ampm = (m.group(3) or '').replace(':', '')
+    if ampm == 'pm' and hh < 12:
+        hh += 12
+    elif ampm == 'am' and hh == 12:
+        hh = 0
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return time(17, 50)
+    return time(hh, mm)
+
+
+def previous_business_day(d: date) -> date:
+    """Día hábil anterior (lunes -> viernes). No considera días festivos."""
+    prev = d - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    return prev
+
+
+def parse_fecha_asunto(subject: str, ref_year: int = None):
+    """Fecha escrita en el asunto del concentrado: '22/10/2026', '22-10-26', '22.10', '22 de octubre'. None si no hay."""
+    s = normalize_text(subject or '')
+    ref_year = ref_year or datetime.now().year
+    m = re.search(r'\b(\d{1,2})[/\-\.](\d{1,2})(?:[/\-\.](\d{2,4}))?\b', s)
+    if m:
+        dd, mm = int(m.group(1)), int(m.group(2))
+        yy = int(m.group(3)) if m.group(3) else ref_year
+        if yy < 100:
+            yy += 2000
+        try:
+            return date(yy, mm, dd)
+        except ValueError:
+            pass
+    m = re.search(r'\b(\d{1,2})\s+(?:de\s+)?([a-z]+)(?:\s+(?:de\s+|del\s+)?(\d{4}))?', s)
+    if m and m.group(2) in _MESES_ES:
+        try:
+            return date(int(m.group(3) or ref_year), _MESES_ES[m.group(2)], int(m.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
+def extract_concentrado_tokens(text: str) -> tuple:
+    """
+    Del cuerpo/adjuntos del concentrado obtiene:
+    - tickets: set de folios numéricos ('I-361515' -> '361515')
+    - numeros: set de todos los números de 3 a 10 dígitos (clientes y créditos, con o sin letra pegada)
+    """
+    text = str(text or '')
+    tickets = {t.lstrip('0') for t in re.findall(r'\bI\s*-\s*(\d{3,10})\b', text, re.I)}
+    numeros = {n.lstrip('0') for n in re.findall(r'(?<!\d)\d{3,10}(?!\d)', strip_letter_prefixes(text))}
+    return tickets, numeros
+
+
+def _row_match_concentrado(row: dict, concentrados: list):
+    """
+    Busca la renovación en los concentrados. Regla anti-omisión:
+    - Si la fila tiene Cliente y Crédito, solo cuenta como enviada si AMBOS aparecen en el concentrado
+      (que esté el ticket no basta: un ticket con 3 renovaciones pudo enviarse con solo 2).
+    - Si a la fila le falta el cliente o el crédito, basta con que aparezca el ticket.
+    Retorna (tipo_match, concentrado) con tipo_match en {'PAR', 'TICKET', None}.
+    """
+    cli = '' if str(row.get('Numero_Cliente', '')).startswith('SIN') else first_digits(row.get('Numero_Cliente'))
+    cred = '' if str(row.get('Credito_Renovado_Hijo', '')).startswith('SIN') else first_digits(row.get('Credito_Renovado_Hijo'))
+    ticket = first_digits(row.get('Numero_Ticket'))
+    ticket_hit = None
+    for conc in concentrados:
+        if cli and cred and cli in conc['numeros'] and cred in conc['numeros']:
+            return 'PAR', conc
+        if ticket and ticket in conc['tickets'] and ticket_hit is None:
+            ticket_hit = conc
+    if ticket_hit is not None:
+        return 'TICKET', ticket_hit
+    return None, None
+
+
+def clasificar_lotes(
+    rows: list,
+    fecha_inicio: date,
+    fecha_fin: date,
+    hora_corte: time,
+    concentrados: list = None,
+    ultimo_lote: dict = None
+) -> dict:
+    """
+    Asigna a cada fila 'Lote_Estado', 'Lote_Etiqueta' y 'Enviado_En' y regresa un resumen para la interfaz.
+
+    Ventana del lote de hoy: (corte del día hábil anterior .. fecha_fin a la hora de corte].
+    Para lo que llegó ANTES de fecha_inicio (día hábil anterior y fin de semana) decide si ya se envió:
+      1. Con el correo concentrado "Ticket Único" del periodo anterior (lo más confiable).
+      2. Si no se encontró ese correo: con la marca local "último lote copiado/exportado" (ultimo_lote['hasta']).
+      3. Si tampoco hay marca: por horario (antes del corte del día hábil anterior = enviada; después = rezagada).
+    """
+    concentrados = concentrados or []
+    inicio_hoy = datetime.combine(fecha_inicio, time(0, 0))
+    corte_fin = datetime.combine(fecha_fin, hora_corte)
+    dia_anterior = previous_business_day(fecha_inicio)
+    corte_anterior = datetime.combine(dia_anterior, hora_corte)
+
+    def _fecha_conc(c):
+        return c.get('fecha_asunto') or (c['recibido'].date() if c.get('recibido') else None)
+
+    conc_previos = [c for c in concentrados if _fecha_conc(c) and dia_anterior <= _fecha_conc(c) < fecha_inicio]
+
+    marca = None
+    if ultimo_lote and ultimo_lote.get('hasta'):
+        try:
+            marca = datetime.fromisoformat(ultimo_lote['hasta'])
+        except (TypeError, ValueError):
+            marca = None
+        if marca and not (datetime.combine(dia_anterior, time(0, 0)) <= marca < inicio_hoy):
+            marca = None
+
+    if conc_previos:
+        metodo = 'concentrado'
+    elif marca:
+        metodo = 'marca'
+    else:
+        metodo = 'horario'
+
+    ultima_considerada = None
+    for r in rows:
+        llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
+        r['Fecha_Llegada_DT'] = llegada
+        r['Enviado_En'] = ''
+        tipo, conc = _row_match_concentrado(r, concentrados)
+        incompleta = bool(r.get('Datos_Incompletos'))
+        enviada_por_conc = tipo == 'PAR' or (tipo == 'TICKET' and incompleta)
+        if enviada_por_conc:
+            r['Enviado_En'] = conc['asunto']
+
+        if llegada < inicio_hoy:
+            if metodo == 'concentrado':
+                es_enviada = enviada_por_conc
+            elif metodo == 'marca':
+                es_enviada = enviada_por_conc or llegada <= marca
+            else:
+                es_enviada = enviada_por_conc or (llegada.date() == dia_anterior and llegada < corte_anterior)
+
+            if es_enviada:
+                r['Lote_Estado'] = LOTE_ENVIADA
+                if enviada_por_conc:
+                    r['Lote_Etiqueta'] = f"📨 Ya enviada en '{conc['asunto'][:40]}'"
+                elif metodo == 'marca':
+                    r['Lote_Etiqueta'] = f"📨 Enviada (antes de la marca {marca.strftime('%d/%m %H:%M')})"
+                else:
+                    r['Lote_Etiqueta'] = f"📨 Enviada (llegó antes del corte {hora_corte.strftime('%H:%M')})"
+                if ultima_considerada is None or llegada > ultima_considerada['Fecha_Llegada_DT']:
+                    ultima_considerada = r
+            else:
+                r['Lote_Estado'] = LOTE_REZAGADA
+                if tipo == 'TICKET':
+                    motivo = "el ticket está en el concentrado pero NO este Cliente+Crédito"
+                elif metodo == 'concentrado':
+                    motivo = "no está en el concentrado"
+                elif metodo == 'marca':
+                    motivo = "después de la última marca"
+                else:
+                    motivo = f"llegó después de las {hora_corte.strftime('%H:%M')}"
+                r['Lote_Etiqueta'] = f"⏰ Rezagada {llegada.strftime('%d/%m %H:%M')} ({motivo})"
+        elif llegada > corte_fin:
+            r['Lote_Estado'] = LOTE_SIGUIENTE
+            r['Lote_Etiqueta'] = f"➡️ Después del corte {hora_corte.strftime('%H:%M')} (va al lote siguiente)"
+        elif enviada_por_conc:
+            r['Lote_Estado'] = LOTE_EN_CONCENTRADO
+            r['Lote_Etiqueta'] = f"📨 Ya en '{conc['asunto'][:40]}'"
+        else:
+            r['Lote_Estado'] = LOTE_HOY
+            r['Lote_Etiqueta'] = "🟢 Lote de hoy"
+
+    conteos = {}
+    for r in rows:
+        conteos[r['Lote_Estado']] = conteos.get(r['Lote_Estado'], 0) + 1
+
+    conc_ref = max(conc_previos, key=lambda c: c.get('recibido') or datetime.min) if conc_previos else None
+    return {
+        'metodo': metodo,
+        'dia_anterior': dia_anterior,
+        'corte_anterior': corte_anterior,
+        'corte_fin': corte_fin,
+        'hora_corte': hora_corte,
+        'concentrados': concentrados,
+        'concentrado_previo': conc_ref,
+        'marca': marca,
+        'ultima_considerada': (
+            {
+                'ticket': ultima_considerada['Numero_Ticket'],
+                'fecha': ultima_considerada['Fecha_Llegada_DT'],
+                'cliente': ultima_considerada['Numero_Cliente'],
+                'credito': ultima_considerada['Credito_Renovado_Hijo'],
+            } if ultima_considerada else None
+        ),
+        'conteos': conteos,
+    }

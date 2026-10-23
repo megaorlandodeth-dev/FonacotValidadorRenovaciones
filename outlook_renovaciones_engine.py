@@ -14,6 +14,8 @@ Incluye:
 import os
 import re
 import json
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from tkinter import filedialog
 import win32com.client
@@ -27,6 +29,15 @@ from openpyxl.utils import get_column_letter
 from core_renovaciones import (
     get_app_dir,
     normalize_text,
+    make_soup,
+    build_itop_url,
+    parse_hora_corte,
+    parse_fecha_asunto,
+    previous_business_day,
+    extract_concentrado_tokens,
+    clasificar_lotes,
+    HORA_CORTE_DEFAULT,
+    ASUNTO_CONCENTRADO_DEFAULT,
     RenovacionTicketParser
 )
 
@@ -63,6 +74,7 @@ class FonacotRenovacionesEngine:
 
         self.renovaciones_rows = []
         self.tickets_summary = []
+        self.lote_info = None
 
     def load_settings(self) -> dict:
         default_settings = {
@@ -617,7 +629,13 @@ class FonacotRenovacionesEngine:
             if not disagg_rows:
                 continue
 
+            # Hora en que el ticket llegó por primera vez (asignación inicial), no la de la última reasignación:
+            # es la que decide si entró antes o después del corte.
+            timeline = clean_timeline_by_ticket.get(cand['Numero_Ticket'], [])
+            llegada_dt = timeline[0][0] if timeline else cand['Fecha_DT']
+
             for r in disagg_rows:
+                r['Fecha_Llegada_DT'] = llegada_dt
                 r['Requiere_Validacion_Agente'] = cand.get('Requiere_Validacion_Agente', False)
                 r['Reasignado_A_Otro'] = cand.get('Reasignado_A_Otro', False)
                 r['Alerta_Asignacion'] = cand.get('Alerta_Asignacion', '✅ Asignación directa')
@@ -860,9 +878,7 @@ class FonacotRenovacionesEngine:
                         t_cell = worksheet.cell(row=row_num, column=ticket_col_idx)
                         t_val = str(t_cell.value or '').strip()
                         if t_val.startswith('I-'):
-                            inc_id = t_val.replace('I-', '')
-                            itop_url = f"https://mservicio.fonacot.gob.mx/pages/UI.php?operation=details&class=Incident&id={inc_id}"
-                            t_cell.hyperlink = itop_url
+                            t_cell.hyperlink = build_itop_url(t_val, self.settings.get('itop_url_template', ''))
                             t_cell.font = font_link
 
                 for col_idx in range(1, worksheet.max_column + 1):
@@ -885,6 +901,153 @@ class FonacotRenovacionesEngine:
         """Retorna la lista de carpetas/opciones de buzón disponibles en Outlook."""
         return self.list_all_user_mail_folders()
 
+    @staticmethod
+    def create_draft_email(subject: str, html_fragment: str, to: str = "", cc: str = "") -> None:
+        """
+        Abre en Outlook un correo NUEVO (borrador, no se envía) con la tabla del lote al inicio del cuerpo,
+        conservando la firma predeterminada del usuario. Se crea una conexión COM propia porque se llama
+        desde el hilo de la interfaz y la del motor pertenece al hilo de extracción.
+        """
+        from lote_utils import insert_into_html_body
+        try:
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        mail = outlook.CreateItem(0)
+        mail.Subject = subject
+        if to:
+            mail.To = to
+        if cc:
+            mail.CC = cc
+        mail.Display()  # Al mostrarlo, Outlook agrega la firma al HTMLBody
+        mail.HTMLBody = insert_into_html_body(str(mail.HTMLBody or ''), html_fragment)
+
+    @staticmethod
+    def _attachments_text(msg) -> str:
+        """Texto de los adjuntos Excel/CSV del concentrado (a veces la relación viene en un .xlsx)."""
+        chunks = []
+        try:
+            attachments = msg.Attachments
+            count = attachments.Count
+        except Exception:
+            return ""
+        if not count:
+            return ""
+        tmp_dir = tempfile.mkdtemp(prefix="fonacot_conc_")
+        try:
+            for i in range(1, count + 1):
+                try:
+                    att = attachments.Item(i)
+                    name = str(getattr(att, 'FileName', '') or '')
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext not in ('.xlsx', '.xlsm', '.xls', '.csv', '.txt'):
+                        continue
+                    path = os.path.join(tmp_dir, f"{i}{ext}")
+                    att.SaveAsFile(path)
+                    if ext in ('.csv', '.txt'):
+                        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                            chunks.append(f.read())
+                    else:
+                        sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
+                        for df in sheets.values():
+                            chunks.append(df.fillna('').to_csv(sep=' ', index=False, header=False))
+                except Exception:
+                    continue
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return "\n".join(chunks)
+
+    def find_concentrado_emails(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        asunto_clave: str = ASUNTO_CONCENTRADO_DEFAULT,
+        progress_callback=None
+    ) -> list:
+        """
+        Busca en TODOS los buzones (incluye Elementos enviados) los correos cuyo asunto contiene `asunto_clave`
+        ("ticket unico", sin importar acentos/mayúsculas) recibidos/enviados entre start_dt y end_dt.
+        Retorna: [{'asunto', 'fecha_asunto', 'recibido', 'remitente', 'carpeta', 'tickets', 'numeros'}]
+        """
+        if not self.connect_outlook():
+            return []
+        clave = normalize_text(asunto_clave or ASUNTO_CONCENTRADO_DEFAULT)
+        if not clave:
+            return []
+
+        folders = []
+        seen = set()
+        for store_name, root in self._get_all_root_folders():
+            for lbl, f_obj in self._collect_mail_folders_recursive(root, parent_label=store_name, max_depth=6, current_depth=0):
+                try:
+                    eid = str(getattr(f_obj, 'EntryID', lbl))
+                except Exception:
+                    eid = lbl
+                if eid not in seen:
+                    seen.add(eid)
+                    folders.append((lbl, f_obj))
+
+        found = {}
+        for f_idx, (lbl, f_obj) in enumerate(folders, 1):
+            if progress_callback and f_idx % 5 == 1:
+                progress_callback(f"📨 Buscando concentrado '{asunto_clave}' en {lbl}...")
+            try:
+                items = f_obj.Items
+                if items.Count == 0:
+                    continue
+                items.Sort("[ReceivedTime]", True)
+            except Exception:
+                continue
+
+            consecutive_older = 0
+            for msg in items:
+                try:
+                    rec = self._to_naive_local_dt(
+                        getattr(msg, 'ReceivedTime', None) or getattr(msg, 'SentOn', None) or getattr(msg, 'CreationTime', None)
+                    )
+                    if not rec:
+                        continue
+                    if rec < start_dt:
+                        consecutive_older += 1
+                        if consecutive_older > 30:
+                            break
+                        continue
+                    consecutive_older = 0
+                    if rec > end_dt or getattr(msg, 'Class', 0) != 43:
+                        continue
+                    subject = str(getattr(msg, 'Subject', '') or '').strip()
+                    if clave not in normalize_text(subject):
+                        continue
+
+                    # El mismo correo puede estar en Enviados y en la Bandeja de varios compañeros
+                    dedup_key = (normalize_text(subject), rec.strftime('%Y%m%d%H%M'))
+                    if dedup_key in found:
+                        continue
+
+                    body = str(getattr(msg, 'Body', '') or '')
+                    try:
+                        html = str(getattr(msg, 'HTMLBody', '') or '')
+                        html_txt = make_soup(html).get_text(" ", strip=True) if html else ""
+                    except Exception:
+                        html_txt = ""
+                    full_text = f"{body}\n{html_txt}\n{self._attachments_text(msg)}"
+                    tickets, numeros = extract_concentrado_tokens(full_text)
+
+                    found[dedup_key] = {
+                        'asunto': subject,
+                        'fecha_asunto': parse_fecha_asunto(subject, ref_year=rec.year),
+                        'recibido': rec,
+                        'remitente': str(getattr(msg, 'SenderName', '') or ''),
+                        'carpeta': lbl,
+                        'tickets': tickets,
+                        'numeros': numeros,
+                    }
+                except Exception:
+                    continue
+
+        return sorted(found.values(), key=lambda c: c['recibido'])
+
     def extract_renewals(
         self,
         account_name: str,
@@ -892,11 +1055,18 @@ class FonacotRenovacionesEngine:
         end_dt: datetime,
         mode: str = "CONCENTRADO",
         agent_filter: str = "",
-        progress_callback=None
+        progress_callback=None,
+        aplicar_corte: bool = True,
+        hora_corte: str = HORA_CORTE_DEFAULT,
+        asunto_concentrado: str = ASUNTO_CONCENTRADO_DEFAULT,
+        ultimo_lote: dict = None
     ) -> list:
         """
         Envoltorio compatible con la GUI principal.
         `mode`: "CONCENTRADO" (todos los compañeros consolidados) o "AGENTE" (por Gafete o Nombre).
+        Con `aplicar_corte`, escanea desde el día hábil anterior, busca el correo concentrado ("Ticket Único")
+        y clasifica cada renovación en lote de hoy / rezagada / ya enviada / después del corte (ver clasificar_lotes).
+        El resumen queda en `self.lote_info`.
         """
         modo_general = (mode == "CONCENTRADO")
         gafetes_list = []
@@ -910,8 +1080,13 @@ class FonacotRenovacionesEngine:
                 frac = (curr / total) if total else 0.5
                 progress_callback(msg, frac)
 
+        scan_start = start_dt
+        if aplicar_corte:
+            scan_start = datetime.combine(previous_business_day(start_dt.date()), datetime.min.time())
+
+        self.lote_info = None
         rows, _summary = self.search_and_validate_renewals(
-            fecha_inicio=start_dt,
+            fecha_inicio=scan_start,
             fecha_fin=end_dt,
             gafetes_filter=gafetes_list,
             modo_concentrador_general=modo_general,
@@ -921,6 +1096,26 @@ class FonacotRenovacionesEngine:
             ignorar_reasignados_a_otro=False,
             progress_callback=_wrapped_progress
         )
+
+        if aplicar_corte:
+            if progress_callback:
+                progress_callback(f"📨 Buscando correos '{asunto_concentrado}' desde {scan_start.strftime('%d/%m/%Y')}...", 0.95)
+            # El concentrado de hoy puede enviarse ya entrada la noche: se busca hasta el fin del día "hasta" + 12 h
+            fin_busqueda = datetime.combine(end_dt.date(), datetime.max.time()) + timedelta(hours=12)
+            concentrados = self.find_concentrado_emails(
+                scan_start,
+                fin_busqueda,
+                asunto_concentrado,
+                progress_callback=(lambda m: progress_callback(m, 0.97)) if progress_callback else None
+            )
+            self.lote_info = clasificar_lotes(
+                rows,
+                fecha_inicio=start_dt.date(),
+                fecha_fin=end_dt.date(),
+                hora_corte=parse_hora_corte(hora_corte),
+                concentrados=concentrados,
+                ultimo_lote=ultimo_lote
+            )
         return rows
 
 
