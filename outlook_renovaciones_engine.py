@@ -1121,7 +1121,7 @@ class FonacotRenovacionesEngine:
         Envoltorio compatible con la GUI principal.
         `mode`: "CONCENTRADO" (todos los compañeros consolidados) o "AGENTE" (por Gafete o Nombre).
         Con `aplicar_corte`, escanea desde el día hábil anterior, busca el correo concentrado ("Ticket Único")
-        y clasifica cada renovación en lote de hoy / rezagada / ya enviada / después del corte (ver clasificar_lotes).
+        y clasifica cada renovación en lote de hoy / rezagada / ya enviada / siguiente lote (ver clasificar_lotes).
         El resumen queda en `self.lote_info`.
         """
         modo_general = (mode == "CONCENTRADO")
@@ -1156,8 +1156,9 @@ class FonacotRenovacionesEngine:
         if aplicar_corte:
             if progress_callback:
                 progress_callback(f"📨 Buscando correos '{asunto_concentrado}' desde {scan_start.strftime('%d/%m/%Y')}...", 0.95)
-            # El concentrado de hoy puede enviarse ya entrada la noche: se busca hasta el fin del día "hasta" + 12 h
-            fin_busqueda = datetime.combine(end_dt.date(), datetime.max.time()) + timedelta(hours=12)
+            # El concentrado de hoy puede enviarse ya entrada la noche: se busca hasta el fin del día "hasta" + 12 h.
+            # Al revisar días pasados se busca hasta hoy: lo que se mandó días después cuenta como enviado (tarde).
+            fin_busqueda = max(datetime.combine(end_dt.date(), datetime.max.time()) + timedelta(hours=12), datetime.now())
             concentrados = self.find_concentrado_emails(
                 scan_start,
                 fin_busqueda,
@@ -1170,7 +1171,8 @@ class FonacotRenovacionesEngine:
                 fecha_fin=end_dt.date(),
                 hora_corte=parse_hora_corte(hora_corte),
                 concentrados=concentrados,
-                ultimo_lote=ultimo_lote
+                ultimo_lote=ultimo_lote,
+                ahora=datetime.now()
             )
         return rows
 

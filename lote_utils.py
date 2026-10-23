@@ -28,6 +28,19 @@ def plain_text(value) -> str:
     return re.sub(r'\s{2,}', ' ', s).strip(" |·-")
 
 
+def lote_corto(etiqueta: str) -> str:
+    """'Rezagada 22/10 14:53 (el ticket está en el concentrado pero NO este…)' -> 'Rezagada 22/10 14:53 · otros datos en el concentrado'."""
+    m = re.match(r'(.*?)\s*\((.*)\)$', etiqueta or '', re.S)
+    if not m:
+        return etiqueta or ''
+    base, motivo = m.groups()
+    if motivo.startswith("el ticket está en el concentrado"):
+        motivo = "otros datos en el concentrado"
+    elif motivo == "no está en el concentrado":
+        motivo = "no se envió"
+    return f"{base}  ·  {motivo}"
+
+
 def row_key(row: dict) -> str:
     """Llave estable de una renovación (no depende del orden ni del gafete): Ticket|Cliente|Crédito."""
     cli = first_digits(row.get('Numero_Cliente')) or 'SC'
