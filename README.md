@@ -100,6 +100,19 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
    - **El rojo gana:** una renovación que no se envió o salió mal se ve en rojo aunque la hayas validado antes.
    - La marca *última considerada* solo la deja el lote de hoy al copiarlo o crear el correo (no el Excel, ni una revisión, ni un lote pasado).
 
+**Novedades v2.5:**
+   - **Corrección importante:** la revisión semanal solo encontraba el ticket único más reciente (los de los días anteriores se ignoraban y todo salía *Sin comprobar*, sin detectar datos equivocados). Ya se leen todos.
+   - **Cambiar de modo no busca solo:** *Lote del día*, *Revisión semanal*, *Esta semana*, *Semana pasada*, *Hoy* o elegir una fecha solo preparan el periodo; la búsqueda empieza con **Extraer y validar** (F5). Debajo del botón se indica qué se va a buscar.
+   - **Capturas de pantalla (OCR):** si un incidente manda una imagen (pantalla *Consulta de Crédito*, resultado de SQL…) en vez de escribir Cliente y Crédito, se leen de la imagen con el reconocimiento de texto que ya trae Windows 10/11 (no hay que instalar nada). La renovación se marca *leído de la imagen: revísalo* y se cuenta en *Con alertas*. La imagen tiene que venir en el correo (adjunta o pegada); se lee a dos tamaños y si no coinciden queda como *lectura dudosa*. Se desactiva en *Validaciones automáticas*.
+   - **Validación en la base de datos (Oracle, `TOPAZ.CR_RENOVACIONES`):** en *Validaciones automáticas* se activa, se escriben servidor (como en SQL Developer: `host:1521/servicio`), usuario y contraseña, y *Probar conexión*. Solo hace `SELECT FECHA_ALTA, CUENTA, NO_RENOVACION` con variables (los números no se pegan en el SQL). Por cada renovación, columna **Base de datos**:
+     - *✔ Existe*: el cliente tiene esa renovación, dada de alta el día del incidente (o hasta 7 días antes).
+     - *⚠ Otra fecha*: la renovación existe pero es de otra fecha (p. ej. la del año pasado); dice cuál tiene ese día.
+     - *✖ No existe*: el cliente no tiene esa renovación; lista las que sí tiene y sugiere la del día (*¿Será 10430?*), o dice de qué cliente es ese crédito.
+     - *💡 Sugerencia*: al incidente le falta el crédito o el cliente y la base lo sugiere.
+     - Lo que no cuadra sale en rojo (aunque esté validado), en la vista *No cuadran con la base (SQL)*, en el aviso de arriba, al crear el correo y en el Excel. En la revisión también se validan los renglones enviados en los tickets únicos (pestaña *Tickets únicos*).
+     - La contraseña no se guarda en la configuración; con *Recordar contraseña en Windows* va al Administrador de credenciales de Windows.
+     - Usa `python-oracledb` en modo *thin* (no requiere Oracle Client). Si la base solo acepta el modo clásico (error DPY-3015), pon la carpeta del Oracle Instant Client en `sql_cliente_oracle` del archivo de configuración.
+
 12. **Funciones nuevas:**
    - **Validaciones guardadas:** las validaciones, descartes y filas incluidas a mano se guardan en disco (`%USERPROFILE%\.fonacot_validador_renovaciones_estado.json`, 30 días). No se pierden al volver a escanear ni al cerrar la app.
    - **Actualización automática** cada 5/10/15/30/60 min: vuelve a escanear Outlook, conserva tus marcas y avisa las renovaciones nuevas (filtro *Nuevas*).
@@ -145,6 +158,8 @@ Se guarda en `%USERPROFILE%\.fonacot_validador_renovaciones_config.json`. Ademá
 - `ultimo_lote`: marca de la última renovación considerada (se actualiza al copiar el lote o crear el correo de hoy).
 - `dias_inhabiles` / `feriados_oficiales`: días inhábiles capturados en pantalla y si se suman los feriados oficiales.
 - `dias_atras_lote`: días hábiles hacia atrás que revisa el lote del día (5 por omisión).
+- `leer_imagenes`, `sql_activo`, `sql_servidor`, `sql_usuario`, `sql_tabla`, `sql_recordar`: lo de *Validaciones automáticas* (la contraseña no se guarda aquí).
+- `sql_cliente_oracle`: carpeta del Oracle Instant Client, solo si la base no acepta el modo *thin*.
 - `columnas_ocultas` y `vista`: columnas y zonas de la pantalla elegidas en *Vista*.
 - `texto_correo`: texto fijo del correo del ticket único (admite `{total}`). Vacío = usar el aprendido.
 - `texto_correo_aprendido`: saludo y avisos copiados del último concentrado encontrado (se actualiza solo).

@@ -13,6 +13,20 @@ from tkcalendar import DateEntry
 import pandas as pd
 
 from outlook_renovaciones_engine import OutlookRenovacionesEngine, DIAS_ATRAS_LOTE
+from sql_renovaciones import (
+    conectar as conectar_sql,
+    validar_contra_base,
+    probar_conexion,
+    texto_corto as texto_sql,
+    leer_password,
+    guardar_password,
+    borrar_password,
+    ErrorSQL,
+    TABLA_DEFAULT,
+    SQL_PROBLEMAS,
+    SQL_SUGERENCIA,
+    SQL_OTRA_FECHA,
+)
 from core_renovaciones import (
     build_itop_url,
     build_itop_search_url,
@@ -43,7 +57,7 @@ from lote_utils import (
 )
 
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"),
@@ -101,13 +115,16 @@ FILTRO_NO_ENVIADAS = "No enviadas en su día"
 FILTRO_TARDE = "Enviadas tarde"
 FILTRO_SIN_COMPROBAR = "Sin comprobar"
 FILTRO_ERRORES = "Datos equivocados en el ticket único"
+FILTRO_SQL = "No cuadran con la base (SQL)"
 OTRAS_VISTAS = "Otras vistas"
 
 FILTROS_PRINCIPALES = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_MULTIPLES, FILTRO_REZAGADAS, FILTRO_NUEVAS]
-FILTROS_SECUNDARIOS = [FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_TARDE, FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS,
+FILTROS_SECUNDARIOS = [FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE, FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS,
                        FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_PAPELERA]
 # Vistas que muestran filas aunque estén fuera del lote de hoy (revisión de envíos)
-FILTROS_REVISION = (FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_TARDE, FILTRO_SIN_COMPROBAR)
+FILTROS_REVISION = (FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE,
+                    FILTRO_SIN_COMPROBAR)
+HINT_EXTRAER = "Lee Outlook y arma el lote del día  ·  F5"
 TIPOS_REVISION = ("Lote del día", "Revisión semanal")
 
 MODOS = {"CONCENTRADO": "Concentrado", "AGENTE": "Por compañero"}
@@ -367,6 +384,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.forced_included_row_ids = set()  # Filas ENVIADA / SIGUIENTE_LOTE que el usuario decidió meter al lote
         self._key_by_rid = {}
         self.lote_info = None
+        self.validaciones = {}  # {'ocr': resumen de imágenes leídas, 'sql': resumen de la validación en la base}
         self.is_extracting = False
 
         # Detección de renovaciones nuevas entre escaneos (auto-actualización)
@@ -407,6 +425,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "feriados_oficiales": True,
             # Días hábiles hacia atrás que revisa el lote del día para no perder lo que no se envió
             "dias_atras_lote": DIAS_ATRAS_LOTE,
+            # Capturas de pantalla en los incidentes (OCR de Windows) y validación en la base (Oracle)
+            "leer_imagenes": True,
+            "sql_activo": False,
+            "sql_servidor": "",
+            "sql_usuario": "",
+            "sql_tabla": TABLA_DEFAULT,
+            "sql_recordar": False,
+            "sql_cliente_oracle": "",  # carpeta del Oracle Instant Client, solo si la base no acepta el modo thin
             # Correo del lote ("Crear correo Ticket Único"); {fecha} se reemplaza por dd/mm/aaaa
             "asunto_borrador": ASUNTO_BORRADOR_DEFAULT,
             "correo_para": "",
@@ -448,6 +474,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "asunto_concentrado": self.ent_asunto_conc.get().strip() or ASUNTO_CONCENTRADO_DEFAULT,
                 "dias_inhabiles": self.ent_inhabiles.get().strip(),
                 "feriados_oficiales": bool(self.var_oficiales.get()),
+                "leer_imagenes": bool(self.var_ocr.get()),
+                "sql_activo": bool(self.var_sql.get()),
+                "sql_servidor": self.ent_sql_servidor.get().strip(),
+                "sql_usuario": self.ent_sql_usuario.get().strip(),
+                "sql_tabla": self.ent_sql_tabla.get().strip() or TABLA_DEFAULT,
+                "sql_recordar": bool(self.var_sql_recordar.get()),
                 "asunto_borrador": self.ent_asunto_borrador.get().strip() or ASUNTO_BORRADOR_DEFAULT,
                 "correo_para": self.ent_correo_para.get().strip(),
                 "correo_cc": self.ent_correo_cc.get().strip(),
@@ -458,6 +490,21 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 json.dump(self.config_data, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
+        self._guardar_password_sql()
+
+    def _guardar_password_sql(self):
+        """La contraseña nunca va al archivo de configuración: si se pide recordarla, va al Administrador de credenciales."""
+        try:
+            usuario, servidor = self.ent_sql_usuario.get().strip(), self.ent_sql_servidor.get().strip()
+            password = self.ent_sql_password.get()
+        except Exception:
+            return
+        if not (usuario and servidor):
+            return
+        if self.var_sql_recordar.get() and password:
+            guardar_password(usuario, servidor, password)
+        elif not self.var_sql_recordar.get():
+            borrar_password(usuario, servidor)
 
     def _scaling(self) -> float:
         try:
@@ -603,9 +650,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         top.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 6))
         self.btn_extract = ctk.CTkButton(top, text="Extraer y validar", font=F(13, True), height=40, command=self._start_extraction)
         self.btn_extract.pack(fill="x")
-        ctk.CTkLabel(
-            top, text="Lee Outlook y arma el lote del día  ·  F5", font=F(11), text_color=COL["muted"], height=16
-        ).pack(anchor="w", pady=(8, 0))
+        self.lbl_extract_hint = ctk.CTkLabel(
+            top, text=HINT_EXTRAER, font=F(11), text_color=COL["muted"], justify="left", anchor="w", wraplength=230
+        )
+        self.lbl_extract_hint.pack(anchor="w", pady=(8, 0))
 
         side = ctk.CTkScrollableFrame(
             wrap, width=262, fg_color=COL["surface"], corner_radius=0,
@@ -669,12 +717,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.cal_end.grid(row=1, column=1, sticky="ew", padx=(6, 0), ipady=3)
         self.cal_start.bind("<<DateEntrySelected>>", lambda e: self._sincronizar_fechas(self.cal_start, self.cal_end))
         self.cal_end.bind("<<DateEntrySelected>>", lambda e: self._sincronizar_fechas(self.cal_end, self.cal_start))
+        for cal in (self.cal_start, self.cal_end):
+            cal.bind("<FocusOut>", lambda e: self._periodo_pendiente(), add="+")
         quick = ctk.CTkFrame(sec, fg_color="transparent")
         quick.grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky="w")
         for txt, cmd in (("Hoy", self._set_today), ("Día hábil anterior", self._set_prev_business_day)):
             self._btn(quick, txt, cmd, "link", height=26).pack(side="left", padx=(0, 4), ipadx=2)
         ctk.CTkLabel(
-            sec, text="Un solo día de hoy = lote del día. Varios días o días pasados = revisión de envíos.",
+            sec, text="Elige el periodo y pulsa «Extraer y validar». En «Lote del día» las dos fechas se mueven juntas.",
             font=F(11), text_color=COL["faint"], justify="left", anchor="w", wraplength=250
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
@@ -704,6 +754,46 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             font=F(12), checkbox_width=18, checkbox_height=18
         ).grid(row=8, column=0, columnspan=2, pady=(8, 0), sticky="w")
         self._aplicar_inhabiles()
+
+        # Validaciones automáticas: capturas de pantalla y base de datos
+        sec = self._section(side, "Validaciones automáticas")
+        self.var_ocr = tk.BooleanVar(value=self.config_data.get("leer_imagenes", True))
+        ctk.CTkCheckBox(
+            sec, text="Leer capturas de pantalla (OCR)", variable=self.var_ocr,
+            font=F(12), checkbox_width=18, checkbox_height=18
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ctk.CTkLabel(
+            sec, text="Si un incidente manda una imagen en vez de escribir Cliente y Crédito, se leen de la imagen "
+                      "y se marcan para que los revises.",
+            font=F(11), text_color=COL["muted"], justify="left", anchor="w", wraplength=230
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.var_sql = tk.BooleanVar(value=self.config_data.get("sql_activo", False))
+        ctk.CTkSwitch(
+            sec, text="Validar en la base de datos", variable=self.var_sql, onvalue=True, offvalue=False,
+            font=F(12), switch_width=36, switch_height=18
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        self.ent_sql_servidor = self._field(sec, 3, "Servidor (como en SQL Developer)",
+                                            self.config_data.get("sql_servidor", ""), "host:1521/servicio")
+        self.ent_sql_usuario = self._field(sec, 5, "Usuario", self.config_data.get("sql_usuario", ""), "Usuario de la base")
+        self.ent_sql_password = self._field(sec, 7, "Contraseña", "", "No se guarda en la configuración")
+        self.ent_sql_password.configure(show="•")
+        self.var_sql_recordar = tk.BooleanVar(value=self.config_data.get("sql_recordar", False))
+        if self.var_sql_recordar.get():
+            guardada = leer_password(self.config_data.get("sql_usuario", ""), self.config_data.get("sql_servidor", ""))
+            if guardada:
+                self.ent_sql_password.insert(0, guardada)
+        ctk.CTkCheckBox(
+            sec, text="Recordar contraseña en Windows", variable=self.var_sql_recordar,
+            font=F(12), checkbox_width=18, checkbox_height=18
+        ).grid(row=9, column=0, columnspan=2, pady=(8, 0), sticky="w")
+        self.ent_sql_tabla = self._field(sec, 10, "Tabla", self.config_data.get("sql_tabla") or TABLA_DEFAULT, TABLA_DEFAULT)
+        self._btn(sec, "Probar conexión", self._probar_sql, "secondary", height=28, font=F(12)).grid(
+            row=12, column=0, sticky="w", pady=(10, 0))
+        self.lbl_sql_estado = ctk.CTkLabel(
+            sec, text="Solo consulta FECHA_ALTA, CUENTA y NO_RENOVACION.", font=F(11), text_color=COL["muted"],
+            justify="left", anchor="w", wraplength=230
+        )
+        self.lbl_sql_estado.grid(row=13, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Correo del lote
         sec = self._section(side, "Correo del lote")
@@ -1030,6 +1120,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "cliente": ("No. cliente", 115, "center"),
             "credito_hijo": ("Crédito a cancelar", 135, "center"),
             "credito_padre": ("Crédito origen", 120, "center"),
+            "sql": ("Base de datos", 130, "w"),
             "lote": ("Lote / envío", 300, "w"),
             "cierre": ("Cierre en iTop", 210, "w"),
             "gafete": ("Gafete", 70, "center"),
@@ -1147,7 +1238,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
     @staticmethod
     def _revision_enviado(f: dict) -> tuple:
-        """(texto, tag) de un renglón del concentrado semanal."""
+        """(texto, tag) de un renglón del concentrado semanal (con lo que dice la base de datos si no cuadra)."""
+        texto, tag = FonacotValidadorRenovacionesApp._revision_outlook(f)
+        if f.get('sql_estado') in SQL_PROBLEMAS:
+            return f"{texto}  ·  BASE DE DATOS: {f['sql_detalle']}", "no_enviada"
+        return texto, tag
+
+    @staticmethod
+    def _revision_outlook(f: dict) -> tuple:
         if f.get('error'):
             return f"DATOS EQUIVOCADOS: {f['error']}", "no_enviada"
         if not f.get('incidente'):
@@ -1275,11 +1373,76 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         now = datetime.now()
         self.cal_start.set_date(now)
         self.cal_end.set_date(now)
+        self._periodo_pendiente()
 
     def _set_prev_business_day(self):
         prev = previous_business_day(datetime.now().date())
         self.cal_start.set_date(prev)
         self.cal_end.set_date(prev)
+        self._periodo_pendiente()
+
+    def _periodo_pendiente(self):
+        """Recuerda que lo elegido aún no se ha buscado (cambiar de modo o de fechas ya no busca solo)."""
+        if self.is_extracting:
+            return
+        ini, fin = self.cal_start.get_date(), self.cal_end.get_date()
+        if self._es_revision():
+            que = f"Revisión del {ini:%d/%m} al {fin:%d/%m}" if ini != fin else f"Revisión del {fin:%d/%m}"
+        else:
+            que = "Lote de hoy" if fin == datetime.now().date() else f"Lote del {fin:%d/%m}"
+        self.lbl_extract_hint.configure(text=f"{que}: pulsa «Extraer y validar» (F5) para buscar",
+                                        text_color=COL["primary"])
+
+    def _sql_params(self) -> dict:
+        """Datos de conexión si la validación en la base está activa (None si no)."""
+        if not self.var_sql.get():
+            return None
+        return {
+            "servidor": self.ent_sql_servidor.get().strip(),
+            "usuario": self.ent_sql_usuario.get().strip(),
+            "password": self.ent_sql_password.get(),
+            "tabla": self.ent_sql_tabla.get().strip() or TABLA_DEFAULT,
+            "cliente_oracle": self.config_data.get("sql_cliente_oracle", ""),
+        }
+
+    def _probar_sql(self):
+        p = {
+            "servidor": self.ent_sql_servidor.get().strip(), "usuario": self.ent_sql_usuario.get().strip(),
+            "password": self.ent_sql_password.get(), "tabla": self.ent_sql_tabla.get().strip() or TABLA_DEFAULT,
+            "cliente_oracle": self.config_data.get("sql_cliente_oracle", ""),
+        }
+        self.lbl_sql_estado.configure(text="Probando conexión…", text_color=COL["muted"])
+
+        def trabajo():
+            try:
+                texto, ok = probar_conexion(**p), True
+            except ErrorSQL as e:
+                texto, ok = str(e), False
+            except Exception as e:
+                texto, ok = f"{type(e).__name__}: {e}", False
+            self.after(0, lambda: self._sql_probado(texto, ok))
+        threading.Thread(target=trabajo, daemon=True).start()
+
+    def _sql_probado(self, texto: str, ok: bool):
+        self.lbl_sql_estado.configure(text=texto, text_color=COL["success"] if ok else "#B91C1C")
+        if ok:
+            self._save_config()
+
+    @staticmethod
+    def _validar_sql(rows: list, lote_info: dict, cfg: dict) -> dict:
+        """Valida cada renovación (y lo enviado en los tickets únicos) en la base. Un error no detiene la extracción."""
+        try:
+            conn = conectar_sql(cfg["servidor"], cfg["usuario"], cfg["password"], cfg["cliente_oracle"])
+            try:
+                filas = ((lote_info or {}).get('semana') or {}).get('filas') or []
+                return validar_contra_base(conn, cfg["tabla"], rows, filas)
+            finally:
+                conn.close()
+        except ErrorSQL as e:
+            return {'ok': False, 'error': str(e)}
+        except Exception as e:
+            texto = str(e).strip().splitlines()[0] if str(e).strip() else ""
+            return {'ok': False, 'error': f"{type(e).__name__}: {texto}"}
 
     def _aplicar_inhabiles(self):
         set_dias_inhabiles(parse_dias_inhabiles(self.ent_inhabiles.get()), bool(self.var_oficiales.get()))
@@ -1291,24 +1454,29 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         """En «Lote del día» el periodo es un solo día: elegir una fecha mueve la otra."""
         if not self._es_revision():
             otro.set_date(origen.get_date())
+        self._periodo_pendiente()
 
     def _on_tipo_revision(self, tipo: str):
+        """Cambiar de modo solo prepara el periodo: no busca hasta «Extraer y validar»."""
+        self.seg_tipo.set(tipo)
         if tipo == TIPOS_REVISION[0]:
             # El lote del día que marca «Al» (hoy o cualquier día pasado)
             self.cal_start.set_date(self.cal_end.get_date())
-            self._start_extraction()
+            self._periodo_pendiente()
+        elif self.cal_start.get_date() == self.cal_end.get_date():
+            self._revisar_semana(0)  # de un solo día a la semana actual; un periodo ya elegido se respeta
         else:
-            self._revisar_semana(0)
+            self._periodo_pendiente()
 
     def _revisar_semana(self, semanas_atras: int = 0):
-        """Lunes a viernes de la semana (la actual llega hasta hoy) y extrae."""
+        """Pone de lunes a viernes de la semana (la actual llega hasta hoy); se busca con «Extraer y validar»."""
         hoy = datetime.now().date()
         lunes = hoy - timedelta(days=hoy.weekday() + 7 * semanas_atras)
         viernes = lunes + timedelta(days=4)
         self.cal_start.set_date(lunes)
         self.cal_end.set_date(min(viernes, hoy) if semanas_atras == 0 else viernes)
         self.seg_tipo.set(TIPOS_REVISION[1])
-        self._start_extraction()
+        self._periodo_pendiente()
 
     def _focus_search(self):
         self.ent_search.focus_set()
@@ -1460,6 +1628,15 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             return
 
         self._save_config()
+        sql_cfg = self._sql_params()
+        if sql_cfg and not (sql_cfg["servidor"] and sql_cfg["usuario"] and sql_cfg["password"]):
+            if not auto:
+                messagebox.showwarning(
+                    "Falta la conexión a la base",
+                    "Para validar en CR_RENOVACIONES escribe servidor, usuario y contraseña en «Validaciones automáticas».\n\n"
+                    "Esta vez se extrae sin validar en la base."
+                )
+            sql_cfg = None
 
         account = self.cmb_account.get().strip()
         if account in ("Sin conexión a Outlook", "Cargando cuentas..."):
@@ -1480,6 +1657,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._prev_scan_signature = signature
 
         self.is_extracting = True
+        self.lbl_extract_hint.configure(text=HINT_EXTRAER, text_color=COL["muted"])
         self.btn_extract.configure(state="disabled", text="Analizando renovaciones…")
         self.progress_bar.set(0.05)
 
@@ -1489,18 +1667,19 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "asunto_concentrado": self.config_data.get("asunto_concentrado", ASUNTO_CONCENTRADO_DEFAULT),
             "ultimo_lote": self.config_data.get("ultimo_lote"),
             "revision": revision,
-            "dias_atras": int(self.config_data.get("dias_atras_lote") or DIAS_ATRAS_LOTE)
+            "dias_atras": int(self.config_data.get("dias_atras_lote") or DIAS_ATRAS_LOTE),
+            "leer_imagenes": bool(self.var_ocr.get())
         }
         self.ent_hora_corte.delete(0, "end")
         self.ent_hora_corte.insert(0, corte_opts["hora_corte"])
 
         threading.Thread(
             target=self._run_extraction_thread,
-            args=(account, d_start, d_end, modo, agente_filter, corte_opts, auto),
+            args=(account, d_start, d_end, modo, agente_filter, corte_opts, auto, sql_cfg),
             daemon=True
         ).start()
 
-    def _run_extraction_thread(self, account, d_start, d_end, modo, agente_filter, corte_opts, auto):
+    def _run_extraction_thread(self, account, d_start, d_end, modo, agente_filter, corte_opts, auto, sql_cfg=None):
         def progress_cb(msg, frac=None):
             self.after(0, lambda: self._update_progress(msg, frac))
 
@@ -1515,7 +1694,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 **corte_opts
             )
             lote_info = self.engine.lote_info
-            self.after(0, lambda: self._on_extraction_done(rows, None, lote_info, auto))
+            validaciones = {'ocr': dict(self.engine.ocr_info), 'sql': None}
+            if sql_cfg and rows:
+                progress_cb(f"🗄️ Validando {len(rows)} renovaciones en la base de datos...", 0.98)
+                validaciones['sql'] = self._validar_sql(rows, lote_info, sql_cfg)
+            self.after(0, lambda: self._on_extraction_done(rows, None, lote_info, auto, validaciones))
         except Exception as e:
             err = str(e)
             self.after(0, lambda: self._on_extraction_done([], err, None, auto))
@@ -1525,7 +1708,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if frac is not None:
             self.progress_bar.set(max(0.05, min(1.0, float(frac))))
 
-    def _on_extraction_done(self, rows, error_msg, lote_info=None, auto=False):
+    def _on_extraction_done(self, rows, error_msg, lote_info=None, auto=False, validaciones=None):
         self.is_extracting = False
         self.btn_extract.configure(state="normal", text="Extraer y validar")
         self.progress_bar.set(1.0)
@@ -1538,6 +1721,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         self.all_rows = rows
         self.lote_info = lote_info
+        self.validaciones = validaciones or {}
         self._tick_clock(reschedule=False)
         self._key_by_rid = {r['Row_ID']: row_key(r) for r in rows}
 
@@ -1555,7 +1739,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.seg_tipo.set(TIPOS_REVISION[1] if revision else TIPOS_REVISION[0])
         if not auto:
             if revision:
-                self.cmb_quick_filter.set(FILTRO_NO_ENVIADAS)
+                self.cmb_quick_filter.set(
+                    FILTRO_NO_ENVIADAS if lote_info.get('no_enviadas') else
+                    FILTRO_ERRORES if lote_info.get('errores_envio') else
+                    FILTRO_SIN_COMPROBAR if lote_info.get('sin_comprobar') else FILTRO_NO_ENVIADAS)
             elif self.cmb_quick_filter.get() in FILTROS_REVISION:
                 self.cmb_quick_filter.set(FILTRO_TODAS)
         self._refresh_views()
@@ -1622,7 +1809,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if not info:
             self.lbl_page_title.configure(text="Lote del día")
             self.lbl_lote_info.configure(text=self._texto_marca_guardada())
-            self.notice.grid_remove()
+            avisos, rojo, filtro = self._avisos_validaciones()
+            if avisos:
+                self._mostrar_aviso("\n".join(avisos), rojo, filtro)
+            else:
+                self.notice.grid_remove()
             return
 
         hc = info['hora_corte'].strftime('%H:%M')
@@ -1722,10 +1913,47 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             else:
                 aviso += f"Se usó la hora habitual ({hc}); revisa las rezagadas antes de enviar el lote."
             avisos.append(aviso)
+        extra, rojo_extra, filtro_extra = self._avisos_validaciones()
+        avisos += extra
+        rojo, filtro = rojo or rojo_extra, filtro or filtro_extra
         if avisos:
             self._mostrar_aviso("\n".join(avisos), rojo, filtro)
         else:
             self.notice.grid_remove()
+
+    def _avisos_validaciones(self) -> tuple:
+        """Avisos de la base de datos y de las capturas de pantalla: (avisos, rojo, filtro)."""
+        avisos, rojo, filtro = [], False, None
+        revision = bool(self.lote_info and self.lote_info.get('revision'))
+        res = self.validaciones.get('sql')
+        if res and not res.get('ok'):
+            avisos.append(f"No se pudo validar en la base de datos: {res.get('error')}")
+        elif res:
+            malas = [r for r in self.all_rows if r.get('SQL_Estado') in SQL_PROBLEMAS
+                     and (not revision or r.get('En_Periodo', True))]
+            if malas:
+                rojo, filtro = True, FILTRO_SQL
+                avisos.append(f"{len(malas)} renovación(es) no cuadran con la base (el cliente no tiene esa renovación "
+                              f"o es de otra fecha): revisa «{FILTRO_SQL}».")
+            n_sug = sum(1 for r in self.all_rows if r.get('SQL_Estado') == SQL_SUGERENCIA)
+            if n_sug:
+                avisos.append(f"{n_sug} renovación(es) a las que les falta un dato tienen sugerencia de la base "
+                              f"(columna «Base de datos»).")
+            if res.get('enviadas_con_problema'):
+                rojo = True
+                avisos.append(f"{res['enviadas_con_problema']} renglón(es) de los tickets únicos no cuadran con la base: "
+                              f"pestaña «Tickets únicos».")
+        ocr = self.validaciones.get('ocr') or {}
+        if ocr.get('completadas'):
+            avisos.append(f"{ocr['completadas']} renovación(es) se completaron leyendo una captura de pantalla: "
+                          f"revísalas antes de enviarlas (vista «{FILTRO_ALERTAS}»).")
+            filtro = filtro or FILTRO_ALERTAS
+        if ocr.get('sin_leer'):
+            avisos.append("No se encontró cliente o crédito en la imagen de: " + ", ".join(ocr['sin_leer'][:8])
+                          + ("…" if len(ocr['sin_leer']) > 8 else ""))
+        if ocr.get('error'):
+            avisos.append(f"No se pudieron leer las capturas de pantalla: {ocr['error']}")
+        return avisos, rojo, filtro
 
     def _guardar_marca_lote(self, rows: list):
         """Guarda la renovación más reciente del lote copiado o del correo creado como 'última considerada'."""
@@ -1762,6 +1990,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             or r.get('Falta_Hoy')
             or r.get('Error_Envio')
             or r.get('Posible_Duplicado')
+            or r.get('SQL_Estado') in SQL_PROBLEMAS
+            or r.get('Dato_Imagen')
             or "DISCREPANCIA" in r.get('Alerta_Renovacion', '')
         )
 
@@ -1794,6 +2024,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 if revision and not r.get('En_Periodo', True):
                     continue  # De la semana anterior: solo se escaneó para sumar rezagadas
                 if q_filter == FILTRO_ERRORES and not r.get('Error_Envio'):
+                    continue
+                if q_filter == FILTRO_SQL and r.get('SQL_Estado') not in SQL_PROBLEMAS:
                     continue
                 if q_filter == FILTRO_ENVIADAS and lote != LOTE_ENVIADA:
                     continue
@@ -1843,6 +2075,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             return "descartado"
         if r.get('No_Enviada') or r.get('Error_Envio'):
             return "no_enviada"
+        if r.get('SQL_Estado') in SQL_PROBLEMAS:
+            # El cliente no tiene esa renovación: rojo aunque ya esté validada; de otra fecha: ámbar
+            return "multiple" if r['SQL_Estado'] == SQL_OTRA_FECHA else "no_enviada"
         if r.get('Falta_Hoy'):
             return "rezagada"
         if self._fuera_de_lote(r):
@@ -1897,6 +2132,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             lote = plain_text(r.get('Lote_Etiqueta', ''))
             self._celdas_completas[(rid, "lote")] = lote
             self._celdas_completas[(rid, "cierre")] = resumen_cierre(r.get('Cierre_iTop'))
+            self._celdas_completas[(rid, "sql")] = r.get('SQL_Detalle', '')
             self.tree_desglose.insert(
                 "", "end", iid=rid,
                 values=(
@@ -1906,6 +2142,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     r['Numero_Cliente'],
                     r['Credito_Renovado_Hijo'],
                     r['Credito_Origen_Padre'],
+                    texto_sql(r.get('SQL_Estado', '')),
                     r.get('Lote_Resumen') or lote_corto(lote),
                     resumen_cierre(r.get('Cierre_iTop'), corto=True),
                     r['Gafete'],
@@ -2067,6 +2304,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             box.insert("end", f"{etiqueta}\n", "error" if r.get('No_Enviada') or r.get('Error_Envio') else "warn")
             if r.get('Error_Envio') and r['Error_Envio'] not in etiqueta:
                 box.insert("end", f"DATOS EQUIVOCADOS en el ticket único: {r['Error_Envio']}\n", "error")
+            box.insert("end", "\n")
+        if r.get('SQL_Detalle') or r.get('Dato_Imagen'):
+            if r.get('SQL_Detalle'):
+                box.insert("end", f"Base de datos: {r['SQL_Detalle']}\n",
+                           "error" if r.get('SQL_Estado') in SQL_PROBLEMAS else "ok")
+            if r.get('Dato_Imagen'):
+                box.insert("end", f"Imagen: {r['Dato_Imagen']}. Compáralo con la imagen del correo antes de enviarlo.\n", "warn")
             box.insert("end", "\n")
         cierre = r.get('Cierre_iTop')
         if cierre:
@@ -2403,6 +2647,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         avisos = []
         if pendientes:
             avisos.append(f"{pendientes} de {len(active_rows)} renovaciones aún no están validadas.")
+        sql_mal = [r['Numero_Ticket'] for r in active_rows if r.get('SQL_Estado') in SQL_PROBLEMAS]
+        if sql_mal:
+            avisos.append(f"{len(sql_mal)} renovación(es) no cuadran con la base de datos: {', '.join(sql_mal[:8])}"
+                          + ("…" if len(sql_mal) > 8 else "") + f". Revisa «{FILTRO_SQL}».")
+        de_imagen = [r['Numero_Ticket'] for r in active_rows if r.get('Dato_Imagen')]
+        if de_imagen:
+            avisos.append(f"{len(de_imagen)} renovación(es) tienen datos leídos de una imagen: {', '.join(de_imagen[:8])}.")
         if cerradas:
             avisos.append(f"{len(cerradas)} ticket(s) ya están cerrados en iTop: {', '.join(cerradas[:8])}"
                           + ("…" if len(cerradas) > 8 else "") + ". Revisa el motivo antes de enviarlos (vista «Cerradas en iTop»).")
@@ -2466,6 +2717,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "No. Cliente (Cuenta)": r['Numero_Cliente'],
                 "Crédito Renovado (A Cancelar)": r['Credito_Renovado_Hijo'],
                 "Crédito Origen (Padre)": r['Credito_Origen_Padre'],
+                "Base de datos (SQL)": r.get('SQL_Detalle', ''),
+                "Leído de imagen": r.get('Dato_Imagen', ''),
                 "Lote / Corte": plain_text(r.get('Lote_Etiqueta', '')),
                 "Gafete": r['Gafete'],
                 "Agente Responsable": r['Nombre_Asignado'],
@@ -2593,6 +2846,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "Días de retraso": r.get('Dias_Retraso') or '',
                 "Detalle": plain_text(r.get('Lote_Etiqueta', '')),
                 "Datos equivocados en el ticket único": r.get('Error_Envio', ''),
+                "Base de datos (SQL)": r.get('SQL_Detalle', ''),
                 "Cierre iTop": resumen_cierre(r.get('Cierre_iTop')),
                 "Gafete": r['Gafete'],
                 "Agente": r['Nombre_Asignado'],
@@ -2610,6 +2864,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "Crédito": f['credito'],
                 "Incidente en Outlook": f['incidente'],
                 "Revisión": self._revision_enviado(f)[0],
+                "Base de datos (SQL)": f.get('sql_detalle', ''),
             }
             for f in ((self.lote_info or {}).get('semana') or {}).get('filas') or []
         ]

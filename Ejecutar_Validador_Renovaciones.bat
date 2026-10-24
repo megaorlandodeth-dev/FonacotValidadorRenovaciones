@@ -26,6 +26,13 @@ if errorlevel 1 (
     %PYEXE% -m pip install -r requirements.txt
 )
 
+rem Opcionales: lectura de capturas (pillow) y validacion en la base de datos (oracledb). Sin ellos la app funciona igual.
+%PYEXE% -c "import PIL, oracledb" >nul 2>nul
+if errorlevel 1 (
+    echo Instalando complementos opcionales ^(pillow, oracledb^)...
+    %PYEXE% -m pip install pillow oracledb
+)
+
 %PYEXE% validador_renovaciones_app.py
 if errorlevel 1 (
     echo.
