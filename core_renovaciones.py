@@ -872,6 +872,67 @@ class RenovacionTicketParser:
         return rows
 
 
+# ======================= DATOS LEÍDOS DE IMÁGENES (capturas de pantalla) =======================
+
+def completar_con_imagenes(rows: list, lecturas: list) -> list:
+    """
+    Completa el cliente o el crédito que el texto del incidente no trae con lo leído en sus imágenes (OCR).
+    `rows`: renglones de un mismo correo. `lecturas`: [{'cliente', 'credito', 'imagen', 'dudosa'}], una por imagen.
+    Si el incidente no trae nada y hay varias imágenes con distintos datos, queda una renovación por imagen.
+    Lo completado se marca para revisarse: una imagen se puede leer con un dígito equivocado.
+    """
+    pares = []
+    for lec in lecturas:
+        par = (first_digits(lec.get('cliente') or ''), first_digits(lec.get('credito') or ''))
+        if any(par) and par not in [p[:2] for p in pares]:
+            pares.append((par[0], par[1], lec.get('imagen') or 'imagen', bool(lec.get('dudosa'))))
+    if not pares or not any(r.get('Datos_Incompletos') for r in rows):
+        return rows
+
+    def llenar(r, par):
+        pc, pr, imagen, dudosa = par
+        leido = []
+        if r['Numero_Cliente'] == "SIN CLIENTE" and pc:
+            r['Numero_Cliente'] = pc
+            leido.append(f"Cliente {pc}")
+        if r['Credito_Renovado_Hijo'] == "SIN CRÉDITO" and pr:
+            r['Credito_Renovado_Hijo'] = pr
+            leido.append(f"Crédito {pr}")
+        r['Datos_Incompletos'] = r['Numero_Cliente'] == "SIN CLIENTE" or r['Credito_Renovado_Hijo'] == "SIN CRÉDITO"
+        r['Dato_Imagen'] = f"{' y '.join(leido)} leído de la imagen «{imagen}»" + (" (lectura dudosa)" if dudosa else "")
+        if r['Datos_Incompletos']:
+            r['Alerta_Renovacion'] = f"🚨 FALTA DATO · {r['Dato_Imagen']}: revísalo"
+            r['Nivel_Alerta'] = "incompleto"
+        else:
+            r['Alerta_Renovacion'] = f"🖼️ {r['Dato_Imagen']}: revísalo antes de enviarlo"
+            r['Nivel_Alerta'] = "multiple"
+
+    usados, salida = set(), []
+    for r in rows:
+        if r.get('Datos_Incompletos'):
+            cli = '' if r['Numero_Cliente'] == "SIN CLIENTE" else first_digits(r['Numero_Cliente'])
+            cred = '' if r['Credito_Renovado_Hijo'] == "SIN CRÉDITO" else first_digits(r['Credito_Renovado_Hijo'])
+            compatibles = [i for i, (pc, pr, _, _) in enumerate(pares) if i not in usados
+                           and (not cli or not pc or pc == cli) and (not cred or not pr or pr == cred)]
+            if compatibles:
+                usados.add(compatibles[0])
+                llenar(r, pares[compatibles[0]])
+        salida.append(r)
+
+    base = salida[0] if len(rows) == 1 and salida[0].get('Dato_Imagen') else None
+    extra = [p for i, p in enumerate(pares) if i not in usados and p[0] and p[1]]
+    if base and extra:
+        for n, par in enumerate(extra, 2):
+            copia = dict(base)
+            copia.update({'Numero_Cliente': "SIN CLIENTE", 'Credito_Renovado_Hijo': "SIN CRÉDITO",
+                          'Row_ID': f"{base['Row_ID']}_img{n}"})
+            llenar(copia, par)
+            salida.append(copia)
+        for i, r in enumerate(salida, 1):
+            r['Indice_En_Ticket'], r['Total_En_Ticket'], r['Es_Multiple'] = i, len(salida), True
+    return salida
+
+
 # ======================= CORTE DIARIO, CONCENTRADO "TICKET ÚNICO" Y REZAGADAS =======================
 # El corte de cada día es la hora en que realmente salió su correo concentrado ("Ticket Único <fecha>"):
 # lo que llegó después, o lo que no quedó en él, debe sumarse al lote siguiente. Mientras el ticket único
