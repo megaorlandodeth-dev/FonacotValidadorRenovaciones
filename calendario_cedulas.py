@@ -198,23 +198,48 @@ def dia_de_envio(r: dict, lote_actual: date = None):
     return llegada.date() if isinstance(llegada, datetime) else llegada
 
 
+def emision_que_bloquea(alta: date, envio: date):
+    """La generación de emisión (fecha, texto) que pasó entre el alta y el ticket único en que sale; None si ninguna."""
+    if not alta or not envio or alta >= envio:
+        return None
+    gens = sorted((gen, f"la generación de la emisión de {_MESES[mes - 1]} {anio} ({gen:%d/%m/%Y})")
+                  for (anio, mes), gen in emisiones().items() if alta <= gen < envio)
+    return gens[0] if gens else None
+
+
 def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
     """
-    Pone 'Bloqueo_Emision' (texto) en las renovaciones que ya no se pueden cancelar: dadas de alta ('SQL_Fecha_Alta',
-    de la base) antes de una emisión o de un cierre de mes que pasó antes del ticket único en que salen. Sin la fecha
-    de alta no se marca (se necesita la validación en la base). `lote_actual`: día del lote que se está armando.
+    Pone 'Bloqueo_Emision' (texto) y 'Bloqueo_Tipo' en las renovaciones dadas de alta antes de una emisión o de un
+    cierre de mes que pasó antes del ticket único en que salen:
+    - 'emision': ya se emitió; no se puede cancelar (solo informativa).
+    - 'cierre': pasó el cierre de mes; solo se cancela con autorización.
+    La fecha de alta es la de la base ('SQL_Fecha_Alta'); sin ella se usa la llegada del incidente (la renovación se dio
+    de alta ese día o antes, así que si con la llegada ya pasó un corte, con el alta real también).
+    `lote_actual`: día del lote que se está armando.
     """
     n = 0
     for r in rows:
-        r['Bloqueo_Emision'] = ''
-        alta = r.get('SQL_Fecha_Alta')
+        r['Bloqueo_Emision'], r['Bloqueo_Tipo'] = '', ''
         llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
         llegada = llegada.date() if isinstance(llegada, datetime) else llegada
+        alta = r.get('SQL_Fecha_Alta') or llegada
         envio = dia_de_envio(r, lote_actual)
-        corte = corte_que_bloquea(alta, envio)
-        if corte:
-            sale = f" y sale en el ticket único del {envio:%d/%m/%Y}" if envio != llegada else ""
-            r['Bloqueo_Emision'] = (f"YA NO SE PUEDE CANCELAR: se dio de alta el {alta:%d/%m/%Y} y el incidente llegó "
-                                    f"el {llegada:%d/%m/%Y}{sale}, " + f"después de {corte[1]}: ya se emitió".replace("de el ", "del "))
-            n += 1
-    return {'bloqueadas': n}
+        emision = emision_que_bloquea(alta, envio)
+        corte = emision or corte_que_bloquea(alta, envio)
+        if not corte:
+            continue
+        sale = f" y sale en el ticket único del {envio:%d/%m/%Y}" if envio != llegada else ""
+        origen = (f"se dio de alta el {alta:%d/%m/%Y} y el incidente llegó el {llegada:%d/%m/%Y}"
+                  if r.get('SQL_Fecha_Alta') else f"el incidente llegó el {llegada:%d/%m/%Y}")
+        if emision:
+            r['Bloqueo_Tipo'] = 'emision'
+            r['Bloqueo_Emision'] = (f"YA NO SE PUEDE CANCELAR: {origen}{sale}, "
+                                    + f"después de {corte[1]}: ya se emitió".replace("de el ", "del "))
+        else:
+            r['Bloqueo_Tipo'] = 'cierre'
+            r['Bloqueo_Emision'] = (f"NECESITA AUTORIZACIÓN: {origen}{sale}, "
+                                    + f"después de {corte[1]}. ".replace("de el ", "del ") +
+                                    "Después del cierre de mes solo se cancela con autorización.")
+        n += 1
+    return {'bloqueadas': n, 'emitidas': sum(1 for r in rows if r.get('Bloqueo_Tipo') == 'emision'),
+            'cierre': sum(1 for r in rows if r.get('Bloqueo_Tipo') == 'cierre')}

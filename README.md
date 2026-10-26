@@ -55,7 +55,7 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 7. **Formato real del "Ticket Único" (v2.2):**
    - Detecta el correo *"Cancelación de renovaciones – ticket único 22-10-2026"* y lee su tabla **INCIDENTE | FECHA | CLIENTE | CREDITO (HIJO)** renglón por renglón (incluye créditos cortos como `681`). Cuenta como enviada solo si coincide **Cliente + Crédito** (si al incidente le falta el cliente, basta el mismo ticket con el mismo crédito). Si el ticket único trae el incidente con otro cliente o crédito, se marca como **datos equivocados** (ver punto 11).
    - Si el ticket sí viene en el concentrado pero con otros datos, la rezagada lo dice: *"ahí viene Cliente X Crédito Y"*.
-   - **Crear correo** arma el borrador con ese mismo formato: asunto `Cancelación de renovaciones – ticket único dd-mm-aaaa`, el saludo *Se envía "N" solicitudes…* y el texto *FAVOR DE BLOQUEAR…* copiados del último concentrado, y la tabla con el incidente ligado a iTop. *Copiar lote* copia lo mismo (saludo y tabla).
+   - **Crear correo** arma el borrador con ese mismo formato: asunto `Cancelación de renovaciones – ticket único dd-mm-aaaa`, el saludo *Se envía "N" solicitudes…* y el texto *FAVOR DE BLOQUEAR…* copiados del último concentrado, y la tabla con el incidente ligado a iTop. *Copiar lote* copia solo la tabla con ese formato (sin saludo).
 
 8. **Cierres en iTop (v2.2):**
    - Lee los correos *"I-xxxxxx Aviso de solución del Ticket"* y marca en violeta las renovaciones cuyo ticket ya se cerró, con **estado, fecha, quién lo cerró y el motivo** (por ejemplo *"Por instrucciones superiores, las cancelaciones de renovación solo podrán realizarse el mismo día…"*).
@@ -99,6 +99,19 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
    - **Solicitudes duplicadas:** si una renovación ya había salido en otro ticket único antes de que llegara el incidente, se avisa *posible duplicado*; dos incidentes que piden lo mismo no se marcan como datos equivocados.
    - **El rojo gana:** una renovación que no se envió o salió mal se ve en rojo aunque la hayas validado antes.
    - La marca *última considerada* solo la deja el lote de hoy al copiarlo o crear el correo (no el Excel, ni una revisión, ni un lote pasado).
+
+**Novedades v3.0:**
+   - **Dos perfiles: Usuario y Validador.** La primera vez se elige el perfil (se cambia con el botón de perfil, arriba a la derecha).
+     - **Usuario (analista):** solo ve *Mis renovaciones de hoy* por su gafete: sin revisión semanal, periodo, correo del ticket único ni descartes. Su botón es **Copiar mis renovaciones**, que copia solo la tabla con el formato del ticket único (sin saludo) para pasársela a quien manda el ticket único.
+     - **Validador:** todo lo de antes, con el desglose más claro para validar.
+   - **Veredicto por renovación:** la tabla dice *Lista*, *Revisar*, *Corregir*, *Autorización*, *No se manda*, *Enviada* o *Siguiente*. El desglose del ticket abre con un recuadro de color que dice qué es y **qué hacer**, y las **comprobaciones** con su evidencia (correo, base de datos, calendario, ticket único, iTop, asignación), para que no haya que ir a corroborarlas.
+   - **Validar más rápido:** al validar con *Espacio* se pasa sola a la siguiente pendiente (`avanzar_al_validar`); **Siguiente pendiente ➜** o la tecla **N** brincan a la que falta. Filtros nuevos: *Listas para enviar* y *No se mandan*.
+   - **Lo que ya pasó la emisión no se manda:** sale del lote y queda solo como informativo (*No se mandan*): ya se emitió y no se puede cancelar. Sin base de datos se usa la fecha en que llegó el incidente como alta. Lo que ya está en la cédula (CR_CEDULAS_DETALLE) también sale.
+   - **Cierre de mes = con autorización:** lo que pasó el cierre de mes sigue en el lote pero marcado *Necesita autorización*.
+   - **Lo resuelto en iTop no se manda**, salvo que se haya **cerrado por error**: el motivo dice que es de otro día (o que no procede), la base dice que es del día, no salió en el ticket único y no está bloqueada (`TZ_LOCK` = 0). Entonces vuelve al lote marcado *CERRADO POR ERROR*. Si no se pudo leer `TZ_LOCK` solo avisa (*posible cierre por error*). Lo que la base dice que *no procede* también sale del lote.
+   - **Crédito padre → hijo:** si el incidente trae el crédito padre, el crédito a cancelar se cambia por su renovación (el hijo), para que el ticket único no salga con el padre y lo rechacen. Queda la leyenda *VALIDAR: el incidente trae el crédito padre …* y el veredicto *Revisar*.
+   - **Varios clientes en un incidente:** si alguno de los clientes no tiene renovaciones (o no de esos días) se avisa: *El cliente X (también viene en el incidente) no cuenta con renovaciones*.
+   - **Copiar lote sin saludo:** solo la tabla INCIDENTE | FECHA | CLIENTE | CREDITO (HIJO). El saludo y los avisos van solo en *Crear correo Ticket Único*.
 
 **Novedades v2.9:**
    - **Pantalla más limpia:** el encabezado ocupa un renglón (lo demás en *Más detalle ▾*); el aviso muestra el primer problema y *+N avisos más ▾* despliega el resto (la revisión semanal ya no llena la parte de arriba). Los indicadores ocupan un solo renglón y al pasar el mouse dicen qué cuentan.
@@ -161,6 +174,8 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 - `core_renovaciones.py`: Motor de parsing, clasificación regex, normalización y desglose 1 a N de renovaciones.
 - `outlook_renovaciones_engine.py`: Conector MAPI con Microsoft Outlook, escaneo multi-buzón, gestión de historial de asignaciones, búsqueda del concentrado y borrador del correo del lote.
 - `lote_utils.py`: Persistencia de validaciones, tabla del lote (texto/HTML) y portapapeles con formato.
+- `reglas_lote.py`: Qué va en el lote y qué solo es informativo (emisión, resuelto, no procede, cerrado por error) y el veredicto con las comprobaciones del desglose.
+- `sql_renovaciones.py` / `calendario_cedulas.py`: Validación en la base (Oracle) y calendario de emisión y cierres de mes.
 - `tests/`: Pruebas automáticas del parser, del corte/rezagadas y de las utilidades del lote (no requieren Outlook).
 - `Ejecutar_Validador_Renovaciones.bat`: Script de inicio rápido.
 
@@ -186,6 +201,9 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 ### Configuración
 
 Se guarda en `%USERPROFILE%\.fonacot_validador_renovaciones_config.json`. Además de lo que se captura en pantalla:
+- `perfil`: `"usuario"` o `"validador"`. Vacío = se pregunta al abrir.
+- `perfil_fijo`: `true` para que no se pueda cambiar de perfil desde la app (lo fija quien instala). El usuario sí puede cambiar su gafete.
+- `avanzar_al_validar`: al validar una renovación se pasa sola a la siguiente pendiente (`true` por omisión).
 - `itop_url_template`: para otro servidor de iTop, p. ej. `https://servidor/pages/UI.php?operation=details&class={clase}&id={id}` (admite `{id}`, `{ref}`, `{clase}`). Vacío = servidor de FONACOT.
 - `ultimo_lote`: marca de la última renovación considerada (se actualiza al copiar el lote o crear el correo de hoy).
 - `dias_inhabiles` / `feriados_oficiales`: días inhábiles capturados en pantalla y si se suman los feriados oficiales.
