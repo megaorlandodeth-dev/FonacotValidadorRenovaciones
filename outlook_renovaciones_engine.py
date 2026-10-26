@@ -41,10 +41,13 @@ from core_renovaciones import (
     ticket_key,
     is_aviso_solucion,
     parse_aviso_solucion,
+    completar_con_imagenes,
     HORA_CORTE_DEFAULT,
     ASUNTO_CONCENTRADO_DEFAULT,
     RenovacionTicketParser
 )
+
+from ocr_imagenes import leer_correo, OCRNoDisponible
 
 # Días hábiles hacia atrás que revisa el lote del día (lo no enviado sigue apareciendo una semana)
 DIAS_ATRAS_LOTE = 5
@@ -83,6 +86,7 @@ class FonacotRenovacionesEngine:
         self.renovaciones_rows = []
         self.tickets_summary = []
         self.lote_info = None
+        self.ocr_info = {'completadas': 0, 'sin_leer': [], 'error': ''}
 
     def load_settings(self) -> dict:
         default_settings = {
@@ -379,7 +383,8 @@ class FonacotRenovacionesEngine:
         incluir_subcarpetas: bool = True,
         incluir_eliminados: bool = True,
         ignorar_reasignados_a_otro: bool = False,
-        progress_callback=None
+        progress_callback=None,
+        leer_imagenes: bool = True
     ) -> tuple:
         """
         Escanea Outlook, identifica todos los tickets de Cancelación/Reversa de Renovación
@@ -397,6 +402,7 @@ class FonacotRenovacionesEngine:
         start_dt = datetime(fecha_inicio.year, fecha_inicio.month, fecha_inicio.day, 0, 0, 0)
         end_dt = datetime(fecha_fin.year, fecha_fin.month, fecha_fin.day, 23, 59, 59)
         extended_end_dt = end_dt + timedelta(hours=12)
+        self.ocr_info = {'completadas': 0, 'sin_leer': [], 'error': ''}
 
         effective_general_mode = modo_concentrador_general or not gafetes_filter
 
@@ -645,6 +651,13 @@ class FonacotRenovacionesEngine:
             if not disagg_rows:
                 continue
 
+            # Incidentes que mandan una captura de pantalla en vez de escribir Cliente y Crédito
+            if leer_imagenes and msg_obj is not None and any(r['Datos_Incompletos'] for r in disagg_rows):
+                if progress_callback:
+                    progress_callback(total_folders, total_folders + 1,
+                                      f"🖼️ Leyendo imágenes del incidente {cand['Numero_Ticket']}...")
+                disagg_rows = self._completar_con_imagenes(msg_obj, disagg_rows, cand['Numero_Ticket'])
+
             # Hora en que el ticket llegó por primera vez (asignación inicial), no la de la última reasignación:
             # es la que decide si entró antes o después del corte.
             timeline = clean_timeline_by_ticket.get(cand['Numero_Ticket'], [])
@@ -706,6 +719,24 @@ class FonacotRenovacionesEngine:
         self.renovaciones_rows = all_renewal_rows
         self.tickets_summary = tickets_summary_list
         return all_renewal_rows, tickets_summary_list
+
+    def _completar_con_imagenes(self, msg, rows: list, ticket: str) -> list:
+        """Lee con OCR las imágenes del correo y completa el dato que falta (ver core.completar_con_imagenes)."""
+        if self.ocr_info['error']:
+            return rows  # el OCR no está disponible en este equipo: no se reintenta en cada correo
+        try:
+            lecturas, n_imagenes = leer_correo(msg)
+        except OCRNoDisponible as e:
+            self.ocr_info['error'] = str(e)
+            return rows
+        except Exception:
+            return rows
+        if lecturas:
+            rows = completar_con_imagenes(rows, lecturas)
+            self.ocr_info['completadas'] += sum(1 for r in rows if r.get('Dato_Imagen'))
+        if n_imagenes and any(r['Datos_Incompletos'] for r in rows):
+            self.ocr_info['sin_leer'].append(ticket)
+        return rows
 
     @staticmethod
     def _aplicar_cierres_itop(rows: list, avisos_solucion: dict, timeline_by_ticket: dict):
@@ -1106,9 +1137,10 @@ class FonacotRenovacionesEngine:
                     tickets, numeros = extract_concentrado_tokens(full_text)
                     filas, vistas = [], set()
                     for f in extract_concentrado_rows(html) + extract_concentrado_rows(adj_html):
-                        clave = (f['ticket'], f['cliente'], f['credito'])
-                        if clave not in vistas:  # la misma relación en el cuerpo y en el adjunto
-                            vistas.add(clave)
+                        # Otro nombre: `clave` es la palabra del asunto y se sigue usando con los demás correos
+                        llave_fila = (f['ticket'], f['cliente'], f['credito'])
+                        if llave_fila not in vistas:  # la misma relación en el cuerpo y en el adjunto
+                            vistas.add(llave_fila)
                             filas.append(f)
                     tickets.update(f['ticket'].split('-', 1)[-1] for f in filas if f['ticket'])
 
@@ -1141,7 +1173,8 @@ class FonacotRenovacionesEngine:
         asunto_concentrado: str = ASUNTO_CONCENTRADO_DEFAULT,
         ultimo_lote: dict = None,
         revision: bool = None,
-        dias_atras: int = DIAS_ATRAS_LOTE
+        dias_atras: int = DIAS_ATRAS_LOTE,
+        leer_imagenes: bool = True
     ) -> list:
         """
         Envoltorio compatible con la GUI principal.
@@ -1181,7 +1214,8 @@ class FonacotRenovacionesEngine:
             incluir_subcarpetas=True,
             incluir_eliminados=True,
             ignorar_reasignados_a_otro=False,
-            progress_callback=_wrapped_progress
+            progress_callback=_wrapped_progress,
+            leer_imagenes=leer_imagenes
         )
 
         if aplicar_corte:

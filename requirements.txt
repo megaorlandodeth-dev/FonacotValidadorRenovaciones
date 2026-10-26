@@ -6,3 +6,5 @@ lxml
 pandas
 openpyxl
 pywin32
+pillow
+oracledb
