@@ -69,7 +69,12 @@ def tabla_valida(tabla: str) -> str:
 def servidor_de(host: str, puerto="", servicio: str = "") -> str:
     """Los tres campos de SQL Developer (Nombre del host, Puerto, Nombre del servicio) -> «host:puerto/servicio»."""
     host, servicio = (host or "").strip(), (servicio or "").strip()
-    puerto = str(puerto or "").strip() or "1521"
+    puerto = str(puerto or "").strip()
+    if re.search(r'[:/\s,;]', host):
+        # Pegaron «host:puerto/servicio» (o «1521/fonatop») en el campo del host
+        h, p, s = separar_servidor(host)
+        host, puerto, servicio = h, puerto or p, servicio or s
+    puerto = puerto or "1521"
     if not host:
         return ""
     return f"{host}:{puerto}/{servicio}" if servicio else f"{host}:{puerto}"
@@ -78,10 +83,26 @@ def servidor_de(host: str, puerto="", servicio: str = "") -> str:
 def separar_servidor(servidor: str) -> tuple:
     """(host, puerto, servicio) de «host:puerto/servicio» (o con espacios, comas o diagonales). Al revés de servidor_de."""
     s = (servidor or "").strip()
-    m = re.fullmatch(r'([^:/\s(),;]+)(?:[\s:,;/]+(\d{2,5}))?(?:[\s:,;/]+([A-Za-z0-9_$#.]+))?', s)
+    m = re.fullmatch(r'([^:/\s(),;]+)(?:[\s:,;/]+(\d{2,5}))?(?:[\s:,;/]+([A-Za-z0-9_$#.\-]+))?', s)
     if not m:
         return s, "", ""
-    return m.group(1), m.group(2) or "", m.group(3) or ""
+    host, puerto, servicio = m.group(1), m.group(2) or "", m.group(3) or ""
+    if host.isdigit():
+        # «1521/fonatop» (sin host): el número es el puerto, no el servidor
+        host, puerto = "", puerto or host
+    return host, puerto, servicio
+
+
+def host_invalido(servidor: str) -> str:
+    """El problema si al servidor le falta el host (p. ej. sólo «1521/fonatop»); '' si se ve bien."""
+    s = (servidor or "").strip()
+    if not s or s.startswith("("):
+        return ""
+    if not separar_servidor(s)[0]:
+        puerto = re.split(r'[:/\s,;]', s)[0]
+        return ("Falta el Nombre del host (el de SQL Developer, p. ej. scanfonacot.fonacot.gob.mx): "
+                f"«{puerto}» es el puerto, no el servidor.")
+    return ""
 
 
 def armar_dsn(servidor: str, oracledb=None) -> str:
@@ -92,10 +113,12 @@ def armar_dsn(servidor: str, oracledb=None) -> str:
     s = (servidor or "").strip()
     if s.startswith("("):
         return s
-    m = re.fullmatch(r'([^:/\s()]+):(\d+):([A-Za-z0-9_$#.]+)', s)
+    m = re.fullmatch(r'([^:/\s()]+):(\d+):([A-Za-z0-9_$#.\-]+)', s)
     if m and oracledb is not None:
         return oracledb.makedsn(m.group(1), int(m.group(2)), sid=m.group(3))
     host, puerto, servicio = separar_servidor(s)
+    if host == s and re.search(r'[:/\s,;]', s):
+        return s  # no se entendió: se le pasa a Oracle tal cual
     # «scanfonacot.fonacot.gob.mx 1521 fonatop»: sin esto, Oracle lo busca como alias en tnsnames.ora (DPY-4000)
     if puerto or "." in host:
         return servidor_de(host, puerto, servicio)
@@ -138,6 +161,9 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
         raise ErrorSQL("Falta el paquete «oracledb». Instálalo con:  python -m pip install oracledb")
     if not (servidor and usuario and password):
         raise ErrorSQL("Faltan servidor, usuario o contraseña de la base de datos")
+    problema = host_invalido(servidor)
+    if problema:
+        raise ErrorSQL(problema)
     if cliente_oracle and not _cliente_oracle_iniciado:
         try:
             oracledb.init_oracle_client(lib_dir=cliente_oracle)
@@ -165,6 +191,9 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
                           "su carpeta en la configuración («sql_cliente_oracle»).")
             elif "DPY-4000" in texto or "DPY-4026" in texto or "DPY-4027" in texto:
                 texto += "  →  Revisa Host, Puerto y Servicio (como en SQL Developer: Básico, Nombre del servicio)."
+            elif "getaddrinfo" in texto or "11001" in texto or "DPY-6005" in texto:
+                texto += (f"  →  No se encontró o no responde el servidor «{separar_servidor(servidor)[0]}»: revisa el "
+                          "Nombre del host y que estés en la red de FONACOT (VPN).")
             raise ErrorSQL(texto)
     try:
         conn.call_timeout = TIEMPO_MAX_MS

@@ -35,7 +35,7 @@ _ABBR_AMBIGUO = {'c'}  # "C" puede ser Cliente o Crédito: se decide por la cant
 _ABBR_RE = re.compile(
     r'(?<![A-Za-zÁÉÍÓÚÑáéíóúñ\d])'
     r'(?P<lbl>clte|cte|cli|clt|cta|trab|tr|t|cred|crd|cdto|cto|cr|renov|reno|ren|r|pag|orig|org|ant|c)'
-    r'\s*[\.:#\-]?\s*(?P<num>\d{3,10})(?!\d)',
+    r'\s*[\.:#\-/]?\s*(?P<num>\d{3,10})(?!\d)',
     re.I
 )
 
@@ -76,6 +76,13 @@ def strip_letter_prefixes(text: str) -> str:
     if not text:
         return ""
     return re.sub(r'(?<![A-Za-zÁÉÍÓÚÑáéíóúñ])[A-Za-z]{1,5}\s*[\.:#\-]?\s*(?=\d{3,})', '', str(text))
+
+
+def normalizar_correo(texto: str) -> str:
+    """Espacios duros (&nbsp;), Ñ y acentos compuestos de dos caracteres y saltos \\r\\n como en un texto normal."""
+    texto = unicodedata.normalize("NFC", str(texto or ""))
+    texto = re.sub(r'[\u00a0\u2007\u202f\u200b\ufeff]', lambda m: '' if m.group(0) in '\u200b\ufeff' else ' ', texto)
+    return texto.replace('\r\n', '\n').replace('\r', '\n')
 
 
 def first_digits(value: str) -> str:
@@ -526,13 +533,19 @@ class RenovacionTicketParser:
         """
         palabra = r"[A-ZÁÉÍÓÚÑÜ][A-Za-zÁÉÍÓÚÑÜáéíóúñü]+"
         encontrados = []
-        for linea in str(texto or '').splitlines():
-            for m in re.finditer(rf'((?:{palabra}[ \t]+){{1,5}}{palabra})[ \t,:\-]+(\d{{6,8}})\b(?![/\-\.]\d)', linea):
+        anterior = ''
+        for linea in normalizar_correo(texto).splitlines():
+            # «PEREZ DIAZ CARLOS ERNESTO» y en el renglón de abajo solo «3326312»
+            if re.fullmatch(r'\s*\d{6,8}\s*', linea) and cls._es_renglon_de_nombre(anterior):
+                encontrados.append(linea.strip())
+            if linea.strip():
+                anterior = linea
+            for m in re.finditer(rf'((?:{palabra}[^\S\n]+){{1,5}}{palabra})[^\S\n,:\-]*[,:\-]?[^\S\n]*(\d{{6,8}})\b(?![/\-\.]\d)', linea):
                 nombre, num = m.group(1), m.group(2)
                 if any(cls._NO_NOMBRE.match(p) for p in nombre.split()):
                     continue
                 encontrados.append(num)
-            for m in re.finditer(rf'(?<![\d/\-\.])\b(\d{{6,8}})[ \t,:\-]+((?:{palabra}[ \t]+){{1,5}}{palabra})', linea):
+            for m in re.finditer(rf'(?<![\d/\-\.])\b(\d{{6,8}})[^\S\n]*[,:\-]?[^\S\n]*((?:{palabra}[^\S\n]+){{1,5}}{palabra})', linea):
                 num, nombre = m.group(1), m.group(2)
                 antes = linea[:m.start()].split()
                 if any(cls._NO_NOMBRE.match(p) for p in nombre.split()[:2]) or (
@@ -544,6 +557,62 @@ class RenovacionTicketParser:
             return len(n) == 8 and (re.fullmatch(r'(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])20\d\d', n)
                                     or re.fullmatch(r'20\d\d(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', n))
         return [n for i, n in enumerate(encontrados) if n not in encontrados[:i] and not es_fecha(n)]
+
+    _PALABRA_NOMBRE = r"(?:[A-ZÁÉÍÓÚÑÜ][A-Za-zÁÉÍÓÚÑÜáéíóúñü]+|de|del|la|las|los)"
+    # Palabras que pueden acompañar a los créditos en su renglón («C/33363», «CREDITO RENOVADO», «53290 Y 61780»)
+    _ETIQUETAS_CREDITO = {'c', 'cr', 'cred', 'credito', 'creditos', 'ren', 'renov', 'renovacion', 'renovaciones',
+                          'renovado', 'renovada', 'renovados', 'renovadas', 'no', 'num', 'numero', 'y', 'e'}
+
+    @classmethod
+    def _es_renglon_de_nombre(cls, linea: str, con_numero: bool = False):
+        """El renglón es solo un nombre (2 a 6 palabras, con o sin el número al final). Devuelve el match o None."""
+        p = cls._PALABRA_NOMBRE
+        m = re.fullmatch(rf'\s*(?P<nom>[A-ZÁÉÍÓÚÑÜ][A-Za-zÁÉÍÓÚÑÜáéíóúñü]+(?:[^\S\n]+{p}){{1,5}})'
+                         rf'(?:[^\S\n]*[,:\-]?[^\S\n]*(?P<num>\d{{6,8}}))?\s*', linea or '')
+        if not m or (m.group('num') and not con_numero):
+            return None
+        palabras = m.group('nom').split()
+        if any(cls._NO_NOMBRE.match(w) for w in palabras) or sum(1 for w in palabras if w[0].isupper()) < 2:
+            return None
+        return m
+
+    @classmethod
+    def _bloques_por_nombre(cls, texto: str) -> list:
+        """
+        Correos sin etiquetas, un trabajador por bloque:
+            PEREZ DIAZ CARLOS ERNESTO            LUIS RENE MENDEZ ZUÑIGA 6650919
+            3326312                              CREDITO RENOVADO
+            C/33363                              . 53290 Y 61780
+        [(cliente, [créditos]), …] solo si cada bloque trae su cliente y al menos un crédito; si no, [].
+        """
+        bloques, actual = [], None
+        for linea in normalizar_correo(texto).splitlines():
+            l = linea.strip()
+            if not l:
+                continue
+            m = cls._es_renglon_de_nombre(l, con_numero=True)
+            if m:
+                actual = {'cliente': m.group('num') or '', 'creditos': []}
+                bloques.append(actual)
+                continue
+            if actual is None:
+                continue
+            if re.fullmatch(r'\d{6,8}', l) and not actual['cliente'] and not actual['creditos']:
+                actual['cliente'] = l
+                continue
+            tokens = re.findall(r'[^\W\d_]+|\d+', l)
+            nums = [t for t in tokens if t.isdigit()]
+            etiquetas = all(normalize_text(t) in cls._ETIQUETAS_CREDITO for t in tokens if not t.isdigit())
+            if etiquetas and nums and actual['cliente'] and all(3 <= len(n) <= 7 for n in nums):
+                actual['creditos'] += [n for n in nums if n not in actual['creditos'] and n != actual['cliente']]
+                continue
+            if etiquetas and not nums:
+                continue  # «CREDITO RENOVADO» sin número: los créditos vienen abajo
+            actual = None  # sucursal, analista, gafete…: termina el bloque
+        bloques = [b for b in bloques if b['cliente'] or b['creditos']]
+        if not bloques or any(not (b['cliente'] and b['creditos']) for b in bloques):
+            return []
+        return [(b['cliente'], b['creditos']) for b in bloques]
 
     @classmethod
     def extract_disaggregated_renewals(cls, resumen: str, descripcion: str, inner_tables: list) -> list:
@@ -567,10 +636,25 @@ class RenovacionTicketParser:
         if table_records:
             return table_records
 
+        resumen, descripcion = normalizar_correo(resumen), normalizar_correo(descripcion)
         clean_desc = cls._clean_user_text_for_extraction(descripcion)
         # Traducir abreviaturas ("C5864479", "Cte. 3386153", "R 91258") a etiquetas completas antes de aplicar los patrones
         resumen_exp = expand_abbreviated_labels(resumen or '')
         full_context = f"{resumen_exp}\n{expand_abbreviated_labels(clean_desc or '')}"
+
+        # Sin etiquetas: «NOMBRE DEL TRABAJADOR / número de cliente / créditos», uno o varios trabajadores
+        bloques = cls._bloques_por_nombre(full_context)
+        if bloques:
+            total = sum(len(creds) for _, creds in bloques)
+            return [{
+                'cliente': cli,
+                'credito_renovado': cred,
+                'credito_padre': '',
+                'sucursal': '',
+                'fecha_op': '',
+                'origen_extraccion': ('Múltiples Clientes y Créditos' if len(bloques) > 1 else
+                                      'Múltiples Créditos en Ticket' if total > 1 else 'Individual')
+            } for cli, creds in bloques for cred in creds]
 
         # PASO 2: ¿Vienen múltiples bloques de "Cliente ... Crédito ..." para DIFERENTES clientes en el mismo texto?
         # (Ej. cuando en un mismo correo enlistan Cliente A con Crédito X y abajo Cliente B con Crédito Y)
@@ -608,7 +692,8 @@ class RenovacionTicketParser:
         cliente_patterns = [
             # Etiquetas explícitas: "Número de Cliente: 5864479", "No. trabajador: 6046732", "Credere: 6400729", "T-3854458"
             r'(?:n[úu]mero|num\.?|no\.?|#)\s*(?:de\s+)?(?:cliente|trabajador(?:a)?|fonacot|credere|cuenta)\s*[:\.\-#]*\s*(\d{5,10})\b',
-            r'\b(?:cliente|trabajador(?:a)?|credere)\s*(?:no\.?|num\.?|#|:|\.)?\s*(?:[A-ZÁÉÍÓÚÑ]{2,20}\s+){0,4}[#:\.]?\s*(\d{5,10})\b',
+            r'\b(?:cliente|trabajador(?:a)?|credere)\s*(?:no\.?|num\.?|#|:|\.)?\s*'
+            r'(?P<nom>(?:(?-i:[A-ZÁÉÍÓÚÑ]{2,20})[^\S\n]+){0,4})[#:\.]?[^\S\n]*(?P<num>\d{5,10})\b',
             r'\bT\s*[\-\.]\s*(\d{5,10})\b',
             r'/\s*T\s+(\d{5,10})\b',
             r'[\+\-]\s*(\d{6,10})\s*[\+\-]\s*\d{4,7}\b',
@@ -617,7 +702,9 @@ class RenovacionTicketParser:
         ]
         for pat in cliente_patterns:
             for m in re.finditer(pat, full_context, re.I):
-                c_num = m.group(1).strip()
+                if m.groupdict().get('nom') and any(cls._NO_NOMBRE.match(w.strip('.:#')) for w in m.group('nom').split()):
+                    continue
+                c_num = (m.groupdict().get('num') or m.group(1)).strip()
                 # Excluir NSS (11 dígitos) y números de solicitud (empiezan con 507 o 508 de 9 dígitos)
                 if len(c_num) == 9 and c_num.startswith(('507', '508')):
                     continue
@@ -625,10 +712,9 @@ class RenovacionTicketParser:
                     clientes_found.append(c_num)
 
         # Sin etiqueta: el número del trabajador junto a su nombre ("LUIS RENE MENDEZ ZUÑIGA 6650919")
-        if not clientes_found:
-            for c_num in cls._clientes_junto_al_nombre(full_context):
-                if c_num not in clientes_found and c_num not in creditos_padre_found:
-                    clientes_found.append(c_num)
+        for c_num in cls._clientes_junto_al_nombre(full_context):
+            if c_num not in clientes_found and c_num not in creditos_padre_found:
+                clientes_found.append(c_num)
 
         # Buscar en tabla estilo texto: "CLIENTE CREDITO ... 4951216 45730"
         for m_inline_tbl in re.finditer(
@@ -651,8 +737,8 @@ class RenovacionTicketParser:
             r'(?:n[úu]mero|num\.?|no\.?)\s+de\s+renovaci(?:[óo]n|ones)(?:\s+nueva)?\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             r'(?:n[úu]mero|num\.?|no\.?)\s+de(?:l)?\s+(?:cr[ée]dito|pagar[ée])\s+a\s+cancelar\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             r'(?:ya\s+renovado|cr[ée]dito\s+nuevo|cr[ée]dito\s+renovado|cr[ée]dito\s+hijo|pagar[ée])\s*[:\.\-\(]*\s*([C\-\d,\s yY]{3,35})',
-            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)\s*(?:(?:n[úu]mero|num\.?|no\.?|n°)\s*)?[:#\.]?\s*([C\-\d]+(?:\s*(?:,|y|Y|\-|\+)\s*[C\-\d]+)+)',
-            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)\s*(?:(?:n[úu]mero|num\.?|no\.?|n°)\s*)?[:#\.]?\s*[C\-]?\s*(\d{3,7})\b',
+            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)[^\S\n]*(?:(?:n[úu]mero|num\.?|no\.?|n°)[^\S\n]*)?(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|y|Y|\-|\+)\s*[C\-\d]+)+)',
+            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)[^\S\n]*(?:(?:n[úu]mero|num\.?|no\.?|n°)[^\S\n]*)?(?:[:#\.]\s*)?[C\-]?[^\S\n]*(\d{3,7})\b',
             r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b'
         ]
 
@@ -693,7 +779,8 @@ class RenovacionTicketParser:
         # Patrón en Resumen tipo: "CANCELACION DE RENOVACION 5042466 57521" o "82377 y 82379 7113273"
         if not clientes_found or not creditos_renovados_found:
             res_nums = [
-                n for n in re.findall(r'\b\d{4,10}\b', strip_letter_prefixes(resumen or ''))
+                n for n in re.findall(r'\b\d{4,10}\b', strip_letter_prefixes(re.sub(
+                    r'\b[IR]-\d+|\b(?:agente|gafete|ticket|incidente)\s*[:#]?\s*\d+', ' ', resumen or '', flags=re.I)))
                 if cls._is_valid_number_token(n, 4, 10) and not (len(n) == 9 and n.startswith(('507', '508')))
             ]
             for n in res_nums:
@@ -739,7 +826,12 @@ class RenovacionTicketParser:
 
         # Caso B: Múltiples Clientes diferentes en el mismo ticket (ej. 2 números de cliente con 2 o más cancelaciones)
         if len(clientes_found) > 1:
+            def posicion(num):
+                m_pos = re.search(rf'(?<!\d){re.escape(num)}(?!\d)', full_context)
+                return m_pos.start() if m_pos else len(full_context)
             if len(creditos_renovados_found) == len(clientes_found):
+                clientes_found = sorted(clientes_found, key=posicion)
+                creditos_renovados_found = sorted(creditos_renovados_found, key=posicion)
                 for idx, cli_str in enumerate(clientes_found):
                     pad_str = creditos_padre_found[idx] if idx < len(creditos_padre_found) else ""
                     disaggregated.append({

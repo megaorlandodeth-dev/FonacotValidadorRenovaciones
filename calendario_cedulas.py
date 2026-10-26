@@ -105,6 +105,8 @@ def actualizar_calendario(forzar: bool = False, timeout: int = 8) -> bool:
     except Exception:
         nuevas = {}
     _emisiones.update(nuevas)
+    if not nuevas:
+        return False
     try:
         with open(_archivo(), "w", encoding="utf-8") as f:
             json.dump({"actualizado": datetime.now().isoformat(timespec="seconds"), "fuente": URL_CALENDARIO,
