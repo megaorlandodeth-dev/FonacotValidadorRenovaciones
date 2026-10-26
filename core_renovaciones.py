@@ -521,7 +521,7 @@ class RenovacionTicketParser:
 
     # Palabras que no son parte de un nombre: si aparecen, el número es de otra cosa (crédito, folio, teléfono…)
     _NO_NOMBRE = re.compile(
-        r'^(CR[EÉ]DITOS?|RENOVAD[OA]S?|RENOVACI[OÓ]N(ES)?|CLIENTE|TRABAJADOR[A]?|SOLICITUD|FOLIO|GAFETE|TEL[EÉ]FONO|'
+        r'^(CR[EÉ]DITOS?|RENOVAD[OA]S?|RENOVACI[OÓ]N(ES)?|CLIENT[EA]|TRABAJADOR[A]?|SOLICITUD|FOLIO|GAFETE|TEL[EÉ]FONO|'
         r'TEL|CEL|NSS|CURP|RFC|SUC|SUCURSAL|ANALISTA|INCIDENTE|TICKET|PAGAR[EÉ]|OPERACI[OÓ]N|CUENTA|FECHA|NO|NUM|'
         r'N[UÚ]MERO|ID|CANCELAR|CANCELACI[OÓ]N|EMPRESA|CENTRO|TRABAJO|ORIGINAL|ANTERIOR|NUEVO|HIJO|PADRE)$', re.I)
 
@@ -691,8 +691,8 @@ class RenovacionTicketParser:
         # 2.B: Extraer Números de Cliente (Trabajador / Trabajadora / Credere / Fonacot / T-)
         cliente_patterns = [
             # Etiquetas explícitas: "Número de Cliente: 5864479", "No. trabajador: 6046732", "Credere: 6400729", "T-3854458"
-            r'(?:n[úu]mero|num\.?|no\.?|#)\s*(?:de\s+)?(?:cliente|trabajador(?:a)?|fonacot|credere|cuenta)\s*[:\.\-#]*\s*(\d{5,10})\b',
-            r'\b(?:cliente|trabajador(?:a)?|credere)\s*(?:no\.?|num\.?|#|:|\.)?\s*'
+            r'(?:n[úu]mero|num\.?|no\.?|#)\s*(?:de\s+)?(?:client[ea]|trabajador(?:a)?|fonacot|credere|cuenta)\s*[:\.\-#]*\s*(\d{5,10})\b',
+            r'\b(?:client[ea]|trabajador(?:a)?|credere)\s*(?:no\.?|num\.?|#|:|\.)?\s*'
             r'(?P<nom>(?:(?-i:[A-ZÁÉÍÓÚÑ]{2,20})[^\S\n]+){0,4})[#:\.]?[^\S\n]*(?P<num>\d{5,10})\b',
             r'\bT\s*[\-\.]\s*(\d{5,10})\b',
             r'/\s*T\s+(\d{5,10})\b',
@@ -737,8 +737,8 @@ class RenovacionTicketParser:
             r'(?:n[úu]mero|num\.?|no\.?)\s+de\s+renovaci(?:[óo]n|ones)(?:\s+nueva)?\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             r'(?:n[úu]mero|num\.?|no\.?)\s+de(?:l)?\s+(?:cr[ée]dito|pagar[ée])\s+a\s+cancelar\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             r'(?:ya\s+renovado|cr[ée]dito\s+nuevo|cr[ée]dito\s+renovado|cr[ée]dito\s+hijo|pagar[ée])\s*[:\.\-\(]*\s*([C\-\d,\s yY]{3,35})',
-            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)[^\S\n]*(?:(?:n[úu]mero|num\.?|no\.?|n°)[^\S\n]*)?(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|y|Y|\-|\+)\s*[C\-\d]+)+)',
-            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)[^\S\n]*(?:(?:n[úu]mero|num\.?|no\.?|n°)[^\S\n]*)?(?:[:#\.]\s*)?[C\-]?[^\S\n]*(\d{3,7})\b',
+            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|y|Y|\-|\+)\s*[C\-\d]+)+)',
+            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?[C\-]?[^\S\n]*(\d{3,7})\b',
             r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b'
         ]
 
@@ -747,7 +747,7 @@ class RenovacionTicketParser:
                 chunk = m.group(1)
                 # Cortar el chunk si empieza otra etiqueta ("Motivo", "Gafete", "Cliente", "Trabajador", "Fecha", "Sucursal")
                 chunk = re.split(
-                    r'\b(motivo|gafete|cliente|trabajador|fecha|sucursal|estado|solicitud|nombre|antes|original|anterior)\b',
+                    r'\b(motivo|gafete|client[ea]|trabajador|fecha|sucursal|estado|solicitud|nombre|antes|original|anterior)\b',
                     chunk,
                     flags=re.I
                 )[0]
@@ -1531,10 +1531,13 @@ def concentrado_semanal(concentrados: list, rows: list, fecha_inicio: date, fech
 
 
 def resumen_por_dia(rows: list, concentrados: list, fecha_inicio: date, fecha_fin: date) -> list:
-    """Por cada día entre semana del periodo: ticket(s) único(s) que salieron y cómo quedó lo que debía ir en ellos."""
+    """
+    Por cada día de lunes a sábado del periodo (el sábado, por la guardia): ticket(s) único(s) que salieron y cómo
+    quedó lo que debía ir en ellos.
+    """
     dias, d = [], fecha_inicio
     while d <= fecha_fin:
-        if d.weekday() < 5 or d in _HABILES_FORZADOS:
+        if d.weekday() < 6 or d in _HABILES_FORZADOS:
             envios = [c for c in concentrados if _fecha_concentrado(c) == d and not es_respuesta(c.get('asunto'))]
             suyas = [r for r in rows if r.get('Dia_Lote') == d]
             dias.append({

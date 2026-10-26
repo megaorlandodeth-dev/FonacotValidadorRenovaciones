@@ -127,6 +127,23 @@ def ultimo_dia_del_mes(d: date) -> date:
     return date(d.year, d.month, calendar.monthrange(d.year, d.month)[1])
 
 
+def cortes_alrededor(hoy: date, adelante: int = 2) -> tuple:
+    """
+    (último corte que ya pasó, [próximos cortes desde hoy]): cada uno (fecha, texto). Son las generaciones de emisión
+    y los cierres de mes. El día del corte todavía cuenta: lo que llega ese día sí se puede cancelar.
+    """
+    cortes = {}
+    for (anio, mes), gen in emisiones().items():
+        cortes[gen] = f"la generación de la emisión de {_MESES[mes - 1]} {anio}"
+    for k in range(-2, 15):
+        anio, mes = divmod(hoy.month - 1 + k, 12)
+        cierre = ultimo_dia_del_mes(date(hoy.year + anio, mes + 1, 1))
+        cortes[cierre] = f"{cortes[cierre]} y el cierre de mes" if cierre in cortes else "el cierre de mes"
+    orden = sorted(cortes.items())
+    pasados = [c for c in orden if c[0] < hoy]
+    return (pasados[-1] if pasados else None), [c for c in orden if c[0] >= hoy][:adelante]
+
+
 def corte_que_bloquea(alta: date, llegada: date):
     """
     El primer corte que pasó entre el alta de la renovación y la llegada del incidente: (fecha, texto), o None si se

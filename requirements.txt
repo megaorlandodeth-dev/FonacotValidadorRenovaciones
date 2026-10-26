@@ -7,4 +7,4 @@ pandas
 openpyxl
 pywin32
 pillow
-oracledb
+oracledb>=3.4,<4

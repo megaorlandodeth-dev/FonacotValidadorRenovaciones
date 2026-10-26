@@ -143,6 +143,25 @@ def _buscar_cliente_oracle() -> str:
     return ""
 
 
+# oracledb 4 ya no acepta Oracle Client anteriores a 19 (el de SQL Developer de FONACOT es 12.2): la 3.4 sí
+ORACLEDB_COMPATIBLE = "oracledb>=3.4,<4"
+
+
+def _explicar_cliente_viejo(texto: str, carpeta: str) -> str:
+    """DPI-1050 («Oracle Client library is at version 12.2 but version 19.1 or higher is needed»): qué hacer."""
+    if "DPI-1050" not in texto:
+        return texto
+    try:
+        import oracledb
+        version = oracledb.__version__
+    except Exception:
+        version = "?"
+    return (f"El Oracle Client de este equipo ({carpeta or 'el instalado'}) es anterior a 19 y la versión {version} "
+            f"de oracledb ya no lo acepta.  →  Cierra la app y ábrela con Ejecutar_Validador_Renovaciones.bat (instala "
+            f"la versión compatible) o ejecuta:  python -m pip install \"{ORACLEDB_COMPATIBLE}\"  ·  Otra opción: "
+            f"instalar Oracle Instant Client 19 o más reciente e indicar su carpeta en «sql_cliente_oracle».")
+
+
 def _mensaje(e: Exception) -> str:
     """Texto del error en una línea, sin el identificador interno de la conexión (la causa viene en la 2a línea)."""
     lineas = [re.sub(r'\s*\(CONNECTION_ID=[^)]*\)', '', ln).strip() for ln in str(e).strip().splitlines()]
@@ -169,7 +188,8 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
             oracledb.init_oracle_client(lib_dir=cliente_oracle)
             _cliente_oracle_iniciado = True
         except Exception as e:
-            raise ErrorSQL(f"No se pudo usar el Oracle Client de «{cliente_oracle}»: {e}")
+            raise ErrorSQL(_explicar_cliente_viejo(f"No se pudo usar el Oracle Client de «{cliente_oracle}»: {e}",
+                                                   cliente_oracle))
     dsn = armar_dsn(servidor, oracledb)
     try:
         conn = oracledb.connect(user=usuario, password=password, dsn=dsn, tcp_connect_timeout=10)
@@ -184,7 +204,8 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
                 _cliente_oracle_iniciado = True
                 conn = oracledb.connect(user=usuario, password=password, dsn=dsn)
             except Exception as e2:
-                raise ErrorSQL(f"{_mensaje(e2)}  (con el Oracle Client de {encontrado})")
+                raise ErrorSQL(_explicar_cliente_viejo(f"{_mensaje(e2)}  (con el Oracle Client de {encontrado})",
+                                                       encontrado))
         else:
             if clasico:
                 texto += ("  →  Esta base pide el modo clásico de Oracle y no se encontró un Oracle Client: indica "
