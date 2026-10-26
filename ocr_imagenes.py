@@ -321,6 +321,6 @@ def extraer_cliente_credito(lineas: list) -> dict:
             m = re.search(r'(?:cliente|cuenta)\W{0,6}(\d{5,9})\b', plano, re.I)
             cliente = m.group(1) if m else ''
         if not credito:
-            m = re.search(r'(?:credito|renovacion)\W{0,6}(\d{3,6})\b', plano, re.I)
+            m = re.search(r'(?:credito|renovacion)\W{0,6}(\d{3,7})\b', plano, re.I)
             credito = m.group(1) if m else ''
     return {'cliente': cliente, 'credito': credito, 'texto': texto}

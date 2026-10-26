@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import threading
 import webbrowser
@@ -23,6 +24,7 @@ from sql_renovaciones import (
     borrar_password,
     servidor_de,
     separar_servidor,
+    host_invalido,
     ErrorSQL,
     TABLA_DEFAULT,
     SQL_PROBLEMAS,
@@ -64,7 +66,7 @@ from lote_utils import (
 )
 
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"),
@@ -324,6 +326,28 @@ class SelectorFiltro:
         self.on_change()
 
 
+class PanelDesplazable(ctk.CTkScrollableFrame):
+    """
+    CTkScrollableFrame que avanza 60 px por golpe de rueda (customtkinter avanza 20 en Windows y con un panel tan
+    largo parecía que no se movía) y que también responde a los giros chicos de los touchpads.
+    """
+
+    def _pasos(self, delta: int) -> int:
+        return -int(delta / 2) or (-10 if delta > 0 else 10)
+
+    def _mouse_wheel_all(self, event):
+        if (sys.platform.startswith("win") and not self._shift_pressed and event.delta
+                and self._check_if_valid_scroll(event.widget)):
+            self._parent_canvas.yview("scroll", self._pasos(event.delta), "units")
+            return
+        super()._mouse_wheel_all(event)
+
+    def desplazar(self, event):
+        """Para widgets de fuera del panel (el bloque de «Extraer y validar»)."""
+        if event.delta:
+            self._parent_canvas.yview("scroll", self._pasos(event.delta), "units")
+
+
 class PestanasSubrayadas:
     """Pestañas con subrayado (en lugar del CTkTabview de botones) y contador en la etiqueta."""
 
@@ -398,6 +422,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         # Detección de renovaciones nuevas entre escaneos (auto-actualización)
         self._prev_keys = None
         self._prev_scan_signature = None
+        self._ultima_busqueda = None  # (revisión, desde, hasta) de la última búsqueda pedida con el botón o F5
         self.new_keys = set()
 
         self._auto_job = None
@@ -666,12 +691,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         )
         self.lbl_extract_hint.pack(anchor="w", pady=(8, 0))
 
-        side = ctk.CTkScrollableFrame(
+        side = PanelDesplazable(
             wrap, width=262, fg_color=COL["surface"], corner_radius=0,
-            scrollbar_button_color=COL["border"], scrollbar_button_hover_color=COL["border_strong"]
+            scrollbar_button_color=COL["border_strong"], scrollbar_button_hover_color=COL["muted"]
         )
         side.grid(row=1, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
         self.sidebar_config = side
+        for w in (top, self.btn_extract, self.lbl_extract_hint):
+            w.bind("<MouseWheel>", side.desplazar, add="+")
 
         # Qué se revisa: el lote de hoy o los envíos de una semana
         sec = self._section(side, "¿Qué quieres revisar?", first=True)
@@ -728,8 +755,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.cal_end.grid(row=1, column=1, sticky="ew", padx=(6, 0), ipady=3)
         self.cal_start.bind("<<DateEntrySelected>>", lambda e: self._sincronizar_fechas(self.cal_start, self.cal_end))
         self.cal_end.bind("<<DateEntrySelected>>", lambda e: self._sincronizar_fechas(self.cal_end, self.cal_start))
-        for cal in (self.cal_start, self.cal_end):
-            cal.bind("<FocusOut>", lambda e: self._periodo_pendiente(), add="+")
+        self.cal_start.bind("<FocusOut>", lambda e: self._sincronizar_fechas(self.cal_start, self.cal_end), add="+")
+        self.cal_end.bind("<FocusOut>", lambda e: self._sincronizar_fechas(self.cal_end, self.cal_start), add="+")
         quick = ctk.CTkFrame(sec, fg_color="transparent")
         quick.grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky="w")
         for txt, cmd in (("Hoy", self._set_today), ("Día hábil anterior", self._set_prev_business_day)):
@@ -788,6 +815,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                                   self.config_data.get("sql_servicio", ""))
         if not host and self.config_data.get("sql_servidor"):
             host, puerto, servicio = separar_servidor(self.config_data["sql_servidor"])
+        if host.strip().isdigit():
+            # La v2.6 pudo guardar el puerto como host («1521»): así no conecta (getaddrinfo failed)
+            host, puerto = "", puerto or host.strip()
         self.ent_sql_host = self._field(sec, 3, "Nombre del host", host, "servidor.fonacot.gob.mx")
         self.ent_sql_puerto = self._field(sec, 5, "Puerto", puerto or "1521", "1521", width=90)
         self.ent_sql_servicio = self._field(sec, 7, "Nombre del servicio", servicio, "Como en SQL Developer")
@@ -1434,8 +1464,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
     def _probar_sql(self):
         p = self._sql_conexion()
-        if not (p["servidor"] and self.ent_sql_servicio.get().strip()):
-            self._sql_probado("Escribe el Nombre del host y el Nombre del servicio (los mismos de SQL Developer).", False)
+        problema = host_invalido(servidor_de(self.ent_sql_host.get(), self.ent_sql_puerto.get(), self.ent_sql_servicio.get())
+                                 or self.ent_sql_puerto.get())
+        if problema or not (p["servidor"] and self.ent_sql_servicio.get().strip()):
+            self._sql_probado(problema or "Escribe el Nombre del host y el Nombre del servicio (los mismos de SQL Developer).",
+                              False)
             return
         self.lbl_sql_estado.configure(text="Probando conexión…", text_color=COL["muted"])
 
@@ -1483,14 +1516,19 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._periodo_pendiente()
 
     def _on_tipo_revision(self, tipo: str):
-        """Cambiar de modo solo prepara el periodo: no busca hasta «Extraer y validar»."""
+        """Cambiar de modo solo prepara el periodo (las fechas se mueven): no busca hasta «Extraer y validar»."""
         self.seg_tipo.set(tipo)
         if tipo == TIPOS_REVISION[0]:
-            # El lote del día que marca «Al» (hoy o cualquier día pasado)
-            self.cal_start.set_date(self.cal_end.get_date())
+            # De una semana al lote de hoy; un solo día ya elegido (hoy o un día pasado) se respeta
+            dia = self.cal_end.get_date() if self.cal_start.get_date() == self.cal_end.get_date() else datetime.now().date()
+            self.cal_start.set_date(dia)
+            self.cal_end.set_date(dia)
             self._periodo_pendiente()
         elif self.cal_start.get_date() == self.cal_end.get_date():
-            self._revisar_semana(0)  # de un solo día a la semana actual; un periodo ya elegido se respeta
+            # De un solo día a la semana: la actual, o la pasada si en esta todavía no hay un día hábil antes de hoy
+            hoy = datetime.now().date()
+            lunes = hoy - timedelta(days=hoy.weekday())
+            self._revisar_semana(0 if lunes <= previous_business_day(hoy) else 1)
         else:
             self._periodo_pendiente()
 
@@ -1655,11 +1693,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         self._save_config()
         sql_cfg = self._sql_params()
-        if sql_cfg and not (sql_cfg["servidor"] and sql_cfg["usuario"] and sql_cfg["password"]):
+        if sql_cfg and (host_invalido(sql_cfg["servidor"])
+                        or not (sql_cfg["servidor"] and sql_cfg["usuario"] and sql_cfg["password"])):
             if not auto:
                 messagebox.showwarning(
                     "Falta la conexión a la base",
-                    "Para validar en CR_RENOVACIONES escribe host, puerto, servicio, usuario y contraseña en "
+                    (host_invalido(sql_cfg["servidor"]) + "\n\n" if host_invalido(sql_cfg["servidor"]) else "")
+                    + "Para validar en CR_RENOVACIONES escribe host, puerto, servicio, usuario y contraseña en "
                     "«Validaciones automáticas».\n\n"
                     "Esta vez se extrae sin validar en la base."
                 )
@@ -1670,26 +1710,37 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             account = ""
 
         self._aplicar_inhabiles()
-        revision = self._es_revision()
-        if not revision and self.cal_start.get_date() != self.cal_end.get_date():
-            self.cal_start.set_date(self.cal_end.get_date())
-        d_start = datetime.combine(self.cal_start.get_date(), datetime.min.time())
-        d_end = datetime.combine(self.cal_end.get_date(), datetime.max.time())
-        if d_start > d_end:
-            d_start, d_end = d_end, d_start
+        if auto and self._ultima_busqueda:
+            # La actualización automática repite lo último que se buscó, no lo que se está preparando en el panel
+            revision, d_start, d_end, era_hoy = self._ultima_busqueda
+            hoy = datetime.now().date()
+            if era_hoy and not revision and d_end.date() != hoy:
+                d_start, d_end = datetime.combine(hoy, datetime.min.time()), datetime.combine(hoy, datetime.max.time())
+                self._ultima_busqueda = (revision, d_start, d_end, True)
+        else:
+            revision = self._es_revision()
+            if not revision and self.cal_start.get_date() != self.cal_end.get_date():
+                self.cal_start.set_date(self.cal_end.get_date())
+            d_start = datetime.combine(self.cal_start.get_date(), datetime.min.time())
+            d_end = datetime.combine(self.cal_end.get_date(), datetime.max.time())
+            if d_start > d_end:
+                d_start, d_end = d_end, d_start
+            self._ultima_busqueda = (revision, d_start, d_end, d_end.date() == datetime.now().date())
 
-        signature = (account, d_start.date(), d_end.date(), modo, agente_filter)
+        signature = (account, d_start.date(), d_end.date(), modo, agente_filter, revision,
+                     bool(self.var_aplicar_corte.get()))
         if signature != self._prev_scan_signature:
             self._prev_keys = None
         self._prev_scan_signature = signature
 
         self.is_extracting = True
+        self.seg_tipo.configure(state="disabled")  # que no se cambie de modo a media búsqueda
         self.lbl_extract_hint.configure(text=HINT_EXTRAER, text_color=COL["muted"])
         self.btn_extract.configure(state="disabled", text="Analizando renovaciones…")
         self.progress_bar.set(0.05)
 
         corte_opts = {
-            "aplicar_corte": bool(self.var_aplicar_corte.get()),
+            "aplicar_corte": revision or bool(self.var_aplicar_corte.get()),
             "hora_corte": self.config_data.get("hora_corte", HORA_CORTE_DEFAULT),
             "asunto_concentrado": self.config_data.get("asunto_concentrado", ASUNTO_CONCENTRADO_DEFAULT),
             "ultimo_lote": self.config_data.get("ultimo_lote"),
@@ -1740,6 +1791,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
     def _on_extraction_done(self, rows, error_msg, lote_info=None, auto=False, validaciones=None):
         self.is_extracting = False
+        self.seg_tipo.configure(state="normal")
         self.btn_extract.configure(state="normal", text="Extraer y validar")
         self.progress_bar.set(1.0)
 
@@ -1766,13 +1818,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._prev_keys = current_keys
 
         revision = bool(lote_info and lote_info.get('revision'))
-        self.seg_tipo.set(TIPOS_REVISION[1] if revision else TIPOS_REVISION[0])
         if not auto:
+            self.seg_tipo.set(TIPOS_REVISION[1] if revision else TIPOS_REVISION[0])
             if revision:
                 self.cmb_quick_filter.set(
                     FILTRO_NO_ENVIADAS if lote_info.get('no_enviadas') else
                     FILTRO_ERRORES if lote_info.get('errores_envio') else
-                    FILTRO_SIN_COMPROBAR if lote_info.get('sin_comprobar') else FILTRO_NO_ENVIADAS)
+                    FILTRO_SIN_COMPROBAR if lote_info.get('sin_comprobar') else FILTRO_TODAS)
             elif self.cmb_quick_filter.get() in FILTROS_REVISION:
                 self.cmb_quick_filter.set(FILTRO_TODAS)
         self._refresh_views()
@@ -1977,6 +2029,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         def cuenta(r):
             """En la revisión, lo del periodo; en el lote del día, solo lo que va en el lote (no lo ya enviado)."""
+            if r.get('Row_ID') in self.discarded_row_ids:
+                return False
             if revision:
                 return r.get('En_Periodo', True)
             return not self.lote_info or r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA)
@@ -2696,6 +2750,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
     # ================= LOTE: COPIAR, CORREO Y EXCEL =================
 
     def _lote_activo_o_aviso(self) -> list:
+        if self.lote_info and self.lote_info.get('revision'):
+            messagebox.showwarning(
+                "Es una revisión", "Estás en «Revisión semanal»: el ticket único se arma desde «Lote del día» (F5).")
+            return []
         active_rows, _ = self._get_active_and_filtered_rows()
         if not active_rows:
             messagebox.showwarning("Sin datos", "No hay renovaciones en el lote. Primero extrae (F5).")
@@ -2756,7 +2814,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if avisos and not messagebox.askyesno("Antes de crear el correo", "\n\n".join(avisos) + "\n\n¿Crear el correo de todas formas?"):
             return
 
-        fecha = self.cal_end.get_date()
+        # La fecha del lote que se extrajo (no la que se esté eligiendo en el panel sin buscar)
+        fecha = (self.lote_info or {}).get('lote_actual') or self.cal_end.get_date()
         plantilla = self.config_data.get("asunto_borrador") or ASUNTO_BORRADOR_DEFAULT
         try:
             asunto = plantilla.format(fecha=fecha.strftime('%d-%m-%Y'))
@@ -2996,8 +3055,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             fill_tarde = PatternFill(start_color="FFFBEB", end_color="FFFBEB", fill_type="solid")
 
             if "6_Enviado_en_Tickets_Unicos" in wb.sheetnames:
-                for row in wb["6_Enviado_en_Tickets_Unicos"].iter_rows(min_row=2):
-                    rev = str(row[-1].value or "")
+                ws6 = wb["6_Enviado_en_Tickets_Unicos"]
+                col_rev = [c.value for c in ws6[1]].index("Revisión")
+                for row in ws6.iter_rows(min_row=2):
+                    rev = str(row[col_rev].value or "")
                     fill = fill_no_env if rev.startswith("DATOS") else (fill_tarde if rev.startswith("No se encontró") else None)
                     if fill:
                         for cell in row:
