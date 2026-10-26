@@ -156,7 +156,7 @@ class TestCalendarioDeEmision(unittest.TestCase):
                          ahora=datetime(2026, 11, 2, 10, 0), revision=False)
         self.assertEqual(r['Lote_Estado'], "REZAGADA")
         self.assertFalse(r['No_Enviada'])
-        # La base: dada de alta el día que llegó -> sin «No procede» ni bloqueo por el cierre del 31/10
+        # La base: dada de alta el día que llegó -> sin «No procede»
         import test_sql_y_ocr
         test_sql_y_ocr.BASE.append((datetime(2026, 10, 30), '7982848', 27179))
         try:
@@ -164,8 +164,9 @@ class TestCalendarioDeEmision(unittest.TestCase):
         finally:
             test_sql_y_ocr.BASE.pop()
         self.assertEqual(r['SQL_Estado'], sql.SQL_OK)
-        cal.marcar_bloqueos([r])
-        self.assertEqual(r['Bloqueo_Emision'], '')
+        # v2.9: llegó después del último ticket único antes del cierre del 31/10 y sale el 02/11: ya se emitió
+        cal.marcar_bloqueos([r], date(2026, 11, 2))
+        self.assertIn("sale en el ticket único del 02/11/2026, después del cierre de mes", r['Bloqueo_Emision'])
 
     def test_renglon_del_ticket_unico_enviado_al_dia_siguiente(self):
         import sql_renovaciones as sql

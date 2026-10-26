@@ -20,6 +20,8 @@ BASE = [(datetime(2026, 10, 23), '1184282', 10430), (datetime(2025, 10, 22), '11
 # Segunda consulta: (cuenta, no_renovacion) -> (sucursal_ejerce, plazo de la renovación, plazo de la disposición, cédula)
 DETALLE = {('1184282', '84846'): (12, 18, 18, 1), ('7982848', '27179'): (104, 12, 18, 0),
            ('3430084', '24969'): (104, 18, 18, 0)}
+# Renovaciones por crédito padre (OPERACION): (fecha_alta, cuenta, no_renovacion, operacion)
+PADRES = [(datetime(2026, 10, 23), '1993891', 52011, 51937)]
 
 
 class Cursor:
@@ -32,6 +34,9 @@ class Cursor:
         valores = {str(v) for k, v in binds.items() if k[0] in 'cr'}
         if "CR_DISPOSICIONES" in texto:
             self._res = [(c, r, *d) for (c, r), d in DETALLE.items() if c in valores]
+        elif "WHERE OPERACION IN" in texto:
+            padres = {str(v) for k, v in binds.items() if k[0] == 'p'}
+            self._res = [x for x in PADRES if str(x[3]) in padres]
         elif "WHERE CUENTA IN" in texto:
             self._res = [x for x in BASE if x[1] in valores]
         else:
