@@ -48,6 +48,7 @@ from core_renovaciones import (
 )
 
 from ocr_imagenes import leer_correo, OCRNoDisponible
+from calendario_cedulas import cortes_entre
 
 # Días hábiles hacia atrás que revisa el lote del día (lo no enviado sigue apareciendo una semana)
 DIAS_ATRAS_LOTE = 5
@@ -1267,8 +1268,11 @@ class FonacotRenovacionesEngine:
             )
             # Lote del día de una fecha pasada: se arma como debía salir ese día
             dia_lote = end_dt.date() if revision is False and end_dt.date() < datetime.now().date() else None
+            # Días de emisión y de cierre de mes del periodo (ese día puede salir más de un ticket único)
+            dias_de_corte = cortes_entre(start_dt.date() - timedelta(days=45), end_dt.date() + timedelta(days=7))
             self.lote_info = clasificar_lotes(
                 rows,
+                dias_de_corte=dias_de_corte,
                 fecha_inicio=start_dt.date(),
                 fecha_fin=end_dt.date(),
                 hora_corte=parse_hora_corte(hora_corte),

@@ -1213,10 +1213,12 @@ def normalizar_fechas_concentrados(concentrados: list):
                                 f"{dia_envio:%d/%m}: se tomó como del {dia_envio:%d/%m}")
 
 
-def cortes_reales(concentrados: list) -> dict:
+def cortes_reales(concentrados: list, dias_ultimo=()) -> dict:
     """
     {día: hora en que salió el PRIMER ticket único original de ese día}. Los que salen después (complementos)
     cuentan como evidencia de envío pero no mueven el corte. Ignora respuestas y reenvíos.
+    En los `dias_ultimo` (días de emisión o de cierre de mes) cuenta el ÚLTIMO del día: ese día se manda otro ticket
+    único con lo que llega después del primero, porque al día siguiente ya no se puede cancelar.
     """
     cortes, tardios = {}, {}
     for c in concentrados or []:
@@ -1224,7 +1226,7 @@ def cortes_reales(concentrados: list) -> dict:
         if not dia or not rec or es_respuesta(c.get('asunto')) or rec.date() < dia:
             continue
         destino = cortes if rec.date() == dia else tardios  # tardío: enviado pasada la medianoche o días después
-        destino[dia] = min(destino.get(dia, rec), rec)
+        destino[dia] = (max if destino is cortes and dia in dias_ultimo else min)(destino.get(dia, rec), rec)
     for dia, rec in tardios.items():
         cortes.setdefault(dia, rec)
     return cortes
@@ -1567,7 +1569,8 @@ def clasificar_lotes(
     ultimo_lote: dict = None,
     ahora: datetime = None,
     revision: bool = None,
-    dia_lote: date = None
+    dia_lote: date = None,
+    dias_de_corte: dict = None
 ) -> dict:
     """
     Concilia cada renovación contra TODOS los correos "Ticket Único" encontrados y le asigna
@@ -1589,7 +1592,10 @@ def clasificar_lotes(
     Con un periodo de varios días (fecha_inicio < fecha_fin) funciona como revisión de envíos; `revision` lo fuerza.
     `dia_lote`: arma el lote de un día pasado tal como debía salir ese día (se compara solo contra los ticket únicos
     hasta ese día; si se mandó después, se anota).
+    `dias_de_corte` ({día: texto}, generaciones de emisión y cierres de mes): ese día el corte es el último ticket
+    único que salió; y hoy, si es día de corte, lo que llega después del ticket único se manda en otro ese mismo día.
     """
+    dias_de_corte = dias_de_corte or {}
     concentrados = sorted(concentrados or [], key=lambda c: c.get('recibido') or datetime.min)
     normalizar_fechas_concentrados(concentrados)
     # Si salió un ticket único un día marcado como inhábil, ese día sí se trabajó
@@ -1606,8 +1612,12 @@ def clasificar_lotes(
     hoy_real = lote_actual == datetime.now().date()
     corte_fin = datetime.combine(fecha_fin, hora_corte)
     dia_anterior = previous_business_day(lote_actual)
-    cortes = cortes_reales(concentrados)
+    cortes = cortes_reales(concentrados, dias_de_corte)
     corte_hoy = cortes.get(lote_actual)
+    # Hoy es día de emisión o de cierre: lo que llegue después del ticket único va en otro ticket único hoy mismo
+    corte_de_hoy = dias_de_corte.get(lote_actual) if not pasado else None
+    envios_hoy = sorted(c['recibido'] for c in concentrados if c.get('recibido') and not es_respuesta(c.get('asunto'))
+                        and _fecha_concentrado(c) == lote_actual and c['recibido'].date() == lote_actual)
     corte_anterior = cortes.get(dia_anterior) or datetime.combine(dia_anterior, hora_corte)
     hc = hora_corte.strftime('%H:%M')
     if revision is None:
@@ -1619,6 +1629,8 @@ def clasificar_lotes(
     para_buscar = [c for c in concentrados if c not in posteriores]
 
     def corte_del(d: date):
+        if corte_de_hoy and d == lote_actual:
+            return None
         if d in cortes:
             return cortes[d]
         return None if d >= lote_actual else datetime.combine(d, hora_corte)
@@ -1671,7 +1683,8 @@ def clasificar_lotes(
 
         conc, antes, ticket_hit = _buscar_envio(r, para_buscar, llegada)
         junto_al_envio = None
-        if not conc and dia == llegada.date() and dia in cortes and llegada > cortes[dia] - MARGEN_ENVIO:
+        if (not conc and dia == llegada.date() and dia in cortes and llegada > cortes[dia] - MARGEN_ENVIO
+                and not (corte_de_hoy and dia == lote_actual)):
             # Llegó mientras se armaba el ticket único: no es un olvido, le toca el siguiente
             junto_al_envio = cortes[dia]
             dia = next_business_day(dia)
@@ -1745,7 +1758,13 @@ def clasificar_lotes(
                 poner(r, LOTE_SIGUIENTE, f"➡️ Va al lote del {dia:%d/%m}", f"Va el {dia:%d/%m}")
         elif llegada >= inicio_actual:
             texto = "Lote de hoy" if not pasado and (hoy_real or lote_actual == fecha_fin) else f"Lote del {lote_actual:%d/%m}"
-            if corte_hoy:
+            if corte_de_hoy and corte_hoy and llegada > corte_hoy - MARGEN_ENVIO:
+                # Día de emisión o de cierre: lo que llegó después del ticket único sale hoy en otro
+                poner(r, LOTE_HOY,
+                      f"📅 {texto}: llegó después del ticket único de las {corte_hoy:%H:%M} y hoy es "
+                      f"{corte_de_hoy}: mándala HOY en otro ticket único (mañana ya no se puede cancelar)",
+                      f"{texto}  ·  otro ticket único hoy (corte)")
+            elif corte_hoy:
                 # El ticket único de hoy ya salió y no la trae (llegó bastante antes del envío)
                 r['Falta_Hoy'] = True
                 detalle = motivo_ticket or f"llegó a las {llegada:%H:%M}"
@@ -1813,7 +1832,7 @@ def clasificar_lotes(
                   f"Sin comprobar ({dia:%d/%m})")
 
     # El ticket único del lote ya salió: las rezagadas que no trae también le faltan
-    if corte_hoy and not revision:
+    if corte_hoy and not revision and not corte_de_hoy:
         for r in rows:
             if r['Lote_Estado'] == LOTE_REZAGADA and not r['Falta_Hoy']:
                 r['Falta_Hoy'] = True
@@ -1843,6 +1862,9 @@ def clasificar_lotes(
         'hora_corte': hora_corte,
         'cortes': cortes,
         'corte_hoy': corte_hoy,
+        'envios_hoy': envios_hoy,
+        'corte_de_hoy': corte_de_hoy,
+        'dias_de_corte': dias_de_corte,
         'faltan_hoy': sum(1 for r in rows if r.get('Falta_Hoy')),
         'fecha_inicio': fecha_inicio,
         'fecha_fin': fecha_fin,

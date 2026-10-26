@@ -190,6 +190,19 @@ def build_ticket_unico_tsv(rows: list) -> str:
     return "\n".join(lines)
 
 
+def texto_intro(intro: str, total: int) -> str:
+    try:
+        return intro.format(total=total).strip()
+    except (KeyError, IndexError, ValueError):
+        return intro.strip()
+
+
+def build_ticket_unico_texto(rows: list, intro: str = "") -> str:
+    """Lo mismo que el correo del ticket único en texto plano (saludo y tabla separada por tabuladores)."""
+    tabla = build_ticket_unico_tsv(rows)
+    return f"{texto_intro(intro, len(rows))}\n\n{tabla}" if intro else tabla
+
+
 def build_ticket_unico_html(rows: list, intro: str = "", url_fn=None) -> str:
     """
     Cuerpo del correo con el mismo formato del "ticket único" que ya se envía:
@@ -200,11 +213,7 @@ def build_ticket_unico_html(rows: list, intro: str = "", url_fn=None) -> str:
     celda = f"{font};border:1px solid #000000;padding:2px 10px;text-align:center"
     partes = []
     if intro:
-        try:
-            texto = intro.format(total=len(rows))
-        except (KeyError, IndexError, ValueError):
-            texto = intro
-        for parrafo in re.split(r'\n\s*\n', texto.strip()):
+        for parrafo in re.split(r'\n\s*\n', texto_intro(intro, len(rows))):
             partes.append(f'<p style="{font};margin:0 0 10pt 0">{escape(parrafo).replace(chr(10), "<br>")}</p>')
     partes.append('<table style="border-collapse:collapse" cellspacing="0" cellpadding="0">')
     partes.append("<tr>" + "".join(f'<td style="{celda};font-weight:bold">{escape(h)}</td>' for h in TICKET_UNICO_COLUMNAS) + "</tr>")
