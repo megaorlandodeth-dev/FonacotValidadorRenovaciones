@@ -826,6 +826,9 @@ class RenovacionTicketParser:
 
         # Caso B: Múltiples Clientes diferentes en el mismo ticket (ej. 2 números de cliente con 2 o más cancelaciones)
         if len(clientes_found) > 1:
+            # Todos los clientes del incidente van en cada renovación: si alguno no tiene renovaciones se avisa
+            todos_clientes = list(dict.fromkeys(clientes_found))
+
             def posicion(num):
                 m_pos = re.search(rf'(?<!\d){re.escape(num)}(?!\d)', full_context)
                 return m_pos.start() if m_pos else len(full_context)
@@ -840,7 +843,8 @@ class RenovacionTicketParser:
                         'credito_padre': pad_str,
                         'sucursal': '',
                         'fecha_op': '',
-                        'origen_extraccion': 'Múltiples Clientes en Ticket'
+                        'origen_extraccion': 'Múltiples Clientes en Ticket',
+                        'clientes_ticket': todos_clientes
                     })
                 return disaggregated
             elif len(creditos_renovados_found) > len(clientes_found):
@@ -864,7 +868,8 @@ class RenovacionTicketParser:
                         'credito_padre': pad_str,
                         'sucursal': '',
                         'fecha_op': '',
-                        'origen_extraccion': 'Múltiples Clientes y Créditos'
+                        'origen_extraccion': 'Múltiples Clientes y Créditos',
+                        'clientes_ticket': todos_clientes
                     })
                 return disaggregated
             else:
@@ -884,7 +889,8 @@ class RenovacionTicketParser:
                             'sucursal': '',
                             'fecha_op': '',
                             'origen_extraccion': 'Discrepancia de Cliente en Ticket',
-                            'discrepancia_cliente': True
+                            'discrepancia_cliente': True,
+                            'clientes_ticket': todos_clientes
                         }]
 
                 # Más clientes que créditos detectados: crear 1 fila por cada cliente para no omitir ninguno
@@ -897,7 +903,8 @@ class RenovacionTicketParser:
                         'credito_padre': pad_str,
                         'sucursal': '',
                         'fecha_op': '',
-                        'origen_extraccion': 'Múltiples Clientes en Ticket'
+                        'origen_extraccion': 'Múltiples Clientes en Ticket',
+                        'clientes_ticket': todos_clientes
                     })
                 return disaggregated
 
@@ -983,6 +990,7 @@ class RenovacionTicketParser:
                 'Numero_Cliente': cli,
                 'Credito_Renovado_Hijo': cred_ren,
                 'Credito_Origen_Padre': cred_pad or "-",
+                'Clientes_Ticket': list(item.get('clientes_ticket') or []),
                 'Subtipo_Renovacion': subtipo,
                 'Motivo': motivo,
                 'Sucursal': item.get('sucursal', '') or base['localidad'][:35],

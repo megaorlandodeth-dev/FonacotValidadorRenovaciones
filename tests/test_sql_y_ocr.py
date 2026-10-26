@@ -22,6 +22,8 @@ DETALLE = {('1184282', '84846'): (12, 18, 18, 1), ('7982848', '27179'): (104, 12
            ('3430084', '24969'): (104, 18, 18, 0)}
 # Renovaciones por crédito padre (OPERACION): (fecha_alta, cuenta, no_renovacion, operacion)
 PADRES = [(datetime(2026, 10, 23), '1993891', 52011, 51937)]
+# TZ_LOCK por (cuenta, no_renovacion): distinto de 0 = ya bloqueada
+TZLOCK = {('1184282', '10430'): 0, ('4363419', '17626'): 7}
 
 
 class Cursor:
@@ -37,6 +39,8 @@ class Cursor:
         elif "WHERE OPERACION IN" in texto:
             padres = {str(v) for k, v in binds.items() if k[0] == 'p'}
             self._res = [x for x in PADRES if str(x[3]) in padres]
+        elif "TZ_LOCK" in texto:
+            self._res = [(c, r, lock) for (c, r), lock in TZLOCK.items() if c in valores]
         elif "WHERE CUENTA IN" in texto:
             self._res = [x for x in BASE if x[1] in valores]
         else:
@@ -94,7 +98,7 @@ class TestValidacionSQL(unittest.TestCase):
         self.assertIn("ha emitido", r['SQL_Cedula'])
         self.assertEqual(resumen['problemas'], 1)
         # La segunda consulta también con variables y solo SELECT
-        texto, binds = conn.consultas[-1]
+        texto, binds = next(c for c in conn.consultas if "CR_DISPOSICIONES" in c[0])
         self.assertTrue(texto.startswith("SELECT c.CUENTA, c.NO_RENOVACION"))
         self.assertIn("TOPAZ.CR_DISPOSICIONES", texto)
         self.assertIn("TOPAZ.CR_CEDULAS_DETALLE", texto)

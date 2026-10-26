@@ -34,6 +34,7 @@ SQL_SIN_DATOS = "SIN_DATOS"
 SQL_APP_PLAZO = "APP_PLAZO"      # de otro día, pero la generó la APP con plazo menor: sí se envía
 SQL_NO_PROCEDE = "NO_PROCEDE"    # de otro día: «No procede, la renovación es de otro día»
 SQL_ES_PADRE = "ES_PADRE"        # mandaron el crédito padre (origen) en vez de la renovación
+SQL_PADRE_CORREGIDO = "PADRE_CORREGIDO"  # traía el padre: se puso su renovación (hijo) como crédito a cancelar; validar
 # Estados que indican que el dato del incidente no cuadra con la base
 SQL_PROBLEMAS = (SQL_OTRA_FECHA, SQL_NO_EXISTE, SQL_SIN_RENOVACIONES, SQL_NO_PROCEDE, SQL_ES_PADRE)
 LEYENDA_NO_PROCEDE = "No procede, la renovación es de otro día"
@@ -300,6 +301,37 @@ def consultar_por_padres(conn, tabla: str, creditos) -> list:
     return [(_fecha(f), _num(c), _num(n), _num(o)) for f, c, n, o in registros]
 
 
+COLUMNAS_TZ_LOCK = ("TZ_LOCK", "TZLOCK")
+
+
+def consultar_tz_lock(conn, tabla: str, clientes) -> dict:
+    """
+    {(cuenta, no_renovacion): TZ_LOCK} de las renovaciones de esos clientes. TZ_LOCK distinto de 0 = la renovación ya
+    está bloqueada en la base. Se prueba TZ_LOCK y TZLOCK (si la columna no existe se usa el siguiente nombre).
+    """
+    tabla = tabla_valida(tabla)
+    clientes = sorted(set(c for c in clientes if c))
+    ultimo = None
+    for columna in COLUMNAS_TZ_LOCK:
+        cur = conn.cursor()
+        try:
+            res = {}
+            for grupo in _lotes(clientes):
+                binds = {f"c{i}": v for i, v in enumerate(grupo)}
+                cur.execute(f"SELECT CUENTA, NO_RENOVACION, {columna} FROM {tabla} "
+                            f"WHERE CUENTA IN ({', '.join(':' + k for k in binds)})", binds)
+                for cuenta, renov, lock in cur.fetchall():
+                    res[(_num(cuenta), _num(renov))] = _entero(lock)
+            return res
+        except Exception as e:
+            ultimo = e
+            if "00904" not in str(e):  # ORA-00904: la columna no existe con ese nombre
+                raise
+        finally:
+            cur.close()
+    raise ultimo
+
+
 def _esquema(tabla: str) -> str:
     """'TOPAZ.CR_RENOVACIONES' -> 'TOPAZ.' (las demás tablas están en el mismo esquema)."""
     return tabla.split(".")[0] + "." if "." in tabla else ""
@@ -366,8 +398,32 @@ def decidir_otro_dia(credito: str, alta: date, ref: date, det: dict) -> tuple:
 # ======================= Validación (sin base de datos: se puede probar sola) =======================
 
 def _dato(valor) -> str:
+    """El número del campo (el primero: «1184282 (⚠️ En texto también: 3386153)» -> '1184282'); '' si es «SIN …»."""
     v = str(valor or '')
-    return '' if v.upper().startswith('SIN ') else _num(v)
+    m = re.search(r'\d+', v)
+    return '' if v.upper().startswith('SIN ') or not m else _num(m.group(0))
+
+
+def clientes_sin_renovaciones(r: dict, por_cliente: dict) -> list:
+    """
+    Incidente con varios números de cliente: [(cliente, texto)] de los que no cuentan con renovaciones (o no de esos
+    días). El cliente de la propia fila no se repite (ya lo dice su estado).
+    """
+    ref = _referencia(r)
+    desde, hasta = ref - timedelta(days=DIAS_ANTES), ref + timedelta(days=1)
+    propio = _dato(r.get('Numero_Cliente'))
+    res = []
+    for cli in dict.fromkeys(_dato(c) for c in r.get('Clientes_Ticket') or []):
+        if not cli or cli == propio:
+            continue
+        renov = por_cliente.get(cli, [])
+        if not renov:
+            res.append((cli, f"El cliente {cli} (también viene en el incidente) no cuenta con renovaciones"))
+        elif not any(f and desde <= f <= hasta for f, _ in renov):
+            ultima = max(renov, key=lambda x: x[0] or date.min)
+            res.append((cli, f"El cliente {cli} (también viene en el incidente) no cuenta con renovaciones de esos días"
+                             + (f" (la última: {ultima[1]} del {ultima[0]:%d/%m/%Y})" if ultima[0] else "")))
+    return res
 
 
 def _referencia(r: dict):
@@ -451,6 +507,33 @@ def validar_par(cliente: str, credito: str, ref: date, por_cliente: dict, por_cr
     return SQL_SIN_DATOS, ""
 
 
+def corregir_padre(r: dict, hijas: list) -> str:
+    """
+    El incidente trae el crédito padre: el crédito a cancelar pasa a ser su renovación (el hijo), para que el ticket único
+    no salga con el padre (lo rechazarían). Si faltaba el cliente, se pone el de la renovación. Queda la leyenda de
+    validar. Regresa el nuevo estado (SQL_PADRE_CORREGIDO).
+    """
+    fecha, cuenta, hija = hijas[0]
+    fecha = _fecha(fecha)
+    padre = _dato(r.get('Credito_Renovado_Hijo'))
+    r['Credito_Padre_Enviado'] = padre
+    r['Credito_Renovado_Hijo'] = hija
+    if str(r.get('Credito_Origen_Padre') or '-').strip() in ('', '-'):
+        r['Credito_Origen_Padre'] = padre
+    puso_cliente = not _dato(r.get('Numero_Cliente'))
+    if puso_cliente:
+        r['Numero_Cliente'] = cuenta
+    if not str(r.get('Numero_Cliente', '')).upper().startswith('SIN') and not str(hija).upper().startswith('SIN'):
+        r['Datos_Incompletos'] = False
+    otras = f" Ese padre también tiene: {', '.join(h[2] for h in hijas[1:4])}; confirma cuál es." if len(hijas) > 1 else ""
+    r['SQL_Fecha_Alta'] = fecha or r.get('SQL_Fecha_Alta')
+    r['SQL_Estado'] = SQL_PADRE_CORREGIDO
+    r['SQL_Detalle'] = (f"VALIDAR: el incidente trae el crédito padre {padre}; se puso su renovación {hija} como crédito a "
+                        f"cancelar (cliente {cuenta}" + (f", alta {fecha:%d/%m/%Y}" if fecha else "") + ")"
+                        + (" y el número de cliente, que faltaba" if puso_cliente else "") + f".{otras}")
+    return SQL_PADRE_CORREGIDO
+
+
 def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ()) -> dict:
     """
     Consulta la base y marca cada renovación con 'SQL_Estado' y 'SQL_Detalle'. Los renglones de los tickets
@@ -463,7 +546,9 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
     todos = pares + pares_env
 
     por_cliente = {}
-    for f, c, n in consultar_por_clientes(conn, tabla, [c for c, _, _ in todos]):
+    # Incidentes con varios números de cliente: también se consultan los demás (¿alguno no tiene renovaciones?)
+    extra = [_dato(c) for r in rows for c in r.get('Clientes_Ticket') or []]
+    for f, c, n in consultar_por_clientes(conn, tabla, [c for c, _, _ in todos] + extra):
         por_cliente.setdefault(c, []).append((f, n))
     # Por crédito: los que no traen cliente y los que el cliente no tiene (¿de quién es esa renovación?)
     buscar = [(cr, ref) for c, cr, ref in todos
@@ -513,20 +598,34 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
                     texto += "." + pista.group(0).rstrip(".") + "."
         resultados[i] = (estado, texto, alta, (detalle.get((c, cr)) or {}).get('cedula', False))
 
+    # TZ_LOCK de las renovaciones que existen (distinto de 0 = ya bloqueada): sirve para saber si un incidente cerrado
+    # sin enviar se cerró por error
+    tz_lock, error_tz_lock = {}, ''
+    if con_alta:
+        try:
+            tz_lock = consultar_tz_lock(conn, tabla, [c for c, _ in con_alta])
+        except Exception as e:
+            error_tz_lock = _mensaje(e)
+
     conteos = {}
-    for r, (estado, texto, alta, cedula) in zip(rows, resultados):
+    for r, (c, cr, _), (estado, texto, alta, cedula) in zip(rows, pares, resultados):
         r['SQL_Estado'], r['SQL_Detalle'], r['SQL_Fecha_Alta'] = estado, texto, alta
+        r['SQL_Tz_Lock'] = tz_lock.get((c, cr)) if alta else None
+        r['SQL_Clientes_Sin_Renov'] = [t for _, t in clientes_sin_renovaciones(r, por_cliente)]
         r['SQL_Cedula'] = "Esta renovación ha emitido, favor de validar (está en CR_CEDULAS_DETALLE)" if cedula else ""
         hijas = hijas_del_padre(_dato(r.get('Numero_Cliente')), _dato(r.get('Credito_Renovado_Hijo')), por_padre) \
             if estado == SQL_ES_PADRE else []
         r['SQL_Renovacion_Hija'] = hijas[0][2] if hijas else ''
+        if hijas:
+            estado = corregir_padre(r, hijas)
         conteos[estado] = conteos.get(estado, 0) + 1
     for f, (estado, texto, alta, cedula) in zip(filas_enviadas, resultados[len(rows):]):
         f['sql_estado'], f['sql_detalle'] = estado, texto
     return {'ok': True, 'conteos': conteos, 'problemas': sum(conteos.get(e, 0) for e in SQL_PROBLEMAS),
             'enviadas_con_problema': sum(1 for f in filas_enviadas if f.get('sql_estado') in SQL_PROBLEMAS),
-            'error_detalle': error_detalle, 'error_padre': error_padre,
-            'padres': conteos.get(SQL_ES_PADRE, 0),
+            'error_detalle': error_detalle, 'error_padre': error_padre, 'error_tz_lock': error_tz_lock,
+            'clientes_sin_renov': sum(1 for r in rows if r.get('SQL_Clientes_Sin_Renov')),
+            'padres': conteos.get(SQL_ES_PADRE, 0) + conteos.get(SQL_PADRE_CORREGIDO, 0),
             'cedulas': sum(1 for *_, ced in resultados[:len(rows)] if ced)}
 
 
@@ -534,7 +633,7 @@ def texto_corto(estado: str) -> str:
     return {SQL_OK: "✔ Existe", SQL_OTRA_FECHA: "⚠ Otra fecha", SQL_NO_EXISTE: "✖ No existe",
             SQL_SIN_RENOVACIONES: "✖ Sin renovaciones", SQL_SUGERENCIA: "💡 Sugerencia", SQL_SIN_DATOS: "—",
             SQL_APP_PLAZO: "✔ APP, plazo menor", SQL_NO_PROCEDE: "✖ No procede (otro día)",
-            SQL_ES_PADRE: "⚠ Es el padre"}.get(estado, "")
+            SQL_ES_PADRE: "⚠ Es el padre", SQL_PADRE_CORREGIDO: "⚠ Era el padre"}.get(estado, "")
 
 
 # ======================= Contraseña en el Administrador de credenciales de Windows =======================

@@ -39,18 +39,24 @@ class TestCreditoPadre(unittest.TestCase):
     def test_mandan_el_padre_con_su_cliente(self):
         r = fila("I-1", "1993891", "51937")
         resumen = sql.validar_contra_base(Conexion(), "TOPAZ.CR_RENOVACIONES", [r])
-        self.assertEqual(r['SQL_Estado'], sql.SQL_ES_PADRE)
+        # v3.0: el crédito a cancelar pasa a ser el hijo (el ticket único no debe salir con el padre), con leyenda de validar
+        self.assertEqual(r['SQL_Estado'], sql.SQL_PADRE_CORREGIDO)
         self.assertEqual(r['SQL_Renovacion_Hija'], "52011")
-        self.assertIn("51937 es el crédito padre", r['SQL_Detalle'])
-        self.assertIn("la 52011 del cliente 1993891", r['SQL_Detalle'])
-        self.assertIn(sql.SQL_ES_PADRE, sql.SQL_PROBLEMAS)
+        self.assertEqual(r['Credito_Renovado_Hijo'], "52011")
+        self.assertEqual(r['Credito_Padre_Enviado'], "51937")
+        self.assertIn("VALIDAR: el incidente trae el crédito padre 51937", r['SQL_Detalle'])
+        self.assertIn("su renovación 52011 como crédito a cancelar (cliente 1993891", r['SQL_Detalle'])
+        self.assertNotIn(sql.SQL_PADRE_CORREGIDO, sql.SQL_PROBLEMAS)
         self.assertEqual(resumen['padres'], 1)
 
     def test_padre_sin_cliente(self):
         r = fila("I-2", "SIN CLIENTE", "51937")
         sql.validar_contra_base(Conexion(), "TOPAZ.CR_RENOVACIONES", [r])
-        self.assertEqual(r['SQL_Estado'], sql.SQL_ES_PADRE)
+        self.assertEqual(r['SQL_Estado'], sql.SQL_PADRE_CORREGIDO)
         self.assertEqual(r['SQL_Renovacion_Hija'], "52011")
+        self.assertEqual((r['Numero_Cliente'], r['Credito_Renovado_Hijo']), ("1993891", "52011"))
+        self.assertFalse(r['Datos_Incompletos'])
+        self.assertIn("y el número de cliente, que faltaba", r['SQL_Detalle'])
 
     def test_consulta_con_variables_y_solo_si_hace_falta(self):
         conn = Conexion()
@@ -119,7 +125,9 @@ class TestYaSeEmitio(unittest.TestCase):
         cal.marcar_bloqueos([r], date(2026, 11, 2))
         self.assertIn("sale en el ticket único del 02/11/2026, después del cierre de mes (31/10/2026)",
                       r['Bloqueo_Emision'])
-        self.assertIn("ya se emitió", r['Bloqueo_Emision'])
+        # v3.0: el cierre de mes todavía se puede cancelar con autorización (la emisión no)
+        self.assertEqual(r['Bloqueo_Tipo'], 'cierre')
+        self.assertIn("NECESITA AUTORIZACIÓN", r['Bloqueo_Emision'])
 
     def test_va_en_el_lote_de_hoy_que_es_el_dia_del_cierre(self):
         r = self.fila_lote(datetime(2026, 10, 30, 19, 30), Dia_Lote=date(2026, 10, 30), Lote_Estado="HOY")
