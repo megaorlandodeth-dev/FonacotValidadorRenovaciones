@@ -1153,6 +1153,7 @@ class FonacotRenovacionesEngine:
                         'tickets': tickets,
                         'numeros': numeros,
                         'filas': filas,
+                        'texto': full_text,  # para los renglones escritos fuera de la tabla
                         'intro': extract_concentrado_intro(body),
                     }
                 except Exception:

@@ -100,6 +100,14 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
    - **El rojo gana:** una renovación que no se envió o salió mal se ve en rojo aunque la hayas validado antes.
    - La marca *última considerada* solo la deja el lote de hoy al copiarlo o crear el correo (no el Excel, ni una revisión, ni un lote pasado).
 
+**Novedades v2.6:**
+   - **Cliente junto al nombre:** si el correo trae el número del trabajador sin la palabra «cliente» («LUIS RENE MENDEZ ZUÑIGA 6650919»), ya se toma como cliente (antes salía *SIN CLIENTE*). No se confunde con fechas, folios ni teléfonos.
+   - **Ticket único de cualquier compañero y con otro formato:** si el ticket único (por ejemplo, el de la guardia del sábado) trae renglones escritos fuera de la tabla («I-362605 6572804 35238»), varios créditos en una celda, columnas de crédito origen y renovado, o nombre y número de cliente, ya se reconocen como enviados. Si el ticket viene en la tabla con otro cliente o crédito, sigue marcándose como *datos equivocados*.
+   - **Lote del día sin avisos de la semana:** en rojo solo sale lo que cambia el lote de hoy (rezagadas abiertas, errores del ticket único de hoy). Lo de días anteriores (cerradas sin enviar, datos equivocados, duplicadas) se resume en una línea y se revisa en *Revisión semanal*. Lo mismo con las capturas y la base: solo cuenta lo del lote.
+   - **Conexión como en SQL Developer:** *Nombre del host*, *Puerto* y *Nombre del servicio* por separado (antes un solo campo: escrito con espacios, Oracle lo buscaba como alias en tnsnames.ora, error DPY-4000). Si la base pide el modo clásico (DPY-3015), se usa solo el Oracle Client que ya está instalado (el de SQL Developer).
+   - **Renovaciones de otro día (segunda consulta):** si la renovación no se dio de alta el día en que llegó el incidente (lo que llegó después del envío del ticket único y sale al día siguiente cuenta con su día de llegada), se consulta `SALDOS`, `CR_DISPOSICIONES` y `CR_CEDULAS_DETALLE` (la misma lógica de la consulta de SQL Developer). Si la generó la APP (sucursal 104) con un plazo menor al de la disposición, **sí va** (*✔ APP, plazo menor*); si no, **«No procede, la renovación es de otro día»** (*✖ No procede*, en rojo). Si ya está en `CR_CEDULAS_DETALLE` avisa *«Esta renovación ha emitido, favor de validar»*.
+   - **Calendario de emisión de cédulas:** si entre el alta de la renovación y la llegada del incidente pasó la generación de una emisión o un cierre de mes (último día del mes), ya no se puede cancelar: sale en rojo, en la vista *Ya no se pueden cancelar (emisión)*, en el aviso de arriba, al crear el correo y en el Excel. Lo que cuenta es cuándo llegó el incidente: si llegó el día correcto pero después del envío del ticket único, se manda al día siguiente sin esa leyenda aunque en medio haya una emisión o un cierre. Necesita la validación en la base (fecha de alta). Las fechas de 2026 vienen incluidas y cada semana se leen de https://www.fonacot.gob.mx/empresa/Paginas/calendariocedulas.aspx (se guardan en `calendario_cedulas.json`).
+
 **Novedades v2.5:**
    - **Corrección importante:** la revisión semanal solo encontraba el ticket único más reciente (los de los días anteriores se ignoraban y todo salía *Sin comprobar*, sin detectar datos equivocados). Ya se leen todos.
    - **Cambiar de modo no busca solo:** *Lote del día*, *Revisión semanal*, *Esta semana*, *Semana pasada*, *Hoy* o elegir una fecha solo preparan el periodo; la búsqueda empieza con **Extraer y validar** (F5). Debajo del botón se indica qué se va a buscar.
@@ -158,8 +166,8 @@ Se guarda en `%USERPROFILE%\.fonacot_validador_renovaciones_config.json`. Ademá
 - `ultimo_lote`: marca de la última renovación considerada (se actualiza al copiar el lote o crear el correo de hoy).
 - `dias_inhabiles` / `feriados_oficiales`: días inhábiles capturados en pantalla y si se suman los feriados oficiales.
 - `dias_atras_lote`: días hábiles hacia atrás que revisa el lote del día (5 por omisión).
-- `leer_imagenes`, `sql_activo`, `sql_servidor`, `sql_usuario`, `sql_tabla`, `sql_recordar`: lo de *Validaciones automáticas* (la contraseña no se guarda aquí).
-- `sql_cliente_oracle`: carpeta del Oracle Instant Client, solo si la base no acepta el modo *thin*.
+- `leer_imagenes`, `sql_activo`, `sql_host`, `sql_puerto`, `sql_servicio`, `sql_usuario`, `sql_tabla`, `sql_recordar`: lo de *Validaciones automáticas* (la contraseña no se guarda aquí). `sql_servidor` se arma solo (`host:puerto/servicio`).
+- `sql_cliente_oracle`: carpeta del Oracle Client, solo si la base no acepta el modo *thin* y no se encuentra sola.
 - `columnas_ocultas` y `vista`: columnas y zonas de la pantalla elegidas en *Vista*.
 - `texto_correo`: texto fijo del correo del ticket único (admite `{total}`). Vacío = usar el aprendido.
 - `texto_correo_aprendido`: saludo y avisos copiados del último concentrado encontrado (se actualiza solo).

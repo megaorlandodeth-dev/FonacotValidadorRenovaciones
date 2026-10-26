@@ -3,10 +3,13 @@
 """
 Validación de las renovaciones contra la base de datos (Oracle, tabla TOPAZ.CR_RENOVACIONES).
 
-Solo consulta (SELECT) tres columnas: FECHA_ALTA, CUENTA (No. de cliente) y NO_RENOVACION (crédito renovado):
+Solo consulta (SELECT). Primera consulta: FECHA_ALTA, CUENTA (No. de cliente) y NO_RENOVACION (crédito renovado):
 - ¿el cliente tiene una renovación con ese número y se dio de alta el día del incidente?
 - si al incidente le falta el crédito: la renovación que el cliente tiene ese día;
 - si le falta el cliente: de qué cliente es esa renovación.
+Segunda consulta (SALDOS, CR_DISPOSICIONES, CR_CEDULAS_DETALLE), para las de días anteriores: solo se envían si las
+generó la APP (sucursal 104) con un plazo menor; si no, «No procede, la renovación es de otro día». También avisa
+si la renovación ya emitió (está en CR_CEDULAS_DETALLE).
 
 La contraseña no se guarda en la configuración: se pide en pantalla y, si el usuario quiere, se guarda en el
 Administrador de credenciales de Windows.
@@ -26,8 +29,12 @@ SQL_NO_EXISTE = "NO_EXISTE"
 SQL_SIN_RENOVACIONES = "SIN_RENOVACIONES"
 SQL_SUGERENCIA = "SUGERENCIA"
 SQL_SIN_DATOS = "SIN_DATOS"
+SQL_APP_PLAZO = "APP_PLAZO"      # de otro día, pero la generó la APP con plazo menor: sí se envía
+SQL_NO_PROCEDE = "NO_PROCEDE"    # de otro día: «No procede, la renovación es de otro día»
 # Estados que indican que el dato del incidente no cuadra con la base
-SQL_PROBLEMAS = (SQL_OTRA_FECHA, SQL_NO_EXISTE, SQL_SIN_RENOVACIONES)
+SQL_PROBLEMAS = (SQL_OTRA_FECHA, SQL_NO_EXISTE, SQL_SIN_RENOVACIONES, SQL_NO_PROCEDE)
+LEYENDA_NO_PROCEDE = "No procede, la renovación es de otro día"
+SUCURSAL_APP = 104
 
 _CREDENCIAL = "FonacotValidadorRenovaciones/SQL"
 _cliente_oracle_iniciado = False
@@ -59,16 +66,58 @@ def tabla_valida(tabla: str) -> str:
     return tabla
 
 
+def servidor_de(host: str, puerto="", servicio: str = "") -> str:
+    """Los tres campos de SQL Developer (Nombre del host, Puerto, Nombre del servicio) -> «host:puerto/servicio»."""
+    host, servicio = (host or "").strip(), (servicio or "").strip()
+    puerto = str(puerto or "").strip() or "1521"
+    if not host:
+        return ""
+    return f"{host}:{puerto}/{servicio}" if servicio else f"{host}:{puerto}"
+
+
+def separar_servidor(servidor: str) -> tuple:
+    """(host, puerto, servicio) de «host:puerto/servicio» (o con espacios, comas o diagonales). Al revés de servidor_de."""
+    s = (servidor or "").strip()
+    m = re.fullmatch(r'([^:/\s(),;]+)(?:[\s:,;/]+(\d{2,5}))?(?:[\s:,;/]+([A-Za-z0-9_$#.]+))?', s)
+    if not m:
+        return s, "", ""
+    return m.group(1), m.group(2) or "", m.group(3) or ""
+
+
 def armar_dsn(servidor: str, oracledb=None) -> str:
     """
-    Acepta lo que muestra SQL Developer: «host:puerto/servicio», «host:puerto:SID», un alias de tnsnames
-    o el descriptor completo «(DESCRIPTION=…)».
+    Acepta «host:puerto/servicio» (lo de SQL Developer), «host:puerto:SID», el host, puerto y servicio separados por
+    espacios o comas, un alias de tnsnames o el descriptor completo «(DESCRIPTION=…)».
     """
     s = (servidor or "").strip()
+    if s.startswith("("):
+        return s
     m = re.fullmatch(r'([^:/\s()]+):(\d+):([A-Za-z0-9_$#.]+)', s)
     if m and oracledb is not None:
         return oracledb.makedsn(m.group(1), int(m.group(2)), sid=m.group(3))
+    host, puerto, servicio = separar_servidor(s)
+    # «scanfonacot.fonacot.gob.mx 1521 fonatop»: sin esto, Oracle lo busca como alias en tnsnames.ora (DPY-4000)
+    if puerto or "." in host:
+        return servidor_de(host, puerto, servicio)
     return s
+
+
+def _buscar_cliente_oracle() -> str:
+    """Carpeta de un Oracle Client instalado (la de SQL Developer o la del sistema), para el modo clásico. '' si no hay."""
+    import glob
+    import os
+    candidatos = []
+    for var in ("ORACLE_HOME",):
+        if os.environ.get(var):
+            candidatos += [os.path.join(os.environ[var], "bin"), os.environ[var]]
+    candidatos += [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    for patron in (r"C:\app\*\product\*\*\bin", r"C:\app\client\*\product\*\*\bin", r"C:\oracle\*\bin",
+                   r"C:\oracle\product\*\*\bin", r"C:\instantclient*", r"C:\oracle\instantclient*"):
+        candidatos += sorted(glob.glob(patron), reverse=True)
+    for carpeta in candidatos:
+        if os.path.isfile(os.path.join(carpeta, "oci.dll")):
+            return carpeta
+    return ""
 
 
 def _mensaje(e: Exception) -> str:
@@ -95,15 +144,28 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
             _cliente_oracle_iniciado = True
         except Exception as e:
             raise ErrorSQL(f"No se pudo usar el Oracle Client de «{cliente_oracle}»: {e}")
+    dsn = armar_dsn(servidor, oracledb)
     try:
-        conn = oracledb.connect(user=usuario, password=password, dsn=armar_dsn(servidor, oracledb),
-                                tcp_connect_timeout=10)
+        conn = oracledb.connect(user=usuario, password=password, dsn=dsn, tcp_connect_timeout=10)
     except Exception as e:
         texto = _mensaje(e)
-        if "DPY-3015" in texto or "DPY-3010" in texto:
-            texto += ("  →  Esta base pide el modo clásico de Oracle: indica en la configuración "
-                      "(«sql_cliente_oracle») la carpeta del Oracle Instant Client.")
-        raise ErrorSQL(texto)
+        clasico = "DPY-3015" in texto or "DPY-3010" in texto
+        encontrado = _buscar_cliente_oracle() if clasico and not _cliente_oracle_iniciado else ""
+        if encontrado:
+            # La base pide el modo clásico: se usa el Oracle Client que ya está instalado (el de SQL Developer)
+            try:
+                oracledb.init_oracle_client(lib_dir=encontrado)
+                _cliente_oracle_iniciado = True
+                conn = oracledb.connect(user=usuario, password=password, dsn=dsn)
+            except Exception as e2:
+                raise ErrorSQL(f"{_mensaje(e2)}  (con el Oracle Client de {encontrado})")
+        else:
+            if clasico:
+                texto += ("  →  Esta base pide el modo clásico de Oracle y no se encontró un Oracle Client: indica "
+                          "su carpeta en la configuración («sql_cliente_oracle»).")
+            elif "DPY-4000" in texto or "DPY-4026" in texto or "DPY-4027" in texto:
+                texto += "  →  Revisa Host, Puerto y Servicio (como en SQL Developer: Básico, Nombre del servicio)."
+            raise ErrorSQL(texto)
     try:
         conn.call_timeout = TIEMPO_MAX_MS
     except Exception:
@@ -169,6 +231,69 @@ def consultar_por_creditos(conn, tabla: str, creditos, desde: date, hasta: date)
     return [(_fecha(f), _num(c), _num(n)) for f, c, n in registros]
 
 
+def _esquema(tabla: str) -> str:
+    """'TOPAZ.CR_RENOVACIONES' -> 'TOPAZ.' (las demás tablas están en el mismo esquema)."""
+    return tabla.split(".")[0] + "." if "." in tabla else ""
+
+
+def consultar_detalle(conn, tabla: str, clientes) -> dict:
+    """
+    La segunda consulta (para las renovaciones de días anteriores), la misma lógica que la de SQL Developer:
+    {(cuenta, no_renovacion): {'sucursal', 'plazo_renovacion' (SALDOS.PLAZO_ORIGINAL de la renovación),
+    'plazo_disposicion' (CR_DISPOSICIONES.PLAZOMESES), 'cedula' (está en CR_CEDULAS_DETALLE)}}.
+    """
+    tabla = tabla_valida(tabla)
+    e = _esquema(tabla)
+    detalle = {}
+    cur = conn.cursor()
+    try:
+        for grupo in _lotes(sorted(set(c for c in clientes if c))):
+            binds = {f"c{i}": v for i, v in enumerate(grupo)}
+            cur.execute(
+                f"SELECT c.CUENTA, c.NO_RENOVACION, MAX(c.SUCURSAL_EJERCE), "
+                f"(SELECT MAX(s.PLAZO_ORIGINAL) FROM {e}SALDOS s WHERE s.CUENTA = c.CUENTA AND s.OPERACION = c.NO_RENOVACION), "
+                f"MAX(b.PLAZOMESES), MAX(CASE WHEN d.OPERACION IS NOT NULL THEN 1 ELSE 0 END) "
+                f"FROM {e}SALDOS a "
+                f"INNER JOIN {e}CR_DISPOSICIONES b ON a.CUENTA = b.IDTRABAJADOR AND b.NROPRESTAMO = a.OPERACION "
+                f"INNER JOIN {tabla} c ON a.CUENTA = c.CUENTA AND c.OPERACION = a.OPERACION "
+                f"LEFT JOIN {e}CR_CEDULAS_DETALLE d ON c.CUENTA = d.CUENTA AND c.NO_RENOVACION = d.OPERACION "
+                f"WHERE a.PRODUCTO > '99' AND c.CUENTA IN ({', '.join(':' + k for k in binds)}) "
+                f"GROUP BY c.CUENTA, c.NO_RENOVACION", binds)
+            for cuenta, renov, sucursal, plazo_r, plazo_d, cedula in cur.fetchall():
+                detalle[(_num(cuenta), _num(renov))] = {
+                    'sucursal': _num(sucursal), 'plazo_renovacion': _entero(plazo_r),
+                    'plazo_disposicion': _entero(plazo_d), 'cedula': bool(cedula)}
+    finally:
+        cur.close()
+    return detalle
+
+
+def _entero(valor):
+    try:
+        return int(valor) if valor is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def decidir_otro_dia(credito: str, alta: date, ref: date, det: dict) -> tuple:
+    """
+    Renovación dada de alta antes del día del incidente: se envía solo si la generó la APP (sucursal 104) con un plazo
+    menor al de la disposición; si no, «No procede, la renovación es de otro día». (estado, detalle)
+    """
+    cuando = f"se dio de alta el {alta:%d/%m/%Y} y el incidente llegó el {ref:%d/%m/%Y}"
+    if not det:
+        return SQL_OTRA_FECHA, (f"La renovación {credito} {cuando}. No se encontró en SALDOS / CR_DISPOSICIONES "
+                                f"para saber si la generó la APP: revísala a mano.")
+    app = det['sucursal'] == str(SUCURSAL_APP)
+    pr, pd = det['plazo_renovacion'], det['plazo_disposicion']
+    plazos = f"plazo de la renovación {pr if pr is not None else '?'} vs. disposición {pd if pd is not None else '?'} meses"
+    if app and pr is not None and pd is not None and pr < pd:
+        return SQL_APP_PLAZO, (f"De otro día pero se envía: la renovación {credito} {cuando}, la generó la APP "
+                               f"(sucursal {SUCURSAL_APP}) con plazo menor ({plazos})")
+    motivo = f"la generó la APP pero el plazo no es menor ({plazos})" if app else f"no es de la APP (sucursal {det['sucursal'] or '?'})"
+    return SQL_NO_PROCEDE, f"{LEYENDA_NO_PROCEDE}: {credito} {cuando}; {motivo}"
+
+
 # ======================= Validación (sin base de datos: se puede probar sola) =======================
 
 def _dato(valor) -> str:
@@ -179,6 +304,12 @@ def _dato(valor) -> str:
 def _referencia(r: dict):
     llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
     return llegada.date() if isinstance(llegada, datetime) else (llegada or date.today())
+
+
+def _alta(cliente: str, credito: str, por_cliente: dict):
+    """Fecha de alta de esa renovación del cliente (la más reciente si hay varias). None si no está."""
+    fechas = [f for f, n in por_cliente.get(cliente, []) if n == credito and f] if cliente and credito else []
+    return max(fechas) if fechas else None
 
 
 def validar_par(cliente: str, credito: str, ref: date, por_cliente: dict, por_credito: dict) -> tuple:
@@ -201,11 +332,12 @@ def validar_par(cliente: str, credito: str, ref: date, por_cliente: dict, por_cr
     if cliente and credito:
         iguales = [f for f, n in renov if n == credito]
         if iguales:
-            alta = max(f for f in iguales if f) if any(iguales) else None
-            if alta and desde <= alta <= hasta:
-                cuando = "el mismo día" if alta == ref else f"el {alta:%d/%m/%Y}"
-                return SQL_OK, f"Renovación {credito} del cliente {cliente} dada de alta {cuando}"
-            otra = f" Ese día tiene: {lista(cercanas)}." if cercanas else ""
+            alta = _alta(cliente, credito, por_cliente)
+            if alta == ref:
+                return SQL_OK, f"Renovación {credito} del cliente {cliente} dada de alta el mismo día ({alta:%d/%m/%Y})"
+            # De otro día: validar_contra_base hace la segunda consulta (¿la generó la APP con plazo menor?)
+            otra = f" Ese día tiene: {lista([(f, n) for f, n in cercanas if f == ref])}." if any(
+                f == ref and n != credito for f, n in cercanas) else ""
             return SQL_OTRA_FECHA, (f"La renovación {credito} del cliente {cliente} es del "
                                     f"{alta:%d/%m/%Y}, no de cuando llegó el incidente ({ref:%d/%m/%Y}).{otra}"
                                     if alta else f"La renovación {credito} no tiene fecha de alta")
@@ -236,7 +368,8 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
     Devuelve el resumen {'ok': True, 'conteos': {estado: n}, 'problemas': n}.
     """
     pares = [(_dato(r.get('Numero_Cliente')), _dato(r.get('Credito_Renovado_Hijo')), _referencia(r)) for r in rows]
-    pares_env = [(_dato(f.get('cliente')), _dato(f.get('credito')), f.get('fecha') or date.today()) for f in filas_enviadas]
+    pares_env = [(_dato(f.get('cliente')), _dato(f.get('credito')), f.get('llegada') or f.get('fecha') or date.today())
+                 for f in filas_enviadas]
     todos = pares + pares_env
 
     por_cliente = {}
@@ -252,19 +385,50 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
                                               min(refs) - timedelta(days=DIAS_ANTES), max(refs) + timedelta(days=1)):
             por_credito.setdefault(n, []).append((f, c))
 
+    # Renglón del ticket único sin su incidente: lo del día hábil anterior que llegó después del envío también es «del día»
+    for i, f in enumerate(filas_enviadas, len(pares)):
+        c, cr, ref = todos[i]
+        alta = _alta(c, cr, por_cliente)
+        if not f.get('llegada') and f.get('desde') and alta and f['desde'] <= alta <= ref:
+            todos[i] = (c, cr, alta)
+    resultados = [validar_par(c, cr, ref, por_cliente, por_credito) for c, cr, ref in todos]
+
+    # Segunda consulta: las de días anteriores (¿APP con plazo menor?) y si ya emitió (CR_CEDULAS_DETALLE)
+    con_alta = [(c, cr) for c, cr, _ in todos if _alta(c, cr, por_cliente)]
+    detalle, error_detalle = {}, ''
+    if con_alta:
+        try:
+            detalle = consultar_detalle(conn, tabla, [c for c, _ in con_alta])
+        except Exception as e:
+            error_detalle = _mensaje(e)
+    for i, ((c, cr, ref), (estado, texto)) in enumerate(zip(todos, resultados)):
+        alta = _alta(c, cr, por_cliente)
+        if estado == SQL_OTRA_FECHA and alta and alta < ref:
+            if error_detalle:
+                texto += f" No se pudo hacer la segunda consulta (APP / plazo): {error_detalle}"
+            else:
+                pista = re.search(r' Ese día tiene: .*$', texto)  # «¿no será la de ese día?»
+                estado, texto = decidir_otro_dia(cr, alta, ref, detalle.get((c, cr)))
+                if estado != SQL_APP_PLAZO and pista:
+                    texto += "." + pista.group(0).rstrip(".") + "."
+        resultados[i] = (estado, texto, alta, (detalle.get((c, cr)) or {}).get('cedula', False))
+
     conteos = {}
-    for r, (c, cr, ref) in zip(rows, pares):
-        r['SQL_Estado'], r['SQL_Detalle'] = validar_par(c, cr, ref, por_cliente, por_credito)
-        conteos[r['SQL_Estado']] = conteos.get(r['SQL_Estado'], 0) + 1
-    for f, (c, cr, ref) in zip(filas_enviadas, pares_env):
-        f['sql_estado'], f['sql_detalle'] = validar_par(c, cr, ref, por_cliente, por_credito)
+    for r, (estado, texto, alta, cedula) in zip(rows, resultados):
+        r['SQL_Estado'], r['SQL_Detalle'], r['SQL_Fecha_Alta'] = estado, texto, alta
+        r['SQL_Cedula'] = "Esta renovación ha emitido, favor de validar (está en CR_CEDULAS_DETALLE)" if cedula else ""
+        conteos[estado] = conteos.get(estado, 0) + 1
+    for f, (estado, texto, alta, cedula) in zip(filas_enviadas, resultados[len(rows):]):
+        f['sql_estado'], f['sql_detalle'] = estado, texto
     return {'ok': True, 'conteos': conteos, 'problemas': sum(conteos.get(e, 0) for e in SQL_PROBLEMAS),
-            'enviadas_con_problema': sum(1 for f in filas_enviadas if f.get('sql_estado') in SQL_PROBLEMAS)}
+            'enviadas_con_problema': sum(1 for f in filas_enviadas if f.get('sql_estado') in SQL_PROBLEMAS),
+            'error_detalle': error_detalle, 'cedulas': sum(1 for *_, ced in resultados[:len(rows)] if ced)}
 
 
 def texto_corto(estado: str) -> str:
     return {SQL_OK: "✔ Existe", SQL_OTRA_FECHA: "⚠ Otra fecha", SQL_NO_EXISTE: "✖ No existe",
-            SQL_SIN_RENOVACIONES: "✖ Sin renovaciones", SQL_SUGERENCIA: "💡 Sugerencia", SQL_SIN_DATOS: "—"}.get(estado, "")
+            SQL_SIN_RENOVACIONES: "✖ Sin renovaciones", SQL_SUGERENCIA: "💡 Sugerencia", SQL_SIN_DATOS: "—",
+            SQL_APP_PLAZO: "✔ APP, plazo menor", SQL_NO_PROCEDE: "✖ No procede (otro día)"}.get(estado, "")
 
 
 # ======================= Contraseña en el Administrador de credenciales de Windows =======================
