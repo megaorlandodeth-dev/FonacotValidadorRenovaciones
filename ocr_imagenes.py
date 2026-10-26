@@ -10,6 +10,7 @@ que instalar nada. Si el equipo no lo permite, la app sigue igual y avisa que la
 
 import base64
 import hashlib
+import html as html_mod
 import os
 import re
 import subprocess
@@ -167,8 +168,47 @@ def leer_imagenes(rutas: list) -> dict:
 
 # ======================= Imágenes del correo =======================
 
-def guardar_imagenes_del_correo(msg, carpeta: str) -> list:
-    """Guarda en `carpeta` las imágenes del correo (adjuntas o pegadas en el cuerpo). Ignora logos y firmas."""
+# Imágenes ligadas en el correo (las que iTop deja en su servidor): solo de estos servidores, nunca de fuera
+SERVIDORES_IMAGENES = ("fonacot.gob.mx", "itop")
+TIEMPO_MAX_DESCARGA = 8
+TIPOS_IMAGEN = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/gif": "gif", "image/bmp": "bmp"}
+
+
+def _descargar_imagen(url: str, ruta_sin_ext: str, notas: list = None) -> str:
+    """Baja una imagen ligada en el correo (iTop). La ruta guardada o '' (no es imagen, pide sesión, sin red…)."""
+    import urllib.request
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    if not any(s in host for s in SERVIDORES_IMAGENES):
+        return ""
+    pedido = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(pedido, timeout=TIEMPO_MAX_DESCARGA) as resp:
+            tipo = (resp.headers.get_content_type() or "").lower()
+            datos = resp.read(15 * 1024 * 1024)
+    except Exception as e:
+        if notas is not None:
+            notas.append(f"no se pudo bajar la imagen de {host} ("
+                         + ("certificado no válido" if "CERTIFICATE" in str(e).upper() else type(e).__name__) + ")")
+        return ""
+    if tipo not in TIPOS_IMAGEN:
+        if notas is not None:
+            notas.append(f"la imagen de {host} pide iniciar sesión en iTop" if "html" in tipo
+                         else f"{host} no devolvió una imagen ({tipo or 'sin tipo'})")
+        return ""
+    if len(datos) < TAM_MIN_IMAGEN:
+        return ""
+    ruta = f"{ruta_sin_ext}.{TIPOS_IMAGEN[tipo]}"
+    with open(ruta, "wb") as f:
+        f.write(datos)
+    return ruta
+
+
+def guardar_imagenes_del_correo(msg, carpeta: str, notas: list = None, _nivel: int = 0) -> list:
+    """
+    Guarda en `carpeta` las imágenes del correo: adjuntas, pegadas en el cuerpo, ligadas al servidor de iTop y las
+    de un correo reenviado como adjunto (.msg). Ignora logos y firmas.
+    """
     rutas = []
     try:
         adjuntos = msg.Attachments
@@ -181,6 +221,21 @@ def guardar_imagenes_del_correo(msg, carpeta: str) -> list:
         try:
             att = adjuntos.Item(i)
             nombre = str(getattr(att, 'FileName', '') or '')
+            if _nivel == 0 and (int(getattr(att, 'Type', 1) or 1) == 5 or nombre.lower().endswith('.msg')):
+                # Correo de la sucursal reenviado como adjunto: sus imágenes también cuentan
+                ruta_msg = os.path.join(carpeta, f"adj{i}.msg")
+                att.SaveAsFile(ruta_msg)
+                interno = msg.Session.OpenSharedItem(ruta_msg)
+                try:
+                    sub = os.path.join(carpeta, f"msg{i}")
+                    os.makedirs(sub, exist_ok=True)
+                    rutas += guardar_imagenes_del_correo(interno, sub, notas, _nivel + 1)
+                finally:
+                    try:
+                        interno.Close(1)  # olDiscard
+                    except Exception:
+                        pass
+                continue
             if os.path.splitext(nombre)[1].lower() not in EXT_IMAGEN or int(getattr(att, 'Size', 0) or 0) < TAM_MIN_IMAGEN:
                 continue
             ruta = os.path.join(carpeta, f"adj{i}_{re.sub(r'[^A-Za-z0-9._-]', '_', nombre)}")
@@ -206,17 +261,28 @@ def guardar_imagenes_del_correo(msg, carpeta: str) -> list:
         with open(ruta, "wb") as f:
             f.write(datos)
         rutas.append(ruta)
-    return rutas
+    # Ligadas al servidor (iTop guarda ahí las imágenes de la descripción del incidente)
+    vistas = set()
+    for n, m in enumerate(re.finditer(r'<img\b[^>]*?\bsrc=["\'](https?://[^"\']+)["\']', html, re.I)):
+        url = html_mod.unescape(m.group(1))
+        if len(rutas) >= MAX_IMAGENES_POR_CORREO or url in vistas:
+            continue
+        vistas.add(url)
+        ruta = _descargar_imagen(url, os.path.join(carpeta, f"ligada{n}"), notas)
+        if ruta:
+            rutas.append(ruta)
+    return rutas[:MAX_IMAGENES_POR_CORREO]
 
 
-def leer_correo(msg) -> tuple:
+def leer_correo(msg, notas: list = None) -> tuple:
     """
     Lee las imágenes del correo de un incidente. Devuelve (lecturas, número de imágenes): una lectura
     {'cliente', 'credito', 'imagen', 'texto', 'dudosa'} por imagen en la que se encontró algún dato.
+    En `notas` deja lo que no se pudo bajar o abrir (para explicarlo en pantalla).
     Lanza OCRNoDisponible si el OCR de Windows no se puede usar en este equipo.
     """
     with tempfile.TemporaryDirectory(prefix="fonacot_correo_") as tmp:
-        rutas = guardar_imagenes_del_correo(msg, tmp)
+        rutas = guardar_imagenes_del_correo(msg, tmp, notas)
         if not rutas:
             return [], 0
         leidas = leer_imagenes(rutas)

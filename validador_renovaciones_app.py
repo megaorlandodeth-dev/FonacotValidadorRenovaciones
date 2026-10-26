@@ -34,7 +34,7 @@ from sql_renovaciones import (
     SQL_NO_PROCEDE,
     LEYENDA_NO_PROCEDE,
 )
-from calendario_cedulas import actualizar_calendario, marcar_bloqueos
+from calendario_cedulas import actualizar_calendario, marcar_bloqueos, cortes_alrededor
 from core_renovaciones import (
     build_itop_url,
     build_itop_search_url,
@@ -66,7 +66,7 @@ from lote_utils import (
 )
 
 
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"),
@@ -138,6 +138,7 @@ HINT_EXTRAER = "Lee Outlook y arma el lote del día  ·  F5"
 TIPOS_REVISION = ("Lote del día", "Revisión semanal")
 
 MODOS = {"CONCENTRADO": "Concentrado", "AGENTE": "Por compañero"}
+DIAS_SEMANA = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
 
 # Mismo asunto que el correo que ya se envía: "Cancelación de renovaciones – ticket único 22-10-2026"
 ASUNTO_BORRADOR_DEFAULT = "Cancelación de renovaciones – ticket único {fecha}"
@@ -428,6 +429,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._auto_job = None
         self._search_job = None
         self._aviso_corte_dia = None
+        self._bloqueadas_avisadas = 0
         self._sort_state = {}
         self._headers = {}
         self._celdas_completas = {}   # {(iid, columna): texto completo} para el tooltip de celdas resumidas
@@ -441,6 +443,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.after(300, self._init_accounts)
         self.after(500, self._tick_clock)
         self.after(800, self._schedule_auto_refresh)
+        self.after(1500, lambda: self._recordatorio_emision(auto=True))
 
     # ================= CONFIGURACIÓN =================
 
@@ -460,6 +463,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "dias_atras_lote": DIAS_ATRAS_LOTE,
             # Capturas de pantalla en los incidentes (OCR de Windows) y validación en la base (Oracle)
             "leer_imagenes": True,
+            # Recordatorio del calendario de emisión: se abre solo cuando faltan estos días (o menos) para un corte
+            "aviso_emision_dias": 5,
+            "recordatorio_emision_visto": "",
             "sql_activo": False,
             "sql_servidor": "",
             "sql_usuario": "",
@@ -639,6 +645,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.grid(row=0, column=2, padx=20, sticky="e")
         # Reloj y estado del ticket único de hoy
+        self.lbl_corte = ctk.CTkLabel(
+            right, text="", font=F(12, True), height=28, corner_radius=14, fg_color=COL["track"],
+            text_color=COL["text_2"], cursor="hand2"
+        )
+        self.lbl_corte.pack(side="left", padx=(0, 10), ipadx=12)
+        self.lbl_corte.bind("<Button-1>", lambda e: self._recordatorio_emision())
         self.lbl_clock = ctk.CTkLabel(
             right, text="--:--", font=F(12, True), height=28, corner_radius=14,
             fg_color=COL["track"], text_color=COL["text_2"]
@@ -1267,7 +1279,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         for d in dias:
             envios = "  ·  ".join(f"{rec:%H:%M} {rem} ({n} renglones)" for rec, rem, n in d['envios'])
             if not envios:
-                envios = "Día inhábil" if not d['habil'] else ("No se encontró ticket único" if d['debian'] else "Sin ticket único")
+                envios = ("Sin guardia: lo que llegó va en el ticket único del lunes" if d['dia'].weekday() == 5
+                          and not d['habil'] else "Día inhábil" if not d['habil'] else
+                          "No se encontró ticket único" if d['debian'] else "Sin ticket único")
             iid = f"DIA_{d['dia']:%Y%m%d}"
             self._celdas_completas[(iid, "envios")] = envios
             malos = d['no_enviadas'] or d['errores']
@@ -1533,12 +1547,15 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             self._periodo_pendiente()
 
     def _revisar_semana(self, semanas_atras: int = 0):
-        """Pone de lunes a viernes de la semana (la actual llega hasta hoy); se busca con «Extraer y validar»."""
+        """
+        Pone de lunes a sábado de la semana (la actual llega hasta hoy): el sábado también llegan incidentes y, si hay
+        guardia, sale ticket único. Se busca con «Extraer y validar».
+        """
         hoy = datetime.now().date()
         lunes = hoy - timedelta(days=hoy.weekday() + 7 * semanas_atras)
-        viernes = lunes + timedelta(days=4)
+        sabado = lunes + timedelta(days=5)
         self.cal_start.set_date(lunes)
-        self.cal_end.set_date(min(viernes, hoy) if semanas_atras == 0 else viernes)
+        self.cal_end.set_date(min(sabado, hoy) if semanas_atras == 0 else sabado)
         self.seg_tipo.set(TIPOS_REVISION[1])
         self._periodo_pendiente()
 
@@ -1636,8 +1653,106 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             text = f"{now:%H:%M}  ·  Ticket único de hoy pendiente: lo que llegue aún entra hoy"
             bg, fg = COL["warning_soft"], COL["warning"]
         self.lbl_clock.configure(text=text, fg_color=bg, text_color=fg)
+        self._actualizar_chip_corte()
         if reschedule:
             self.after(20000, self._tick_clock)
+
+    # ================= RECORDATORIO DEL CALENDARIO DE EMISIÓN =================
+
+    @staticmethod
+    def _cuando(fecha, hoy) -> str:
+        dias = (fecha - hoy).days
+        return "HOY" if dias == 0 else "mañana" if dias == 1 else f"en {dias} días"
+
+    def _actualizar_chip_corte(self):
+        hoy = datetime.now().date()
+        _, proximos = cortes_alrededor(hoy, 1)
+        if not proximos:
+            self.lbl_corte.pack_forget()
+            return
+        fecha, texto = proximos[0]
+        dias = (fecha - hoy).days
+        corto = "Emisión" if "emisión" in texto else "Cierre de mes"
+        bg, fg = ((COL["danger_soft"], COL["danger"]) if dias <= 1 else
+                  (COL["warning_soft"], COL["warning"]) if dias <= int(self.config_data.get("aviso_emision_dias") or 5)
+                  else (COL["track"], COL["text_2"]))
+        self.lbl_corte.configure(text=f"📅 {corto} {fecha:%d/%m} ({self._cuando(fecha, hoy)})", fg_color=bg, text_color=fg)
+
+    def _recordatorio_emision(self, auto: bool = False):
+        """
+        Ventana con el próximo corte del calendario de emisión (generación de la emisión o cierre de mes) y lo que
+        implica. Sola: una vez al día cuando faltan pocos días para el corte o acaba de pasar uno, y cuando el lote
+        trae renovaciones que ya no se pueden cancelar. Siempre: con clic en el aviso de la barra de arriba.
+        """
+        hoy = datetime.now().date()
+        ultimo, proximos = cortes_alrededor(hoy, 2)
+        if not proximos:
+            return
+        en_lote = [r for r in self.all_rows if r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA)
+                   and r.get('Row_ID') not in self.discarded_row_ids]
+        bloqueadas = [r for r in en_lote if r.get('Bloqueo_Emision')]
+        if auto:
+            dias_aviso = int(self.config_data.get("aviso_emision_dias") or 5)
+            toca = ((proximos[0][0] - hoy).days <= dias_aviso or (ultimo and (hoy - ultimo[0]).days <= 2))
+            visto = self.config_data.get("recordatorio_emision_visto") == hoy.isoformat()
+            nuevas = len(bloqueadas) > self._bloqueadas_avisadas
+            if not ((toca and not visto) or nuevas):
+                return
+        self._bloqueadas_avisadas = len(bloqueadas)
+        self.config_data["recordatorio_emision_visto"] = hoy.isoformat()
+        self._save_config()
+
+        fecha, texto = proximos[0]
+        win = ctk.CTkToplevel(self)
+        win.title("Recordatorio: calendario de emisión")
+        win.resizable(False, False)
+        win.transient(self)
+        win.configure(fg_color=COL["surface"])
+        urgente = (fecha - hoy).days <= 1 or bloqueadas
+        ctk.CTkFrame(win, height=6, corner_radius=0, fg_color="#DC2626" if urgente else "#F59E0B").pack(fill="x")
+        cuerpo = ctk.CTkFrame(win, fg_color="transparent")
+        cuerpo.pack(fill="both", padx=28, pady=(18, 8))
+
+        def renglon(t, fuente=F(12), color=COL["text"], arriba=6):
+            ctk.CTkLabel(cuerpo, text=t, font=fuente, text_color=color, justify="left", anchor="w",
+                         wraplength=520).pack(fill="x", pady=(arriba, 0))
+
+        renglon("📅  Calendario de emisión", F(17, True), arriba=0)
+        renglon(f"Próximo corte: {texto}, {DIAS_SEMANA[fecha.weekday()]} {fecha:%d/%m/%Y} "
+                f"({self._cuando(fecha, hoy)}).", F(14, True), "#B91C1C" if urgente else COL["warning"], 12)
+        renglon(f"Las renovaciones dadas de alta hasta el {fecha:%d/%m} cuyo incidente llegue después de ese día ya "
+                f"no se podrán cancelar. Lo que llegue a más tardar el {fecha:%d/%m} sí se manda, aunque salga en el "
+                f"ticket único del siguiente día hábil.")
+        if len(proximos) > 1:
+            f2, t2 = proximos[1]
+            renglon(f"Después: {t2}, {DIAS_SEMANA[f2.weekday()]} {f2:%d/%m/%Y} ({self._cuando(f2, hoy)}).",
+                    color=COL["text_2"], arriba=10)
+        if ultimo and (hoy - ultimo[0]).days <= 7:
+            renglon(f"Corte reciente: {ultimo[1]}, el {ultimo[0]:%d/%m}. Lo dado de alta hasta ese día y pedido "
+                    f"después ya no se puede cancelar.", color=COL["text_2"], arriba=10)
+        if bloqueadas:
+            tickets = sorted({r['Numero_Ticket'] for r in bloqueadas})
+            renglon(f"⚠️  En el lote hay {len(bloqueadas)} renovación(es) que ya NO se pueden cancelar: "
+                    f"{', '.join(tickets[:8])}{'…' if len(tickets) > 8 else ''}.", F(13, True), "#B91C1C", 14)
+        elif not self.var_sql.get():
+            renglon("Para que la app marque cuáles ya no se pueden cancelar, activa «Validar en la base de datos» "
+                    "(necesita la fecha de alta de cada renovación).", color=COL["muted"], arriba=14)
+        botones = ctk.CTkFrame(win, fg_color="transparent")
+        botones.pack(fill="x", padx=28, pady=(10, 20))
+        self._btn(botones, "Entendido", win.destroy, "primary").pack(side="right", ipadx=12)
+        if bloqueadas:
+            def ver():
+                win.destroy()
+                self._apply_filter(FILTRO_EMISION)
+            self._btn(botones, "Ver las que ya no se pueden cancelar", ver, "secondary").pack(side="right", padx=(0, 8))
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.attributes("-topmost", True)
+        win.after(200, lambda: (win.winfo_exists() and win.focus_force()))
+        if urgente:
+            self.bell()
 
     def _aviso_corte(self, mins: int):
         active_rows, _ = self._get_active_and_filtered_rows()
@@ -1848,6 +1963,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             msg += f"  ·  {len(cerradas)} ticket(s) ya cerrados en iTop"
         self.lbl_status.configure(text=msg)
         self._aprender_texto_correo(lote_info)
+        if not (lote_info and lote_info.get('revision')):
+            self.after(300, lambda: self._recordatorio_emision(auto=True))
 
         if self.new_keys:
             nuevas = sum(1 for r in active_rows if self._key_by_rid.get(r['Row_ID']) in self.new_keys)
@@ -2444,6 +2561,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             box.insert("end", "\n")
         if r.get('Bloqueo_Emision'):
             box.insert("end", f"Emisión: {r['Bloqueo_Emision']}\n\n", "error")
+        if r.get('Imagen_Info') and not r.get('Dato_Imagen'):
+            box.insert("end", f"Imagen: {r['Imagen_Info']}.\n\n", "warn")
         if r.get('SQL_Detalle') or r.get('Dato_Imagen') or r.get('SQL_Cedula'):
             if r.get('SQL_Cedula'):
                 box.insert("end", f"Cédula: {r['SQL_Cedula']}\n", "warn")

@@ -403,6 +403,7 @@ class FonacotRenovacionesEngine:
         end_dt = datetime(fecha_fin.year, fecha_fin.month, fecha_fin.day, 23, 59, 59)
         extended_end_dt = end_dt + timedelta(hours=12)
         self.ocr_info = {'completadas': 0, 'sin_leer': [], 'error': ''}
+        self._correos_por_ticket = {}  # todos los correos de cada incidente (las imágenes pueden venir en otro)
 
         effective_general_mode = modo_concentrador_general or not gafetes_filter
 
@@ -492,6 +493,11 @@ class FonacotRenovacionesEngine:
                     subj_low = subject.lower()
                     if 'i-' not in subj_low and 'ticket' not in subj_low:
                         continue
+                    m_ticket = re.search(r'\b[IR]-\d{5,7}\b', subject, re.I)
+                    if m_ticket:
+                        correos = self._correos_por_ticket.setdefault(m_ticket.group(0).upper(), [])
+                        if len(correos) < 8:
+                            correos.append(msg)
 
                     is_assign, gafete, agente, ticket_num = RenovacionTicketParser.is_official_assignment_email(subject, "", "")
                     if not is_assign and ('asignado al agente' in subj_low or 'se te asign' in subj_low):
@@ -721,21 +727,49 @@ class FonacotRenovacionesEngine:
         return all_renewal_rows, tickets_summary_list
 
     def _completar_con_imagenes(self, msg, rows: list, ticket: str) -> list:
-        """Lee con OCR las imágenes del correo y completa el dato que falta (ver core.completar_con_imagenes)."""
+        """
+        Lee con OCR las imágenes del correo y completa el dato que falta (ver core.completar_con_imagenes). Si en
+        ese correo no hay imágenes, prueba con los demás correos del mismo incidente (la asignación original, la
+        reasignación, la nota de iTop…). Si no se pudo, deja en 'Imagen_Info' por qué, para verlo en pantalla.
+        """
         if self.ocr_info['error']:
+            for r in rows:
+                if r['Datos_Incompletos']:
+                    r['Imagen_Info'] = f"No se pudieron leer las imágenes en este equipo: {self.ocr_info['error']}"
             return rows  # el OCR no está disponible en este equipo: no se reintenta en cada correo
-        try:
-            lecturas, n_imagenes = leer_correo(msg)
-        except OCRNoDisponible as e:
-            self.ocr_info['error'] = str(e)
-            return rows
-        except Exception:
-            return rows
+        correos = [msg] + [m for m in getattr(self, '_correos_por_ticket', {}).get(ticket.upper(), []) if m is not msg]
+        lecturas, n_imagenes, notas, error = [], 0, [], ''
+        for correo in correos:
+            try:
+                leidas, n = leer_correo(correo, notas)
+            except OCRNoDisponible as e:
+                self.ocr_info['error'] = str(e)
+                error = str(e)
+                break
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+                continue
+            n_imagenes += n
+            if leidas:
+                lecturas = leidas
+                break
         if lecturas:
             rows = completar_con_imagenes(rows, lecturas)
             self.ocr_info['completadas'] += sum(1 for r in rows if r.get('Dato_Imagen'))
-        if n_imagenes and any(r['Datos_Incompletos'] for r in rows):
-            self.ocr_info['sin_leer'].append(ticket)
+        if any(r['Datos_Incompletos'] for r in rows):
+            if n_imagenes:
+                self.ocr_info['sin_leer'].append(ticket)
+                info = (f"Se leyeron {n_imagenes} imagen(es) del incidente y no se encontró el No. de cliente ni el "
+                        f"No. de crédito (revisa la imagen en el correo o en iTop)")
+            elif error:
+                info = f"No se pudieron leer las imágenes: {error}"
+            else:
+                info = (f"No se encontró ninguna imagen en {len(correos)} correo(s) del incidente"
+                        + (f" ({'; '.join(dict.fromkeys(notas))})" if notas else "")
+                        + ": si la captura solo está en iTop, revísala ahí")
+            for r in rows:
+                if r['Datos_Incompletos']:
+                    r['Imagen_Info'] = info
         return rows
 
     @staticmethod
