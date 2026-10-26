@@ -512,6 +512,39 @@ class RenovacionTicketParser:
 
         return records
 
+    # Palabras que no son parte de un nombre: si aparecen, el número es de otra cosa (crédito, folio, teléfono…)
+    _NO_NOMBRE = re.compile(
+        r'^(CR[EÉ]DITOS?|RENOVAD[OA]S?|RENOVACI[OÓ]N(ES)?|CLIENTE|TRABAJADOR[A]?|SOLICITUD|FOLIO|GAFETE|TEL[EÉ]FONO|'
+        r'TEL|CEL|NSS|CURP|RFC|SUC|SUCURSAL|ANALISTA|INCIDENTE|TICKET|PAGAR[EÉ]|OPERACI[OÓ]N|CUENTA|FECHA|NO|NUM|'
+        r'N[UÚ]MERO|ID|CANCELAR|CANCELACI[OÓ]N|EMPRESA|CENTRO|TRABAJO|ORIGINAL|ANTERIOR|NUEVO|HIJO|PADRE)$', re.I)
+
+    @classmethod
+    def _clientes_junto_al_nombre(cls, texto: str) -> list:
+        """
+        Números de 6 a 8 dígitos pegados a un nombre en mayúsculas o con mayúscula inicial (al menos 2 palabras),
+        antes o después: «LUIS RENE MENDEZ ZUÑIGA 6650919», «6650919 Luis Rene Mendez». Sin etiqueta «cliente».
+        """
+        palabra = r"[A-ZÁÉÍÓÚÑÜ][A-Za-zÁÉÍÓÚÑÜáéíóúñü]+"
+        encontrados = []
+        for linea in str(texto or '').splitlines():
+            for m in re.finditer(rf'((?:{palabra}[ \t]+){{1,5}}{palabra})[ \t,:\-]+(\d{{6,8}})\b(?![/\-\.]\d)', linea):
+                nombre, num = m.group(1), m.group(2)
+                if any(cls._NO_NOMBRE.match(p) for p in nombre.split()):
+                    continue
+                encontrados.append(num)
+            for m in re.finditer(rf'(?<![\d/\-\.])\b(\d{{6,8}})[ \t,:\-]+((?:{palabra}[ \t]+){{1,5}}{palabra})', linea):
+                num, nombre = m.group(1), m.group(2)
+                antes = linea[:m.start()].split()
+                if any(cls._NO_NOMBRE.match(p) for p in nombre.split()[:2]) or (
+                        antes and cls._NO_NOMBRE.match(antes[-1].strip(':.#'))):
+                    continue
+                encontrados.append(num)
+
+        def es_fecha(n):  # 26102026 / 20261026
+            return len(n) == 8 and (re.fullmatch(r'(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])20\d\d', n)
+                                    or re.fullmatch(r'20\d\d(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', n))
+        return [n for i, n in enumerate(encontrados) if n not in encontrados[:i] and not es_fecha(n)]
+
     @classmethod
     def extract_disaggregated_renewals(cls, resumen: str, descripcion: str, inner_tables: list) -> list:
         """
@@ -589,6 +622,12 @@ class RenovacionTicketParser:
                 if len(c_num) == 9 and c_num.startswith(('507', '508')):
                     continue
                 if cls._is_valid_number_token(c_num, 5, 10) and c_num not in clientes_found and c_num not in creditos_padre_found:
+                    clientes_found.append(c_num)
+
+        # Sin etiqueta: el número del trabajador junto a su nombre ("LUIS RENE MENDEZ ZUÑIGA 6650919")
+        if not clientes_found:
+            for c_num in cls._clientes_junto_al_nombre(full_context):
+                if c_num not in clientes_found and c_num not in creditos_padre_found:
                     clientes_found.append(c_num)
 
         # Buscar en tabla estilo texto: "CLIENTE CREDITO ... 4951216 45730"
@@ -1160,18 +1199,7 @@ def extract_concentrado_rows(html: str) -> list:
         for tr in tbl.find_all('tr'):
             raw = [c.get_text(" ", strip=True) for c in tr.find_all(['td', 'th'])]
             if cols is None:
-                idx = {}
-                for i, cell in enumerate(normalize_text(c) for c in raw):
-                    if 'ticket' not in idx and re.search(r'incidente|ticket|folio', cell):
-                        idx['ticket'] = i
-                    elif 'cliente' not in idx and 'cliente' in cell:
-                        idx['cliente'] = i
-                    elif 'credito' not in idx and 'credito' in cell:
-                        idx['credito'] = i
-                    elif 'fecha' not in idx and 'fecha' in cell:
-                        idx['fecha'] = i
-                if {'cliente', 'credito'} <= idx.keys():
-                    cols = idx
+                cols = _columnas_concentrado([normalize_text(c) for c in raw])
                 continue
 
             def val(campo):
@@ -1179,12 +1207,41 @@ def extract_concentrado_rows(html: str) -> list:
                 return raw[i] if i is not None and i < len(raw) else ''
 
             cli = first_digits(strip_letter_prefixes(val('cliente')))
-            cred = first_digits(strip_letter_prefixes(val('credito')))
-            if not cli and not cred:
+            # La celda puede traer varios créditos del mismo cliente ("35237 y 35238")
+            creditos = [n.lstrip('0') for n in re.findall(r'(?<!\d)\d{3,7}(?!\d)', strip_letter_prefixes(val('credito')))]
+            if not cli and not creditos:
                 continue
-            filas.append({'ticket': ticket_key(val('ticket')) if re.search(r'\d', val('ticket')) else '',
-                          'fecha': val('fecha'), 'cliente': cli, 'credito': cred})
+            for cred in creditos or ['']:
+                filas.append({'ticket': ticket_key(val('ticket')) if re.search(r'\d', val('ticket')) else '',
+                              'fecha': val('fecha'), 'cliente': cli, 'credito': cred})
     return filas
+
+
+def _columnas_concentrado(encabezados: list) -> dict:
+    """
+    {'ticket', 'cliente', 'credito', 'fecha': índice} del renglón de encabezados, o None si no lo es. Con varias
+    columnas de crédito se toma la del crédito renovado (hijo / a cancelar), no la del origen; con varias de cliente,
+    la del número (no la del nombre).
+    """
+    idx, puntos = {}, {}
+
+    def poner(campo, i, valor):
+        if valor > puntos.get(campo, -1):
+            idx[campo], puntos[campo] = i, valor
+
+    for i, cell in enumerate(encabezados):
+        if re.search(r'incidente|ticket|folio', cell):
+            poner('ticket', i, 1)
+        elif 'cliente' in cell or 'trabajador' in cell or cell in ('cuenta', 'no. cuenta'):
+            poner('cliente', i, 0 if 'nombre' in cell else 2 if re.search(r'\bno\b|num|cuenta|#', cell) else 1)
+        elif 'credito' in cell or 'renovacion' in cell or 'pagare' in cell:
+            if re.search(r'padre|origen|anterior|original|antes', cell):
+                poner('credito', i, 0)
+            else:
+                poner('credito', i, 2 if re.search(r'hijo|renov|cancel|nuevo|pagare', cell) else 1)
+        elif 'fecha' in cell:
+            poner('fecha', i, 1)
+    return idx if {'cliente', 'credito'} <= idx.keys() else None
 
 
 def extract_concentrado_intro(plain_body: str) -> str:
@@ -1228,21 +1285,43 @@ def _row_match_concentrado(row: dict, concentrados: list):
     return None, None
 
 
+def _junto_al_ticket(texto: str, ticket: str, numeros: list, renglones_tabla=()) -> bool:
+    """
+    ¿Vienen todos los `numeros` justo después del folio (antes del siguiente folio, a menos de 150 caracteres)?
+    Se salta la aparición que es el renglón de la tabla (`renglones_tabla`: [(cliente, crédito)] de ese folio).
+    """
+    if not texto or not ticket or not numeros:
+        return False
+    for m in re.finditer(rf'(?<!\d)0*{re.escape(ticket)}(?!\d)', texto):
+        tramo = re.split(r'\b[IR]\s*-\s*\d{3,}', texto[m.end():m.end() + 150], maxsplit=1)[0]
+        orden = [n.lstrip('0') for n in re.findall(r'\d{3,10}', strip_letter_prefixes(tramo))]
+        if any(c in orden[:4] and cr in orden[:4] for c, cr in renglones_tabla):
+            continue
+        if all(n in orden for n in numeros):
+            return True
+    return False
+
+
 def _match_en_concentrado(row: dict, conc: dict):
     """'PAR' si la renovación (Cliente+Crédito) viene en este concentrado, 'TICKET' si solo viene su ticket, None si no."""
     cli = '' if str(row.get('Numero_Cliente', '')).startswith('SIN') else first_digits(row.get('Numero_Cliente'))
     cred = '' if str(row.get('Credito_Renovado_Hijo', '')).startswith('SIN') else first_digits(row.get('Credito_Renovado_Hijo'))
     ticket = first_digits(row.get('Numero_Ticket'))
     filas = conc.get('filas') or []
-    if filas:
-        for f in filas:
-            if cli and cred and f['cliente'] == cli and f['credito'] == cred:
-                return 'PAR'
-            if not cli and ticket and cred and f['credito'] == cred and first_digits(f['ticket']) == ticket:
-                return 'PAR'
-            if cli and not cred and ticket and f['cliente'] == cli and first_digits(f['ticket']) == ticket:
-                return 'PAR'  # Sin crédito: basta su ticket con su mismo cliente (no cualquier renglón del ticket)
-    elif cli and cred and cli in conc['numeros'] and cred in conc['numeros']:
+    for f in filas:
+        if cli and cred and f['cliente'] == cli and f['credito'] == cred:
+            return 'PAR'
+        if not cli and ticket and cred and f['credito'] == cred and first_digits(f['ticket']) == ticket:
+            return 'PAR'
+        if cli and not cred and ticket and f['cliente'] == cli and first_digits(f['ticket']) == ticket:
+            return 'PAR'  # Sin crédito: basta su ticket con su mismo cliente (no cualquier renglón del ticket)
+    # El renglón viene escrito fuera de la tabla (otra lista, otro formato de quien lo mandó): «I-362605 6572804 35238»
+    del_ticket = [(f['cliente'], f['credito']) for f in filas if f.get('ticket') and first_digits(f['ticket']) == ticket]
+    if ticket and cred and _junto_al_ticket(conc.get('texto'), ticket, [n for n in (cli, cred) if n], del_ticket):
+        return 'PAR'
+    # Sin tabla legible, o el ticket no viene en ella: cuenta si el Cliente y el Crédito están en el correo
+    en_la_tabla = ticket and any(first_digits(f['ticket']) == ticket for f in filas if f.get('ticket'))
+    if not en_la_tabla and cli and cred and cli in conc['numeros'] and cred in conc['numeros']:
         return 'PAR'
     if ticket and ticket in conc['tickets']:
         return 'TICKET'
@@ -1343,7 +1422,12 @@ def concentrado_semanal(concentrados: list, rows: list, fecha_inicio: date, fech
                 error = error or f"el incidente {incidente} no tiene Cliente {f['cliente']} Crédito {f['credito']}"
             clave = (f['cliente'], f['credito'])
             vistos[clave] = vistos.get(clave, 0) + 1
+            # Día en que se pidió (para la base): el de llegada del incidente; si no se encontró, puede ser del día
+            # hábil anterior (llegó después del envío del ticket único de ese día)
+            llegadas = [r.get('Fecha_Llegada_DT') or r.get('Fecha_DT') for r in por_ticket.get(first_digits(incidente), [])]
+            llegada = next((x.date() if isinstance(x, datetime) else x for x in llegadas if x), None)
             filas.append({
+                'llegada': llegada, 'desde': previous_business_day(dia),
                 'fecha': dia, 'recibido': c.get('recibido'), 'asunto': c.get('asunto', ''),
                 'ticket': f['ticket'], 'cliente': f['cliente'], 'credito': f['credito'],
                 'incidente': incidente, 'error': error, 'en_periodo': dia <= fecha_fin,

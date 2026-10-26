@@ -21,12 +21,18 @@ from sql_renovaciones import (
     leer_password,
     guardar_password,
     borrar_password,
+    servidor_de,
+    separar_servidor,
     ErrorSQL,
     TABLA_DEFAULT,
     SQL_PROBLEMAS,
     SQL_SUGERENCIA,
     SQL_OTRA_FECHA,
+    SQL_APP_PLAZO,
+    SQL_NO_PROCEDE,
+    LEYENDA_NO_PROCEDE,
 )
+from calendario_cedulas import actualizar_calendario, marcar_bloqueos
 from core_renovaciones import (
     build_itop_url,
     build_itop_search_url,
@@ -36,6 +42,7 @@ from core_renovaciones import (
     set_dias_inhabiles,
     HORA_CORTE_DEFAULT,
     ASUNTO_CONCENTRADO_DEFAULT,
+    LOTE_HOY,
     LOTE_REZAGADA,
     LOTE_ENVIADA,
     LOTE_EN_CONCENTRADO,
@@ -57,7 +64,7 @@ from lote_utils import (
 )
 
 
-APP_VERSION = "2.5"
+APP_VERSION = "2.6"
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"),
@@ -116,10 +123,11 @@ FILTRO_TARDE = "Enviadas tarde"
 FILTRO_SIN_COMPROBAR = "Sin comprobar"
 FILTRO_ERRORES = "Datos equivocados en el ticket único"
 FILTRO_SQL = "No cuadran con la base (SQL)"
+FILTRO_EMISION = "Ya no se pueden cancelar (emisión)"
 OTRAS_VISTAS = "Otras vistas"
 
 FILTROS_PRINCIPALES = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_MULTIPLES, FILTRO_REZAGADAS, FILTRO_NUEVAS]
-FILTROS_SECUNDARIOS = [FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE, FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS,
+FILTROS_SECUNDARIOS = [FILTRO_EMISION, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE, FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS,
                        FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_PAPELERA]
 # Vistas que muestran filas aunque estén fuera del lote de hoy (revisión de envíos)
 FILTROS_REVISION = (FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE,
@@ -476,7 +484,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "feriados_oficiales": bool(self.var_oficiales.get()),
                 "leer_imagenes": bool(self.var_ocr.get()),
                 "sql_activo": bool(self.var_sql.get()),
-                "sql_servidor": self.ent_sql_servidor.get().strip(),
+                "sql_host": self.ent_sql_host.get().strip(),
+                "sql_puerto": self.ent_sql_puerto.get().strip() or "1521",
+                "sql_servicio": self.ent_sql_servicio.get().strip(),
+                "sql_servidor": self._sql_servidor(),
                 "sql_usuario": self.ent_sql_usuario.get().strip(),
                 "sql_tabla": self.ent_sql_tabla.get().strip() or TABLA_DEFAULT,
                 "sql_recordar": bool(self.var_sql_recordar.get()),
@@ -495,7 +506,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
     def _guardar_password_sql(self):
         """La contraseña nunca va al archivo de configuración: si se pide recordarla, va al Administrador de credenciales."""
         try:
-            usuario, servidor = self.ent_sql_usuario.get().strip(), self.ent_sql_servidor.get().strip()
+            usuario, servidor = self.ent_sql_usuario.get().strip(), self._sql_servidor()
             password = self.ent_sql_password.get()
         except Exception:
             return
@@ -772,28 +783,36 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             sec, text="Validar en la base de datos", variable=self.var_sql, onvalue=True, offvalue=False,
             font=F(12), switch_width=36, switch_height=18
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(14, 0))
-        self.ent_sql_servidor = self._field(sec, 3, "Servidor (como en SQL Developer)",
-                                            self.config_data.get("sql_servidor", ""), "host:1521/servicio")
-        self.ent_sql_usuario = self._field(sec, 5, "Usuario", self.config_data.get("sql_usuario", ""), "Usuario de la base")
-        self.ent_sql_password = self._field(sec, 7, "Contraseña", "", "No se guarda en la configuración")
+        # Como en SQL Developer (tipo de conexión «Básico»): Nombre del host, Puerto y Nombre del servicio
+        host, puerto, servicio = (self.config_data.get("sql_host", ""), self.config_data.get("sql_puerto", ""),
+                                  self.config_data.get("sql_servicio", ""))
+        if not host and self.config_data.get("sql_servidor"):
+            host, puerto, servicio = separar_servidor(self.config_data["sql_servidor"])
+        self.ent_sql_host = self._field(sec, 3, "Nombre del host", host, "servidor.fonacot.gob.mx")
+        self.ent_sql_puerto = self._field(sec, 5, "Puerto", puerto or "1521", "1521", width=90)
+        self.ent_sql_servicio = self._field(sec, 7, "Nombre del servicio", servicio, "Como en SQL Developer")
+        self.ent_sql_usuario = self._field(sec, 9, "Usuario", self.config_data.get("sql_usuario", ""), "Usuario de la base")
+        self.ent_sql_password = self._field(sec, 11, "Contraseña", "", "No se guarda en la configuración")
         self.ent_sql_password.configure(show="•")
         self.var_sql_recordar = tk.BooleanVar(value=self.config_data.get("sql_recordar", False))
         if self.var_sql_recordar.get():
-            guardada = leer_password(self.config_data.get("sql_usuario", ""), self.config_data.get("sql_servidor", ""))
+            guardada = (leer_password(self.config_data.get("sql_usuario", ""), self._sql_servidor())
+                        or leer_password(self.config_data.get("sql_usuario", ""), self.config_data.get("sql_servidor", "")))
             if guardada:
                 self.ent_sql_password.insert(0, guardada)
         ctk.CTkCheckBox(
             sec, text="Recordar contraseña en Windows", variable=self.var_sql_recordar,
             font=F(12), checkbox_width=18, checkbox_height=18
-        ).grid(row=9, column=0, columnspan=2, pady=(8, 0), sticky="w")
-        self.ent_sql_tabla = self._field(sec, 10, "Tabla", self.config_data.get("sql_tabla") or TABLA_DEFAULT, TABLA_DEFAULT)
+        ).grid(row=13, column=0, columnspan=2, pady=(8, 0), sticky="w")
+        self.ent_sql_tabla = self._field(sec, 14, "Tabla", self.config_data.get("sql_tabla") or TABLA_DEFAULT, TABLA_DEFAULT)
         self._btn(sec, "Probar conexión", self._probar_sql, "secondary", height=28, font=F(12)).grid(
-            row=12, column=0, sticky="w", pady=(10, 0))
+            row=16, column=0, sticky="w", pady=(10, 0))
         self.lbl_sql_estado = ctk.CTkLabel(
-            sec, text="Solo consulta FECHA_ALTA, CUENTA y NO_RENOVACION.", font=F(11), text_color=COL["muted"],
+            sec, text="Solo consulta (SELECT): CR_RENOVACIONES y, para las de otro día, SALDOS, CR_DISPOSICIONES y "
+                      "CR_CEDULAS_DETALLE.", font=F(11), text_color=COL["muted"],
             justify="left", anchor="w", wraplength=230
         )
-        self.lbl_sql_estado.grid(row=13, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.lbl_sql_estado.grid(row=17, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Correo del lote
         sec = self._section(side, "Correo del lote")
@@ -1393,24 +1412,31 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.lbl_extract_hint.configure(text=f"{que}: pulsa «Extraer y validar» (F5) para buscar",
                                         text_color=COL["primary"])
 
-    def _sql_params(self) -> dict:
-        """Datos de conexión si la validación en la base está activa (None si no)."""
-        if not self.var_sql.get():
-            return None
+    def _sql_servidor(self) -> str:
+        """«host:puerto/servicio» con lo que está en los campos (o en la configuración, antes de crearlos)."""
+        if not hasattr(self, "ent_sql_servicio"):
+            return servidor_de(self.config_data.get("sql_host", ""), self.config_data.get("sql_puerto", ""),
+                               self.config_data.get("sql_servicio", ""))
+        return servidor_de(self.ent_sql_host.get(), self.ent_sql_puerto.get(), self.ent_sql_servicio.get())
+
+    def _sql_conexion(self) -> dict:
         return {
-            "servidor": self.ent_sql_servidor.get().strip(),
+            "servidor": self._sql_servidor(),
             "usuario": self.ent_sql_usuario.get().strip(),
             "password": self.ent_sql_password.get(),
             "tabla": self.ent_sql_tabla.get().strip() or TABLA_DEFAULT,
             "cliente_oracle": self.config_data.get("sql_cliente_oracle", ""),
         }
 
+    def _sql_params(self) -> dict:
+        """Datos de conexión si la validación en la base está activa (None si no)."""
+        return self._sql_conexion() if self.var_sql.get() else None
+
     def _probar_sql(self):
-        p = {
-            "servidor": self.ent_sql_servidor.get().strip(), "usuario": self.ent_sql_usuario.get().strip(),
-            "password": self.ent_sql_password.get(), "tabla": self.ent_sql_tabla.get().strip() or TABLA_DEFAULT,
-            "cliente_oracle": self.config_data.get("sql_cliente_oracle", ""),
-        }
+        p = self._sql_conexion()
+        if not (p["servidor"] and self.ent_sql_servicio.get().strip()):
+            self._sql_probado("Escribe el Nombre del host y el Nombre del servicio (los mismos de SQL Developer).", False)
+            return
         self.lbl_sql_estado.configure(text="Probando conexión…", text_color=COL["muted"])
 
         def trabajo():
@@ -1633,7 +1659,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             if not auto:
                 messagebox.showwarning(
                     "Falta la conexión a la base",
-                    "Para validar en CR_RENOVACIONES escribe servidor, usuario y contraseña en «Validaciones automáticas».\n\n"
+                    "Para validar en CR_RENOVACIONES escribe host, puerto, servicio, usuario y contraseña en "
+                    "«Validaciones automáticas».\n\n"
                     "Esta vez se extrae sin validar en la base."
                 )
             sql_cfg = None
@@ -1698,6 +1725,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             if sql_cfg and rows:
                 progress_cb(f"🗄️ Validando {len(rows)} renovaciones en la base de datos...", 0.98)
                 validaciones['sql'] = self._validar_sql(rows, lote_info, sql_cfg)
+            # Calendario de emisión: lo generado antes de la emisión o del cierre de mes ya no se puede cancelar
+            actualizar_calendario()
+            validaciones['emision'] = marcar_bloqueos(rows)
             self.after(0, lambda: self._on_extraction_done(rows, None, lote_info, auto, validaciones))
         except Exception as e:
             err = str(e)
@@ -1878,29 +1908,48 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         avisos, rojo, filtro = [], False, None
         n_no = info.get('no_enviadas', 0)
-        if n_no:
-            rojo, filtro = True, FILTRO_NO_ENVIADAS
-            cerradas = info.get('cerradas_sin_envio', 0)
-            texto = f"{n_no} renovación(es) NO se enviaron en el ticket único del día que les tocaba"
-            detalle = []
-            if n_no - cerradas:
-                detalle.append(f"{n_no - cerradas} con el incidente abierto se suman al lote {dia_txt}")
-            if cerradas:
-                detalle.append(f"{cerradas} ya tienen el incidente cerrado en iTop (no entran al lote; «Restaurar» las incluye)")
-            avisos.append(f"{texto}: {'; '.join(detalle)}.  Clic aquí para verlas.")
+        cerradas = info.get('cerradas_sin_envio', 0)
         n_err = info.get('errores_envio', 0)
-        if n_err:
-            rojo = True
-            avisos.append(f"{n_err} renovación(es) salieron en el ticket único con datos equivocados (cliente, crédito o "
-                          f"folio de otro incidente): revisa «{FILTRO_ERRORES}».")
-            filtro = filtro or FILTRO_ERRORES
+        if revision:
+            if n_no:
+                rojo, filtro = True, FILTRO_NO_ENVIADAS
+                texto = f"{n_no} renovación(es) NO se enviaron en el ticket único del día que les tocaba"
+                detalle = []
+                if n_no - cerradas:
+                    detalle.append(f"{n_no - cerradas} con el incidente abierto se suman al lote {dia_txt}")
+                if cerradas:
+                    detalle.append(f"{cerradas} ya tienen el incidente cerrado en iTop (no entran al lote; «Restaurar» las incluye)")
+                avisos.append(f"{texto}: {'; '.join(detalle)}.  Clic aquí para verlas.")
+            if n_err:
+                rojo = True
+                avisos.append(f"{n_err} renovación(es) salieron en el ticket único con datos equivocados (cliente, crédito o "
+                              f"folio de otro incidente): revisa «{FILTRO_ERRORES}».")
+                filtro = filtro or FILTRO_ERRORES
+        else:
+            # Lote del día: en rojo solo lo que cambia el lote de hoy; lo de días anteriores, en una línea
+            if n_no - cerradas:
+                rojo, filtro = True, FILTRO_NO_ENVIADAS
+                avisos.append(f"{n_no - cerradas} renovación(es) de días anteriores NO se enviaron y siguen abiertas: "
+                              f"se suman al lote {dia_txt}.  Clic aquí para verlas.")
+            err_hoy = sum(1 for r in self.all_rows if r.get('Error_Envio') and r.get('Dia_Lote') == info['lote_actual'])
+            if err_hoy:
+                rojo = True
+                avisos.append(f"{err_hoy} renovación(es) salieron en el ticket único {dia_txt} con datos equivocados: "
+                              f"revisa «{FILTRO_ERRORES}».")
+                filtro = filtro or FILTRO_ERRORES
+            antes = [t for t in (f"{cerradas} cerrada(s) en iTop sin enviar" if cerradas else "",
+                                 f"{n_err - err_hoy} con datos equivocados" if n_err - err_hoy else "",
+                                 f"{info['duplicadas']} posible(s) duplicada(s)" if info.get('duplicadas') else "") if t]
+            if antes:
+                avisos.append(f"De días anteriores: {', '.join(antes)}. No cambian el lote de hoy; el detalle está en "
+                              f"«Revisión semanal».")
         if info.get('faltan_hoy'):
             avisos.append(f"{info['faltan_hoy']} renovación(es) {dia_txt} no vienen en el ticket único que salió a las "
                           f"{info['corte_hoy']:%H:%M}: agrégalas o mándalas en el siguiente.")
             filtro = filtro or FILTRO_ALERTAS
         if info.get('avisos_fecha'):
             avisos.append("Fecha corregida: " + "  ·  ".join(info['avisos_fecha']))
-        if info.get('duplicadas'):
+        if revision and info.get('duplicadas'):
             avisos.append(f"{info['duplicadas']} renovación(es) ya habían salido antes en otro ticket único "
                           f"(posible solicitud duplicada): están en «{FILTRO_ENVIADAS}».")
         if info.get('sin_comprobar'):
@@ -1925,32 +1974,60 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         """Avisos de la base de datos y de las capturas de pantalla: (avisos, rojo, filtro)."""
         avisos, rojo, filtro = [], False, None
         revision = bool(self.lote_info and self.lote_info.get('revision'))
+
+        def cuenta(r):
+            """En la revisión, lo del periodo; en el lote del día, solo lo que va en el lote (no lo ya enviado)."""
+            if revision:
+                return r.get('En_Periodo', True)
+            return not self.lote_info or r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA)
+
+        del_lote = [r for r in self.all_rows if cuenta(r)]
+        bloqueadas = [r for r in del_lote if r.get('Bloqueo_Emision') and r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA)]
+        if bloqueadas:
+            rojo, filtro = True, FILTRO_EMISION
+            avisos.append(f"{len(bloqueadas)} renovación(es) ya NO se pueden cancelar: se generaron antes de la emisión "
+                          f"o del cierre de mes (calendario de cédulas). Revisa «{FILTRO_EMISION}».")
         res = self.validaciones.get('sql')
         if res and not res.get('ok'):
             avisos.append(f"No se pudo validar en la base de datos: {res.get('error')}")
         elif res:
-            malas = [r for r in self.all_rows if r.get('SQL_Estado') in SQL_PROBLEMAS
-                     and (not revision or r.get('En_Periodo', True))]
+            malas = [r for r in del_lote if r.get('SQL_Estado') in SQL_PROBLEMAS]
             if malas:
-                rojo, filtro = True, FILTRO_SQL
-                avisos.append(f"{len(malas)} renovación(es) no cuadran con la base (el cliente no tiene esa renovación "
-                              f"o es de otra fecha): revisa «{FILTRO_SQL}».")
-            n_sug = sum(1 for r in self.all_rows if r.get('SQL_Estado') == SQL_SUGERENCIA)
+                rojo, filtro = True, filtro or FILTRO_SQL
+                no_procede = sum(1 for r in malas if r.get('SQL_Estado') == SQL_NO_PROCEDE)
+                avisos.append(f"{len(malas)} renovación(es) no cuadran con la base"
+                              + (f"; {no_procede} de otro día que no generó la APP con plazo menor: "
+                                 f"«{LEYENDA_NO_PROCEDE}»" if no_procede else "")
+                              + f": revisa «{FILTRO_SQL}».")
+            n_app = sum(1 for r in del_lote if r.get('SQL_Estado') == SQL_APP_PLAZO)
+            if n_app:
+                avisos.append(f"{n_app} renovación(es) son de otro día pero las generó la APP con plazo menor: "
+                              f"sí van (columna «Base de datos»).")
+            n_ced = sum(1 for r in del_lote if r.get('SQL_Cedula'))
+            if n_ced:
+                avisos.append(f"{n_ced} renovación(es) ya emitieron (están en CR_CEDULAS_DETALLE): favor de validar.")
+                filtro = filtro or FILTRO_ALERTAS
+            n_sug = sum(1 for r in del_lote if r.get('SQL_Estado') == SQL_SUGERENCIA)
             if n_sug:
                 avisos.append(f"{n_sug} renovación(es) a las que les falta un dato tienen sugerencia de la base "
                               f"(columna «Base de datos»).")
-            if res.get('enviadas_con_problema'):
+            if res.get('error_detalle'):
+                avisos.append(f"La segunda consulta (APP / plazo / cédula) falló: {res['error_detalle']}")
+            if revision and res.get('enviadas_con_problema'):
                 rojo = True
                 avisos.append(f"{res['enviadas_con_problema']} renglón(es) de los tickets únicos no cuadran con la base: "
                               f"pestaña «Tickets únicos».")
         ocr = self.validaciones.get('ocr') or {}
-        if ocr.get('completadas'):
-            avisos.append(f"{ocr['completadas']} renovación(es) se completaron leyendo una captura de pantalla: "
+        de_imagen = sum(1 for r in del_lote if r.get('Dato_Imagen'))
+        if de_imagen:
+            avisos.append(f"{de_imagen} renovación(es) se completaron leyendo una captura de pantalla: "
                           f"revísalas antes de enviarlas (vista «{FILTRO_ALERTAS}»).")
             filtro = filtro or FILTRO_ALERTAS
-        if ocr.get('sin_leer'):
-            avisos.append("No se encontró cliente o crédito en la imagen de: " + ", ".join(ocr['sin_leer'][:8])
-                          + ("…" if len(ocr['sin_leer']) > 8 else ""))
+        tickets_lote = {r.get('Numero_Ticket') for r in del_lote}
+        sin_leer = [t for t in ocr.get('sin_leer') or [] if t in tickets_lote]
+        if sin_leer:
+            avisos.append("No se encontró cliente o crédito en la imagen de: " + ", ".join(sin_leer[:8])
+                          + ("…" if len(sin_leer) > 8 else ""))
         if ocr.get('error'):
             avisos.append(f"No se pudieron leer las capturas de pantalla: {ocr['error']}")
         return avisos, rojo, filtro
@@ -1991,6 +2068,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             or r.get('Error_Envio')
             or r.get('Posible_Duplicado')
             or r.get('SQL_Estado') in SQL_PROBLEMAS
+            or r.get('SQL_Cedula')
+            or r.get('Bloqueo_Emision')
             or r.get('Dato_Imagen')
             or "DISCREPANCIA" in r.get('Alerta_Renovacion', '')
         )
@@ -2042,6 +2121,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     continue
                 if q_filter == FILTRO_REZAGADAS and lote != LOTE_REZAGADA:
                     continue
+                if q_filter == FILTRO_EMISION and not r.get('Bloqueo_Emision'):
+                    continue
                 if q_filter == FILTRO_MULTIPLES and not r.get('Es_Multiple'):
                     continue
                 if q_filter == FILTRO_ALERTAS and not self._tiene_alerta(r):
@@ -2078,6 +2159,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if r.get('SQL_Estado') in SQL_PROBLEMAS:
             # El cliente no tiene esa renovación: rojo aunque ya esté validada; de otra fecha: ámbar
             return "multiple" if r['SQL_Estado'] == SQL_OTRA_FECHA else "no_enviada"
+        if r.get('Bloqueo_Emision') and r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA):
+            return "no_enviada"  # ya pasó la emisión o el cierre de mes: no se puede cancelar
         if r.get('Falta_Hoy'):
             return "rezagada"
         if self._fuera_de_lote(r):
@@ -2305,7 +2388,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             if r.get('Error_Envio') and r['Error_Envio'] not in etiqueta:
                 box.insert("end", f"DATOS EQUIVOCADOS en el ticket único: {r['Error_Envio']}\n", "error")
             box.insert("end", "\n")
-        if r.get('SQL_Detalle') or r.get('Dato_Imagen'):
+        if r.get('Bloqueo_Emision'):
+            box.insert("end", f"Emisión: {r['Bloqueo_Emision']}\n\n", "error")
+        if r.get('SQL_Detalle') or r.get('Dato_Imagen') or r.get('SQL_Cedula'):
+            if r.get('SQL_Cedula'):
+                box.insert("end", f"Cédula: {r['SQL_Cedula']}\n", "warn")
             if r.get('SQL_Detalle'):
                 box.insert("end", f"Base de datos: {r['SQL_Detalle']}\n",
                            "error" if r.get('SQL_Estado') in SQL_PROBLEMAS else "ok")
@@ -2651,6 +2738,15 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if sql_mal:
             avisos.append(f"{len(sql_mal)} renovación(es) no cuadran con la base de datos: {', '.join(sql_mal[:8])}"
                           + ("…" if len(sql_mal) > 8 else "") + f". Revisa «{FILTRO_SQL}».")
+        bloqueadas = sorted({r['Numero_Ticket'] for r in active_rows if r.get('Bloqueo_Emision')})
+        if bloqueadas:
+            avisos.append(f"{len(bloqueadas)} ticket(s) ya NO se pueden cancelar (pasó la emisión o el cierre de mes): "
+                          f"{', '.join(bloqueadas[:8])}" + ("…" if len(bloqueadas) > 8 else "")
+                          + f". Revisa «{FILTRO_EMISION}».")
+        con_cedula = sorted({r['Numero_Ticket'] for r in active_rows if r.get('SQL_Cedula')})
+        if con_cedula:
+            avisos.append(f"{len(con_cedula)} ticket(s) ya emitieron (están en CR_CEDULAS_DETALLE): "
+                          f"{', '.join(con_cedula[:8])}. Favor de validar.")
         de_imagen = [r['Numero_Ticket'] for r in active_rows if r.get('Dato_Imagen')]
         if de_imagen:
             avisos.append(f"{len(de_imagen)} renovación(es) tienen datos leídos de una imagen: {', '.join(de_imagen[:8])}.")
@@ -2718,6 +2814,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "Crédito Renovado (A Cancelar)": r['Credito_Renovado_Hijo'],
                 "Crédito Origen (Padre)": r['Credito_Origen_Padre'],
                 "Base de datos (SQL)": r.get('SQL_Detalle', ''),
+                "Cédula": r.get('SQL_Cedula', ''),
+                "Emisión": r.get('Bloqueo_Emision', ''),
                 "Leído de imagen": r.get('Dato_Imagen', ''),
                 "Lote / Corte": plain_text(r.get('Lote_Etiqueta', '')),
                 "Gafete": r['Gafete'],
@@ -2847,6 +2945,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "Detalle": plain_text(r.get('Lote_Etiqueta', '')),
                 "Datos equivocados en el ticket único": r.get('Error_Envio', ''),
                 "Base de datos (SQL)": r.get('SQL_Detalle', ''),
+                "Emisión": r.get('Bloqueo_Emision', ''),
                 "Cierre iTop": resumen_cierre(r.get('Cierre_iTop')),
                 "Gafete": r['Gafete'],
                 "Agente": r['Nombre_Asignado'],

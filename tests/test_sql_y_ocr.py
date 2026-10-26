@@ -15,7 +15,11 @@ import sql_renovaciones as sql  # noqa: E402
 
 # Lo que devolvió la consulta del 23/10/2026 para el cliente 1184282
 BASE = [(datetime(2026, 10, 23), '1184282', 10430), (datetime(2025, 10, 22), '1184282', 84846),
-        (datetime(2026, 10, 23), '4363419', 17626)]
+        (datetime(2026, 10, 23), '4363419', 17626), (datetime(2026, 10, 22), '7982848', 27179),
+        (datetime(2026, 10, 22), '3430084', 24969)]
+# Segunda consulta: (cuenta, no_renovacion) -> (sucursal_ejerce, plazo de la renovación, plazo de la disposición, cédula)
+DETALLE = {('1184282', '84846'): (12, 18, 18, 1), ('7982848', '27179'): (104, 12, 18, 0),
+           ('3430084', '24969'): (104, 18, 18, 0)}
 
 
 class Cursor:
@@ -26,7 +30,9 @@ class Cursor:
     def execute(self, texto, binds):
         self.consultas.append((texto, binds))
         valores = {str(v) for k, v in binds.items() if k[0] in 'cr'}
-        if "WHERE CUENTA IN" in texto:
+        if "CR_DISPOSICIONES" in texto:
+            self._res = [(c, r, *d) for (c, r), d in DETALLE.items() if c in valores]
+        elif "WHERE CUENTA IN" in texto:
             self._res = [x for x in BASE if x[1] in valores]
         else:
             self._res = [x for x in BASE if str(x[2]) in valores and binds['desde'] <= x[0] < binds['hasta']]
@@ -71,12 +77,55 @@ class TestValidacionSQL(unittest.TestCase):
         self.assertNotIn("1184282", texto)
         self.assertEqual(binds, {'c0': '1184282'})
 
-    def test_renovacion_vieja_es_otra_fecha(self):
+    def test_renovacion_vieja_no_procede(self):
         r = fila("I-2", "1184282", "84846")
-        self.validar(r)
-        self.assertEqual(r['SQL_Estado'], sql.SQL_OTRA_FECHA)
+        resumen, conn = self.validar(r)
+        self.assertEqual(r['SQL_Estado'], sql.SQL_NO_PROCEDE)
+        self.assertTrue(r['SQL_Detalle'].startswith("No procede, la renovación es de otro día"))
         self.assertIn("22/10/2025", r['SQL_Detalle'])
+        self.assertIn("no es de la APP", r['SQL_Detalle'])
         self.assertIn("10430 (23/10/2026)", r['SQL_Detalle'])
+        self.assertEqual(r['SQL_Fecha_Alta'], date(2025, 10, 22))
+        self.assertIn("ha emitido", r['SQL_Cedula'])
+        self.assertEqual(resumen['problemas'], 1)
+        # La segunda consulta también con variables y solo SELECT
+        texto, binds = conn.consultas[-1]
+        self.assertTrue(texto.startswith("SELECT c.CUENTA, c.NO_RENOVACION"))
+        self.assertIn("TOPAZ.CR_DISPOSICIONES", texto)
+        self.assertIn("TOPAZ.CR_CEDULAS_DETALLE", texto)
+        self.assertNotIn("1184282", texto)
+
+    def test_de_otro_dia_pero_de_la_app_con_plazo_menor(self):
+        r = fila("I-8", "7982848", "27179")
+        self.validar(r)
+        self.assertEqual(r['SQL_Estado'], sql.SQL_APP_PLAZO)
+        self.assertIn("se envía", r['SQL_Detalle'])
+        self.assertIn("12 vs. disposición 18", r['SQL_Detalle'])
+        self.assertNotIn(r['SQL_Estado'], sql.SQL_PROBLEMAS)
+
+    def test_de_la_app_con_el_mismo_plazo_no_procede(self):
+        r = fila("I-9", "3430084", "24969")
+        self.validar(r)
+        self.assertEqual(r['SQL_Estado'], sql.SQL_NO_PROCEDE)
+        self.assertIn("el plazo no es menor", r['SQL_Detalle'])
+
+    def test_si_falla_la_segunda_consulta_queda_otra_fecha(self):
+        conn = Conexion()
+        original = Cursor.execute
+
+        def execute(cur, texto, binds):
+            if "CR_DISPOSICIONES" in texto:
+                raise RuntimeError("ORA-00942: table or view does not exist")
+            original(cur, texto, binds)
+        Cursor.execute = execute
+        try:
+            r = fila("I-10", "7982848", "27179")
+            resumen = sql.validar_contra_base(conn, "TOPAZ.CR_RENOVACIONES", [r])
+        finally:
+            Cursor.execute = original
+        self.assertEqual(r['SQL_Estado'], sql.SQL_OTRA_FECHA)
+        self.assertIn("ORA-00942", r['SQL_Detalle'])
+        self.assertIn("ORA-00942", resumen['error_detalle'])
 
     def test_credito_que_el_cliente_no_tiene(self):
         r = fila("I-3", "1184282", "10431")
@@ -106,7 +155,7 @@ class TestValidacionSQL(unittest.TestCase):
     def test_renglones_del_ticket_unico(self):
         enviada = {'cliente': '1184282', 'credito': '84846', 'fecha': date(2026, 10, 23)}
         resumen, _ = self.validar(fila("I-1", "1184282", "10430"), enviadas=[enviada])
-        self.assertEqual(enviada['sql_estado'], sql.SQL_OTRA_FECHA)
+        self.assertEqual(enviada['sql_estado'], sql.SQL_NO_PROCEDE)
         self.assertEqual(resumen['enviadas_con_problema'], 1)
 
     def test_nombre_de_tabla_seguro(self):
@@ -116,6 +165,14 @@ class TestValidacionSQL(unittest.TestCase):
 
     def test_servidor_como_en_sql_developer(self):
         self.assertEqual(sql.armar_dsn(" 10.0.0.5:1521/TOPAZ "), "10.0.0.5:1521/TOPAZ")
+        # Separado por espacios o comas ya no se busca como alias de tnsnames.ora (DPY-4000 «unable to find "1521"»)
+        for texto in ("scanfonacot.fonacot.gob.mx 1521 fonatop", "scanfonacot.fonacot.gob.mx, 1521, fonatop"):
+            self.assertEqual(sql.armar_dsn(texto), "scanfonacot.fonacot.gob.mx:1521/fonatop")
+        self.assertEqual(sql.armar_dsn("PRODUCCION"), "PRODUCCION")  # un alias sí se deja igual
+        self.assertEqual(sql.servidor_de("scanfonacot.fonacot.gob.mx", "", "fonatop"),
+                         "scanfonacot.fonacot.gob.mx:1521/fonatop")
+        self.assertEqual(sql.separar_servidor("scanfonacot.fonacot.gob.mx:1521/fonatop"),
+                         ("scanfonacot.fonacot.gob.mx", "1521", "fonatop"))
 
 
 def palabra(texto, x, y, ancho=None, alto=20):
