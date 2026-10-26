@@ -10,6 +10,8 @@ Solo consulta (SELECT). Primera consulta: FECHA_ALTA, CUENTA (No. de cliente) y 
 Segunda consulta (SALDOS, CR_DISPOSICIONES, CR_CEDULAS_DETALLE), para las de días anteriores: solo se envían si las
 generó la APP (sucursal 104) con un plazo menor; si no, «No procede, la renovación es de otro día». También avisa
 si la renovación ya emitió (está en CR_CEDULAS_DETALLE).
+Si el crédito que manda el incidente no es una renovación del cliente, se busca como crédito padre (OPERACION): si lo
+es, se avisa cuál es su renovación (la que hay que cancelar).
 
 La contraseña no se guarda en la configuración: se pide en pantalla y, si el usuario quiere, se guarda en el
 Administrador de credenciales de Windows.
@@ -31,8 +33,9 @@ SQL_SUGERENCIA = "SUGERENCIA"
 SQL_SIN_DATOS = "SIN_DATOS"
 SQL_APP_PLAZO = "APP_PLAZO"      # de otro día, pero la generó la APP con plazo menor: sí se envía
 SQL_NO_PROCEDE = "NO_PROCEDE"    # de otro día: «No procede, la renovación es de otro día»
+SQL_ES_PADRE = "ES_PADRE"        # mandaron el crédito padre (origen) en vez de la renovación
 # Estados que indican que el dato del incidente no cuadra con la base
-SQL_PROBLEMAS = (SQL_OTRA_FECHA, SQL_NO_EXISTE, SQL_SIN_RENOVACIONES, SQL_NO_PROCEDE)
+SQL_PROBLEMAS = (SQL_OTRA_FECHA, SQL_NO_EXISTE, SQL_SIN_RENOVACIONES, SQL_NO_PROCEDE, SQL_ES_PADRE)
 LEYENDA_NO_PROCEDE = "No procede, la renovación es de otro día"
 SUCURSAL_APP = 104
 
@@ -281,6 +284,22 @@ def consultar_por_creditos(conn, tabla: str, creditos, desde: date, hasta: date)
     return [(_fecha(f), _num(c), _num(n)) for f, c, n in registros]
 
 
+def consultar_por_padres(conn, tabla: str, creditos) -> list:
+    """[(fecha_alta, cuenta, no_renovacion, operacion)] de las renovaciones cuyo crédito padre (OPERACION) es alguno de esos."""
+    tabla = tabla_valida(tabla)
+    registros = []
+    cur = conn.cursor()
+    try:
+        for grupo in _lotes(sorted(set(c for c in creditos if c))):
+            binds = {f"p{i}": v for i, v in enumerate(grupo)}
+            cur.execute(f"SELECT FECHA_ALTA, CUENTA, NO_RENOVACION, OPERACION FROM {tabla} "
+                        f"WHERE OPERACION IN ({', '.join(':' + k for k in binds)})", binds)
+            registros.extend(cur.fetchall())
+    finally:
+        cur.close()
+    return [(_fecha(f), _num(c), _num(n), _num(o)) for f, c, n, o in registros]
+
+
 def _esquema(tabla: str) -> str:
     """'TOPAZ.CR_RENOVACIONES' -> 'TOPAZ.' (las demás tablas están en el mismo esquema)."""
     return tabla.split(".")[0] + "." if "." in tabla else ""
@@ -362,11 +381,26 @@ def _alta(cliente: str, credito: str, por_cliente: dict):
     return max(fechas) if fechas else None
 
 
-def validar_par(cliente: str, credito: str, ref: date, por_cliente: dict, por_credito: dict) -> tuple:
+def hijas_del_padre(cliente: str, credito: str, por_padre: dict) -> list:
+    """[(fecha, cuenta, no_renovacion)] de las renovaciones de ese crédito padre (del cliente, si se conoce), la más reciente primero."""
+    hijas = [(f, c, n) for f, c, n in (por_padre or {}).get(credito, []) if not cliente or c == cliente]
+    return sorted(hijas, key=lambda x: x[0] or date.min, reverse=True)
+
+
+def _texto_padre(credito: str, hijas: list) -> str:
+    f, c, n = hijas[0]
+    otras = f" (también: {', '.join(h[2] for h in hijas[1:4])})" if len(hijas) > 1 else ""
+    alta = f", alta {f:%d/%m/%Y}" if f else ""
+    return (f"OJO: {credito} es el crédito padre (origen), no la renovación. La renovación que hay que cancelar es la "
+            f"{n} del cliente {c}{alta}{otras}")
+
+
+def validar_par(cliente: str, credito: str, ref: date, por_cliente: dict, por_credito: dict,
+                por_padre: dict = None) -> tuple:
     """
     (estado, detalle) de un Cliente + Crédito contra lo que trajo la base. `ref`: día en que debía hacerse la
     renovación (llegada del incidente o día del ticket único). `por_cliente`: {cuenta: [(fecha, no_renov)]},
-    `por_credito`: {no_renov: [(fecha, cuenta)]}.
+    `por_credito`: {no_renov: [(fecha, cuenta)]}, `por_padre`: {operacion: [(fecha, cuenta, no_renov)]}.
     """
     desde, hasta = ref - timedelta(days=DIAS_ANTES), ref + timedelta(days=1)
 
@@ -391,6 +425,9 @@ def validar_par(cliente: str, credito: str, ref: date, por_cliente: dict, por_cr
             return SQL_OTRA_FECHA, (f"La renovación {credito} del cliente {cliente} es del "
                                     f"{alta:%d/%m/%Y}, no de cuando llegó el incidente ({ref:%d/%m/%Y}).{otra}"
                                     if alta else f"La renovación {credito} no tiene fecha de alta")
+        hijas = hijas_del_padre(cliente, credito, por_padre)
+        if hijas:
+            return SQL_ES_PADRE, _texto_padre(credito, hijas)
         if renov:
             sugerencia = f" ¿Será {', '.join(n for _, n in cercanas)}?" if cercanas else ""
             return SQL_NO_EXISTE, (f"El cliente {cliente} no tiene la renovación {credito}. Sus renovaciones: "
@@ -407,6 +444,9 @@ def validar_par(cliente: str, credito: str, ref: date, por_cliente: dict, por_cr
         if duenos:
             return SQL_SUGERENCIA, "Falta el cliente: la renovación {} es del cliente {}".format(
                 credito, ", ".join(f"{c} (alta {f:%d/%m/%Y})" for f, c in duenos))
+        hijas = hijas_del_padre("", credito, por_padre)
+        if hijas:
+            return SQL_ES_PADRE, _texto_padre(credito, hijas)
         return SQL_NO_EXISTE, f"No hay una renovación {credito} dada de alta cerca del {ref:%d/%m/%Y}"
     return SQL_SIN_DATOS, ""
 
@@ -435,13 +475,23 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
                                               min(refs) - timedelta(days=DIAS_ANTES), max(refs) + timedelta(days=1)):
             por_credito.setdefault(n, []).append((f, c))
 
+    # El crédito que el cliente no tiene como renovación, ¿es un crédito padre? (mandaron el origen en vez de la renovación)
+    por_padre, error_padre = {}, ''
+    padres = sorted({cr for c, cr, _ in todos if cr and cr not in {n for _, n in por_cliente.get(c, [])}})
+    if padres:
+        try:
+            for f, c, n, o in consultar_por_padres(conn, tabla, padres):
+                por_padre.setdefault(o, []).append((f, c, n))
+        except Exception as e:
+            error_padre = _mensaje(e)
+
     # Renglón del ticket único sin su incidente: lo del día hábil anterior que llegó después del envío también es «del día»
     for i, f in enumerate(filas_enviadas, len(pares)):
         c, cr, ref = todos[i]
         alta = _alta(c, cr, por_cliente)
         if not f.get('llegada') and f.get('desde') and alta and f['desde'] <= alta <= ref:
             todos[i] = (c, cr, alta)
-    resultados = [validar_par(c, cr, ref, por_cliente, por_credito) for c, cr, ref in todos]
+    resultados = [validar_par(c, cr, ref, por_cliente, por_credito, por_padre) for c, cr, ref in todos]
 
     # Segunda consulta: las de días anteriores (¿APP con plazo menor?) y si ya emitió (CR_CEDULAS_DETALLE)
     con_alta = [(c, cr) for c, cr, _ in todos if _alta(c, cr, por_cliente)]
@@ -467,18 +517,24 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
     for r, (estado, texto, alta, cedula) in zip(rows, resultados):
         r['SQL_Estado'], r['SQL_Detalle'], r['SQL_Fecha_Alta'] = estado, texto, alta
         r['SQL_Cedula'] = "Esta renovación ha emitido, favor de validar (está en CR_CEDULAS_DETALLE)" if cedula else ""
+        hijas = hijas_del_padre(_dato(r.get('Numero_Cliente')), _dato(r.get('Credito_Renovado_Hijo')), por_padre) \
+            if estado == SQL_ES_PADRE else []
+        r['SQL_Renovacion_Hija'] = hijas[0][2] if hijas else ''
         conteos[estado] = conteos.get(estado, 0) + 1
     for f, (estado, texto, alta, cedula) in zip(filas_enviadas, resultados[len(rows):]):
         f['sql_estado'], f['sql_detalle'] = estado, texto
     return {'ok': True, 'conteos': conteos, 'problemas': sum(conteos.get(e, 0) for e in SQL_PROBLEMAS),
             'enviadas_con_problema': sum(1 for f in filas_enviadas if f.get('sql_estado') in SQL_PROBLEMAS),
-            'error_detalle': error_detalle, 'cedulas': sum(1 for *_, ced in resultados[:len(rows)] if ced)}
+            'error_detalle': error_detalle, 'error_padre': error_padre,
+            'padres': conteos.get(SQL_ES_PADRE, 0),
+            'cedulas': sum(1 for *_, ced in resultados[:len(rows)] if ced)}
 
 
 def texto_corto(estado: str) -> str:
     return {SQL_OK: "✔ Existe", SQL_OTRA_FECHA: "⚠ Otra fecha", SQL_NO_EXISTE: "✖ No existe",
             SQL_SIN_RENOVACIONES: "✖ Sin renovaciones", SQL_SUGERENCIA: "💡 Sugerencia", SQL_SIN_DATOS: "—",
-            SQL_APP_PLAZO: "✔ APP, plazo menor", SQL_NO_PROCEDE: "✖ No procede (otro día)"}.get(estado, "")
+            SQL_APP_PLAZO: "✔ APP, plazo menor", SQL_NO_PROCEDE: "✖ No procede (otro día)",
+            SQL_ES_PADRE: "⚠ Es el padre"}.get(estado, "")
 
 
 # ======================= Contraseña en el Administrador de credenciales de Windows =======================
