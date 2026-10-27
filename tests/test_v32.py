@@ -392,5 +392,23 @@ class TestNoSeMandanDelDia(unittest.TestCase):
         self.assertEqual(len(reglas.grupos_del_dia(filas)['no_se_mandan']), 4)  # revisión: todas
 
 
+class TestEtiquetaClienteRepetida(unittest.TestCase):
+    """«…CREDITO DEL CLIENTE» y abajo «CLIENTE 7988789»: antes la primera etiqueta se «comía» a la segunda."""
+
+    def leer(self, texto):
+        return Parser.parse_and_disaggregate_email("CANCELACION DE RENOVACION", "", texto, datetime(2026, 10, 27, 14, 7),
+                                                   "I-1", "2609", "N")
+
+    def test_en_renglones(self):
+        rows = self.leer("BUENAS TARDES FAVOR DE CANCELAR CREDITO DEL CLIENTE\nCLIENTE 7988789\n"
+                         "FRANCISCA BEJARANO VILLA\nCREDITO REN 51588\nLE BAJO LA CAPACIDAD\nQUEDO A SUS ORDENES")
+        self.assertEqual([(r['Numero_Cliente'], r['Credito_Renovado_Hijo']) for r in rows], [("7988789", "51588")])
+        self.assertFalse(rows[0]['Datos_Incompletos'])
+
+    def test_en_un_renglon(self):
+        rows = self.leer("Favor de cancelar crédito del cliente cliente 7988789 crédito ren 51588")
+        self.assertEqual([(r['Numero_Cliente'], r['Credito_Renovado_Hijo']) for r in rows], [("7988789", "51588")])
+
+
 if __name__ == "__main__":
     unittest.main()
