@@ -410,5 +410,62 @@ class TestEtiquetaClienteRepetida(unittest.TestCase):
         self.assertEqual([(r['Numero_Cliente'], r['Credito_Renovado_Hijo']) for r in rows], [("7988789", "51588")])
 
 
+class TestCorregirDato(unittest.TestCase):
+    """El analista corrige el crédito con la renovación que dice la base: al copiar ya va el número bueno."""
+
+    def fila(self):
+        return renovacion(Numero_Ticket="I-362823", Numero_Cliente="5980215", Credito_Renovado_Hijo="6756",
+                          Indice_En_Ticket=1, Total_En_Ticket=1)
+
+    def test_corregir_y_quitar(self):
+        from lote_utils import aplicar_correccion, quitar_correccion, row_key
+        r = self.fila()
+        llave = row_key(r)
+        self.assertTrue(aplicar_correccion(r, "5980215", "48033", "2026-10-27T12:30:00"))
+        self.assertEqual((r['Numero_Cliente'], r['Credito_Renovado_Hijo']), ("5980215", "48033"))
+        self.assertEqual(row_key(r), llave)  # la llave sigue siendo la del correo: no se pierde lo marcado
+        self.assertFalse(aplicar_correccion(r, "5980215", "11111"))  # ya estaba corregida
+        self.assertTrue(quitar_correccion(r))
+        self.assertEqual(r['Credito_Renovado_Hijo'], "6756")
+        self.assertNotIn('Correccion_Manual', r)
+        self.assertFalse(aplicar_correccion(r, "5980215", "6756"))  # igual a lo del correo: nada que corregir
+
+    def test_completa_el_dato_que_faltaba(self):
+        from lote_utils import aplicar_correccion
+        r = renovacion(Numero_Cliente="SIN CLIENTE", Credito_Renovado_Hijo="51588", Datos_Incompletos=True,
+                       Nivel_Alerta="incompleto")
+        aplicar_correccion(r, "7988789", "")
+        self.assertEqual((r['Numero_Cliente'], r['Credito_Renovado_Hijo']), ("7988789", "51588"))
+        self.assertFalse(r['Datos_Incompletos'])
+        self.assertEqual(r['Nivel_Alerta'], "normal")
+
+    def test_se_vuelve_a_poner_al_actualizar(self):
+        from lote_utils import aplicar_correcciones, row_key
+        r = self.fila()
+        guardadas = {row_key(r): {'cliente': "5980215", 'credito': "48033", 'hora': "2026-10-27T12:30:00"}}
+        self.assertEqual(aplicar_correcciones([r], guardadas), [r])
+        self.assertEqual(r['Credito_Renovado_Hijo'], "48033")
+        self.assertEqual(aplicar_correcciones([r], guardadas), [])  # ya estaba
+
+    def test_desglose(self):
+        from lote_utils import aplicar_correccion
+        r = self.fila()
+        aplicar_correccion(r, "5980215", "48033", "2026-10-27T12:30:00")
+        nivel, texto = reglas._check_correo(r)
+        self.assertEqual(nivel, reglas.OK)
+        self.assertIn("traía el crédito 6756; se corrigió a mano: cliente 5980215 y crédito 48033 (12:30)", texto)
+        self.assertIn("6756", str(reglas.comparacion(r, en_lote=True)))  # la columna del incidente: lo del correo
+
+    def test_la_base_ofrece_la_renovacion_de_ese_dia(self):
+        from test_sql_y_ocr import Conexion, fila
+        r = fila("I-3", "1184282", "99999")  # el cliente tiene la 10430 del mismo día
+        sql.validar_contra_base(Conexion(), "TOPAZ.CR_RENOVACIONES", [r])
+        self.assertEqual(r['SQL_Estado'], sql.SQL_NO_EXISTE)
+        self.assertEqual(r['SQL_Opciones'][0], ("1184282", "10430", date(2026, 10, 23)))
+        texto = reglas._checks_base(r, True)[0][1]
+        self.assertFalse(texto.endswith("?."), texto)  # «¿Será 10430?» sin otro punto
+        self.assertIn("usa «Corregir dato» (E)", reglas._accion_corregir(r, []))
+
+
 if __name__ == "__main__":
     unittest.main()
