@@ -522,6 +522,7 @@ def corregir_padre(r: dict, hijas: list) -> str:
         r['Credito_Origen_Padre'] = padre
     puso_cliente = not _dato(r.get('Numero_Cliente'))
     if puso_cliente:
+        r['Cliente_Enviado'] = r.get('Numero_Cliente') or ''
         r['Numero_Cliente'] = cuenta
     if not str(r.get('Numero_Cliente', '')).upper().startswith('SIN') and not str(hija).upper().startswith('SIN'):
         r['Datos_Incompletos'] = False

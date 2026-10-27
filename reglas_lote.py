@@ -24,6 +24,7 @@ from core_renovaciones import (
 )
 from sql_renovaciones import (
     SQL_OK, SQL_APP_PLAZO, SQL_SUGERENCIA, SQL_SIN_DATOS, SQL_ES_PADRE, SQL_PADRE_CORREGIDO, SQL_NO_PROCEDE, SQL_PROBLEMAS,
+    SQL_NO_EXISTE, SQL_SIN_RENOVACIONES, SQL_OTRA_FECHA,
     LEYENDA_NO_PROCEDE,
 )
 
@@ -319,3 +320,75 @@ def veredicto(r: dict, en_lote: bool = None, validada: bool = False, descartada:
                 accion=("Va en el ticket único de hoy. Ya la validaste." if validada
                         else "Va en el ticket único de hoy: si todo cuadra, márcala como validada (Espacio)."),
                 checks=checks)
+
+
+# ======================= Comparación en tres columnas =======================
+
+def _falta(valor) -> bool:
+    return not valor or str(valor).strip() in ("-", "") or str(valor).upper().startswith("SIN")
+
+
+def _v(valor) -> str:
+    return "falta" if _falta(valor) else str(valor)
+
+
+def comparacion(r: dict, en_lote: bool = None) -> list:
+    """
+    Lo que dice cada fuente, lado a lado: [{'dato', 'incidente', 'base', 'ticket', 'estado'}] para el cliente, el
+    crédito y la fecha. 'estado' (OK/AVISO/MAL/INFO) dice si las tres cuadran, si se corrigió algo o si no cuadran.
+    """
+    en_lote = va_en_lote(r) if en_lote is None else en_lote
+    estado = r.get("SQL_Estado")
+    cli, cred = r.get("Numero_Cliente"), r.get("Credito_Renovado_Hijo")
+    cli_inc = r.get("Cliente_Enviado", cli) if "Cliente_Enviado" in r else cli
+    cred_inc = r.get("Credito_Padre_Enviado") or cred
+    alta, llegada = r.get("SQL_Fecha_Alta"), r.get("Fecha_Llegada_DT") or r.get("Fecha_DT")
+    confirma = estado in (SQL_OK, SQL_APP_PLAZO, SQL_PADRE_CORREGIDO)
+    sin_base = not estado or estado == SQL_SIN_DATOS
+
+    # Columna de la base de datos
+    if sin_base:
+        b_cli = b_cred = b_fecha = "sin validar"
+    elif confirma:
+        b_cli, b_cred, b_fecha = _v(cli), _v(cred), _f(alta) or "—"
+        if r.get("Credito_Padre_Enviado"):
+            b_cred = f"{cred} (renovación del padre {r['Credito_Padre_Enviado']})"
+    elif estado == SQL_ES_PADRE:
+        b_cli, b_cred, b_fecha = _v(cli), f"{cred} es el padre de {r.get('SQL_Renovacion_Hija') or '?'}", "—"
+    elif estado == SQL_NO_EXISTE:
+        b_cli, b_cred, b_fecha = _v(cli), "no existe para ese cliente", "—"
+    elif estado == SQL_SIN_RENOVACIONES:
+        b_cli, b_cred, b_fecha = "sin renovaciones", "—", "—"
+    elif estado in (SQL_OTRA_FECHA, SQL_NO_PROCEDE):
+        b_cli, b_cred, b_fecha = _v(cli), _v(cred), f"{_f(alta) or '?'} (otro día)"
+    else:  # sugerencia u otro: el detalle lo explica
+        b_cli, b_cred, b_fecha = _v(cli), "ver detalle", _f(alta) or "—"
+
+    # Columna del ticket único
+    if en_lote:
+        t_cli, t_cred = _v(cli), _v(cred)
+        t_fecha = f"hoy ({_f(r.get('Dia_Lote'))})" if r.get("Dia_Lote") else "hoy"
+    elif r.get("Lote_Estado") in (LOTE_ENVIADA, LOTE_EN_CONCENTRADO):
+        t_cli, t_cred, t_fecha = _v(cli), _v(cred), f"salió el {_f(r.get('Enviado_Fecha')) or 'día de hoy'}"
+    else:
+        t_cli = t_cred = t_fecha = "no se manda"
+
+    def est(inc, ticket, base_ok):
+        if _falta(inc) and _falta(ticket):
+            return MAL
+        if sin_base:
+            return INFO if not _falta(ticket) else MAL
+        if not base_ok:
+            return MAL
+        return OK if str(inc) == str(ticket) or not en_lote else AVISO
+
+    llegada = llegada.date() if hasattr(llegada, "date") else llegada
+    return [
+        dict(dato="Cliente", incidente=_v(cli_inc), base=b_cli, ticket=t_cli,
+             estado=est(cli_inc, cli, estado not in (SQL_SIN_RENOVACIONES,))),
+        dict(dato="Crédito", incidente=_v(cred_inc), base=b_cred, ticket=t_cred,
+             estado=est(cred_inc, cred, confirma or estado in (SQL_OTRA_FECHA, SQL_NO_PROCEDE))),
+        dict(dato="Fecha", incidente=f"llegó {_f(llegada)}" if llegada else "—", base=b_fecha, ticket=t_fecha,
+             estado=(INFO if sin_base else OK if confirma else MAL if estado in (SQL_OTRA_FECHA, SQL_NO_PROCEDE)
+                     else INFO)),
+    ]

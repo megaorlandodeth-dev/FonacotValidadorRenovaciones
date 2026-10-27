@@ -48,10 +48,31 @@ def row_key(row: dict) -> str:
     return f"{row.get('Numero_Ticket', '')}|{cli}|{cred}|{row.get('Indice_En_Ticket', '') if cred == 'SR' else ''}"
 
 
-class EstadoValidaciones:
-    """Persistencia simple en JSON: {categoria: {llave: fecha_iso}}. Purga lo que tenga más de `dias_retencion` días."""
+def llaves_fila(row: dict) -> list:
+    """La llave de la renovación y, si el crédito padre se cambió por su renovación, la llave con el padre (así se
+    reconoce en otro equipo que no validó en la base)."""
+    llaves = [row_key(row)]
+    if row.get('Credito_Padre_Enviado'):
+        llaves.append(row_key(dict(row, Credito_Renovado_Hijo=row['Credito_Padre_Enviado'])))
+    return llaves
 
-    CATEGORIAS = ('validados', 'descartados', 'incluidos')
+
+def _fecha_de(valor) -> str:
+    """Fecha ISO de un registro guardado: texto, {'hora': …} o lista de eventos [[hora, …], …]."""
+    if isinstance(valor, dict):
+        return str(valor.get('hora', ''))
+    if isinstance(valor, list):
+        return str(valor[-1][0]) if valor and valor[-1] else ''
+    return str(valor)
+
+
+class EstadoValidaciones:
+    """
+    Persistencia simple en JSON: {categoria: {llave: fecha_iso}}, más 'dudas' ({llave: {'hora', 'nota'}}) y la
+    'bitacora' ({llave: [[hora, acción, detalle], …]}). Purga lo que tenga más de `dias_retencion` días.
+    """
+
+    CATEGORIAS = ('validados', 'descartados', 'incluidos', 'dudas', 'bitacora')
 
     def __init__(self, path: str, dias_retencion: int = 30):
         self.path = path
@@ -81,7 +102,7 @@ class EstadoValidaciones:
     def _purge(self):
         limite = (datetime.now() - timedelta(days=self.dias_retencion)).isoformat()
         for c in self.CATEGORIAS:
-            self.data[c] = {k: v for k, v in self.data[c].items() if str(v) >= limite}
+            self.data[c] = {k: v for k, v in self.data[c].items() if _fecha_de(v) >= limite}
 
     def has(self, categoria: str, key: str) -> bool:
         return key in self.data[categoria]
@@ -94,6 +115,29 @@ class EstadoValidaciones:
             else:
                 self.data[categoria].pop(k, None)
         self.save()
+
+    def registrar(self, keys, accion: str, detalle: str = '', guardar: bool = True):
+        """Agrega a la bitácora de cada renovación: quién hizo qué y cuándo (se queda en este equipo)."""
+        now = datetime.now().isoformat(timespec='seconds')
+        for k in keys:
+            self.data['bitacora'].setdefault(k, []).append([now, accion, detalle])
+            del self.data['bitacora'][k][:-30]  # las últimas 30 por renovación
+        if guardar:
+            self.save()
+
+    def historial(self, key: str) -> list:
+        return [tuple(e) for e in self.data['bitacora'].get(key, []) if len(e) == 3]
+
+    def poner_duda(self, key: str, nota: str):
+        """Duda para el validador (nota vacía = se quita)."""
+        if nota:
+            self.data['dudas'][key] = {'hora': datetime.now().isoformat(timespec='seconds'), 'nota': nota}
+        else:
+            self.data['dudas'].pop(key, None)
+        self.save()
+
+    def duda(self, key: str) -> str:
+        return (self.data['dudas'].get(key) or {}).get('nota', '')
 
 
 # ======================= LOTE PARA CORREO / PORTAPAPELES =======================
