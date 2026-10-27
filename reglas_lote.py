@@ -269,7 +269,13 @@ def _check_correo(r: dict) -> tuple:
     sin_cli, sin_cred = str(cli).upper().startswith("SIN"), str(cred).upper().startswith("SIN")
     if sin_cli or sin_cred:
         falta = "el número de cliente y el crédito" if sin_cli and sin_cred else ("el número de cliente" if sin_cli else "el crédito")
-        return MAL, f"Correo: falta {falta}. Búscalo en el correo original o en iTop."
+        return MAL, f"Correo: falta {falta}. Búscalo en el correo original o en iTop y usa «Corregir dato» (E)."
+    antes = r.get("Correccion_Manual")
+    if antes:
+        cambios = [f"{que} {_limpio(antes[campo])}" for que, campo, ahora in (
+            ("el cliente", "cliente", cli), ("el crédito", "credito", cred)) if str(antes[campo]) != str(ahora)]
+        return OK, (f"Correo: traía {' y '.join(cambios)}; se corrigió a mano: cliente {cli} y crédito {cred}"
+                    + (f" ({str(antes['hora'])[11:16]})" if antes.get("hora") else "") + ".")
     if r.get("Credito_Padre_Enviado"):
         return AVISO, (f"Correo: trae el crédito padre {r['Credito_Padre_Enviado']}; en el lote va su renovación {cred}. "
                        f"Valida que sea la correcta.")
@@ -289,20 +295,24 @@ def _check_correo(r: dict) -> tuple:
 
 def _checks_base(r: dict, sql_activo: bool) -> list:
     estado, detalle = r.get("SQL_Estado"), _limpio(r.get("SQL_Detalle")).rstrip(".")
+    if detalle and not detalle.endswith(("?", "!")):
+        detalle += "."  # «¿Será 48033?» no lleva otro punto
     checks = []
-    if not estado:
+    if not estado and r.get("Correccion_Manual") and sql_activo:
+        checks.append((INFO, "Base de datos: se corrigió a mano; se confirma en la base al actualizar."))
+    elif not estado:
         checks.append((INFO, "Base de datos: no se validó" + (
             "." if sql_activo else " (actívala en Configuración → Validaciones automáticas para confirmarla).")))
     elif estado in SQL_SE_ENVIA:
-        checks.append((OK, f"Base de datos: {detalle}."))
+        checks.append((OK, f"Base de datos: {detalle}"))
     elif estado in (SQL_SUGERENCIA, SQL_PADRE_CORREGIDO):
-        checks.append((AVISO, f"Base de datos: {detalle}."))
+        checks.append((AVISO, f"Base de datos: {detalle}"))
     elif estado == SQL_ES_PADRE:
-        checks.append((MAL, f"Base de datos: {detalle}."))
+        checks.append((MAL, f"Base de datos: {detalle}"))
     elif estado in SQL_PROBLEMAS:
-        checks.append((MAL, f"Base de datos: {detalle}."))
+        checks.append((MAL, f"Base de datos: {detalle}"))
     elif estado != SQL_SIN_DATOS:
-        checks.append((INFO, f"Base de datos: {detalle}."))
+        checks.append((INFO, f"Base de datos: {detalle}"))
     for texto in r.get("SQL_Clientes_Sin_Renov") or []:
         checks.append((AVISO, f"Base de datos: {texto}."))
     return checks
@@ -401,10 +411,14 @@ def _accion_corregir(r: dict, checks: list) -> str:
         return (f"Cambia el crédito {r.get('Credito_Renovado_Hijo')} por la renovación "
                 f"{r.get('SQL_Renovacion_Hija') or '(ver base de datos)'} antes de mandarla.")
     if r.get("Datos_Incompletos"):
-        return "Completa el dato que falta (correo original o iTop) antes de mandarla."
+        return "Completa el dato que falta (correo original o iTop) con «Corregir dato» (E) antes de mandarla."
     if r.get("Error_Envio"):
         return "Salió con datos equivocados: avisa a quien mandó el ticket único para corregirlo."
     if r.get("SQL_Estado") in SQL_PROBLEMAS:
+        if r.get("SQL_Opciones"):
+            c, n, f = r["SQL_Opciones"][0]
+            return (f"La base no la confirma; el cliente tiene la renovación {n}" + (f" del {_f(f, '%d/%m')}" if f else "")
+                    + ". Si es esa, usa «Corregir dato» (E); si no, verifica con la sucursal.")
         return "La base no la confirma: verifica cliente y crédito con la sucursal antes de mandarla."
     malas = [t for e, t in checks if e == MAL]
     return f"Revisa: {malas[0]}" if malas else "Revísala antes de mandarla."
@@ -524,8 +538,9 @@ def comparacion(r: dict, en_lote: bool = None) -> list:
     en_lote = va_en_lote(r) if en_lote is None else en_lote
     estado = r.get("SQL_Estado")
     cli, cred = r.get("Numero_Cliente"), r.get("Credito_Renovado_Hijo")
-    cli_inc = r.get("Cliente_Enviado", cli) if "Cliente_Enviado" in r else cli
-    cred_inc = r.get("Credito_Padre_Enviado") or cred
+    antes = r.get("Correccion_Manual") or {}
+    cli_inc = antes.get("cliente") or (r.get("Cliente_Enviado", cli) if "Cliente_Enviado" in r else cli)
+    cred_inc = antes.get("credito") or r.get("Credito_Padre_Enviado") or cred
     alta, llegada = r.get("SQL_Fecha_Alta"), r.get("Fecha_Llegada_DT") or r.get("Fecha_DT")
     confirma = estado in SQL_SE_ENVIA + (SQL_PADRE_CORREGIDO,)
     sin_base = not estado or estado == SQL_SIN_DATOS

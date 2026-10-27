@@ -50,10 +50,62 @@ def lote_corto(etiqueta: str) -> str:
 
 
 def row_key(row: dict) -> str:
-    """Llave estable de una renovación (no depende del orden ni del gafete): Ticket|Cliente|Crédito."""
-    cli = first_digits(row.get('Numero_Cliente')) or 'SC'
-    cred = first_digits(row.get('Credito_Renovado_Hijo')) or 'SR'
+    """
+    Llave estable de una renovación (no depende del orden ni del gafete): Ticket|Cliente|Crédito. Si se corrigió a mano,
+    con lo que traía el correo (así no se pierde lo ya marcado ni la corrección en la siguiente actualización).
+    """
+    antes = row.get('Correccion_Manual') or {}
+    cli = first_digits(antes.get('cliente', row.get('Numero_Cliente'))) or 'SC'
+    cred = first_digits(antes.get('credito', row.get('Credito_Renovado_Hijo'))) or 'SR'
     return f"{row.get('Numero_Ticket', '')}|{cli}|{cred}|{row.get('Indice_En_Ticket', '') if cred == 'SR' else ''}"
+
+
+def _sin_dato(valor) -> bool:
+    return not first_digits(valor) or str(valor).upper().startswith('SIN')
+
+
+def aplicar_correccion(row: dict, cliente: str, credito: str, hora: str = '') -> bool:
+    """
+    El analista corrigió el cliente o el crédito a cancelar (por ejemplo, con la renovación de ese día que dice la
+    base): lo que traía el correo queda en 'Correccion_Manual'. False si ya estaba corregida o no cambia nada.
+    """
+    if row.get('Correccion_Manual'):
+        return False
+    cli_antes, cred_antes = row.get('Numero_Cliente', ''), row.get('Credito_Renovado_Hijo', '')
+    cliente, credito = (cliente or cli_antes), (credito or cred_antes)
+    if (first_digits(cliente), first_digits(credito)) == (first_digits(cli_antes), first_digits(cred_antes)):
+        return False
+    row['Correccion_Manual'] = {'cliente': cli_antes, 'credito': cred_antes, 'hora': hora,
+                                'nivel': row.get('Nivel_Alerta'), 'alerta': row.get('Alerta_Renovacion')}
+    row['Numero_Cliente'], row['Credito_Renovado_Hijo'] = cliente, credito
+    row['Datos_Incompletos'] = _sin_dato(cliente) or _sin_dato(credito)
+    if not row['Datos_Incompletos'] and row.get('Nivel_Alerta') == 'incompleto':
+        row['Nivel_Alerta'] = 'multiple' if row.get('Es_Multiple') else 'normal'
+        row['Alerta_Renovacion'] = "✏️ Dato corregido a mano"
+    return True
+
+
+def quitar_correccion(row: dict) -> bool:
+    """Regresa lo que traía el correo. False si no estaba corregida."""
+    antes = row.pop('Correccion_Manual', None)
+    if not antes:
+        return False
+    row['Numero_Cliente'], row['Credito_Renovado_Hijo'] = antes['cliente'], antes['credito']
+    row['Datos_Incompletos'] = _sin_dato(antes['cliente']) or _sin_dato(antes['credito'])
+    if antes.get('nivel'):
+        row['Nivel_Alerta'], row['Alerta_Renovacion'] = antes['nivel'], antes.get('alerta', '')
+    return True
+
+
+def aplicar_correcciones(rows: list, correcciones: dict) -> list:
+    """Vuelve a poner lo corregido a mano ({llave: {'cliente', 'credito', 'hora'}}) en las renovaciones recién leídas.
+    Regresa las que se corrigieron ahora (las que ya lo estaban no cuentan)."""
+    hechas = []
+    for r in rows:
+        cor = correcciones.get(row_key(r)) if not r.get('Correccion_Manual') else None
+        if cor and aplicar_correccion(r, cor.get('cliente', ''), cor.get('credito', ''), cor.get('hora', '')):
+            hechas.append(r)
+    return hechas
 
 
 def llaves_fila(row: dict) -> list:
@@ -80,7 +132,7 @@ class EstadoValidaciones:
     'bitacora' ({llave: [[hora, acción, detalle], …]}). Purga lo que tenga más de `dias_retencion` días.
     """
 
-    CATEGORIAS = ('validados', 'descartados', 'incluidos', 'dudas', 'bitacora')
+    CATEGORIAS = ('validados', 'descartados', 'incluidos', 'dudas', 'bitacora', 'correcciones')
 
     def __init__(self, path: str, dias_retencion: int = 30):
         self.path = path
@@ -145,6 +197,15 @@ class EstadoValidaciones:
 
     def duda(self, key: str) -> str:
         return (self.data['dudas'].get(key) or {}).get('nota', '')
+
+    def corregir(self, key: str, cliente: str = '', credito: str = ''):
+        """Guarda lo corregido a mano de esa renovación (sin cliente ni crédito = se quita la corrección)."""
+        if cliente or credito:
+            self.data['correcciones'][key] = {'hora': datetime.now().isoformat(timespec='seconds'),
+                                              'cliente': cliente, 'credito': credito}
+        else:
+            self.data['correcciones'].pop(key, None)
+        self.save()
 
 
 # ======================= LOTE PARA CORREO / PORTAPAPELES =======================

@@ -511,6 +511,23 @@ def validar_par(cliente: str, credito: str, ref: date, por_cliente: dict, por_cr
     return SQL_SIN_DATOS, ""
 
 
+def opciones_correccion(cliente: str, credito: str, ref: date, por_cliente: dict, por_credito: dict) -> list:
+    """
+    Renovaciones de la base que podrían ser la buena, para «Corregir dato»: [(cliente, renovación, fecha de alta)].
+    Las del cliente de esos días (las del mismo día primero) y, si falta el cliente, de quién es ese crédito.
+    """
+    desde, hasta = ref - timedelta(days=DIAS_ANTES), ref + timedelta(days=1)
+    res = []
+    if cliente:
+        cercanas = [(f, n) for f, n in por_cliente.get(cliente, []) if f and desde <= f <= hasta and n != credito]
+        for f, n in sorted(cercanas, key=lambda x: (x[0] != ref, -x[0].toordinal())):
+            res.append((cliente, n, f))
+    elif credito:
+        res += [(c, credito, f) for f, c in sorted(por_credito.get(credito, []), key=lambda x: x[0] or date.min,
+                                                     reverse=True) if f and desde <= f <= hasta]
+    return list(dict.fromkeys(res))[:4]
+
+
 def corregir_padre(r: dict, hijas: list) -> str:
     """
     El incidente trae el crédito padre: el crédito a cancelar pasa a ser su renovación (el hijo), para que el ticket único
@@ -618,8 +635,9 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
             error_tz_lock = _mensaje(e)
 
     conteos = {}
-    for r, (c, cr, _), (estado, texto, alta, cedula) in zip(rows, pares, resultados):
+    for r, (c, cr, ref), (estado, texto, alta, cedula) in zip(rows, pares, resultados):
         r['SQL_Estado'], r['SQL_Detalle'], r['SQL_Fecha_Alta'] = estado, texto, alta
+        r['SQL_Opciones'] = [] if estado in SQL_SE_ENVIA else opciones_correccion(c, cr, ref, por_cliente, por_credito)
         r['SQL_Tz_Lock'] = tz_lock.get((c, cr)) if alta else None
         r['SQL_Clientes_Sin_Renov'] = [t for _, t in clientes_sin_renovaciones(r, por_cliente)]
         r['SQL_Cedula'] = "Esta renovación ha emitido, favor de validar (está en CR_CEDULAS_DETALLE)" if cedula else ""

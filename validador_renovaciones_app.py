@@ -60,6 +60,9 @@ from lote_utils import (
     EstadoValidaciones,
     row_key,
     llaves_fila,
+    aplicar_correccion,
+    aplicar_correcciones,
+    quitar_correccion,
     build_ticket_unico_tsv,
     build_ticket_unico_html,
     set_clipboard_html,
@@ -250,6 +253,7 @@ ATAJOS = [
     ("Espacio / doble clic", "Marcar o desmarcar como validada (y pasa a la siguiente pendiente)"),
     ("Ctrl + Z", "Deshacer lo último (validar, descartar, restaurar…)"),
     ("N", "Ir a la siguiente pendiente"),
+    ("E", "Corregir el cliente o el crédito a cancelar (por ejemplo, con la renovación que dice la base)"),
     ("J  /  K", "Renovación siguiente / anterior"),
     ("?", "Ver estos atajos"),
     ("Enter", "Abrir el ticket seleccionado en iTop"),
@@ -1961,6 +1965,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.tree_desglose.bind("<Control-c>", lambda e: self._copy_selected_rows())
         self.tree_desglose.bind("<n>", lambda e: self._siguiente_pendiente())
         self.tree_desglose.bind("<N>", lambda e: self._siguiente_pendiente())
+        self.tree_desglose.bind("<e>", lambda e: self._corregir_dato())
+        self.tree_desglose.bind("<E>", lambda e: self._corregir_dato())
         # Estado vacío sobre la tabla
         self.lbl_empty = ctk.CTkLabel(self.tab_desglose, text="", font=F(13), text_color=COL["muted"], fg_color=COL["surface"])
 
@@ -2134,6 +2140,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         botones = self._detail_botones = ctk.CTkFrame(hdr, fg_color="transparent")
         botones.grid(row=0, column=1, sticky="ne", padx=(8, 0))
         self._btn(botones, "Abrir en iTop", self._open_selected_in_itop, height=30).pack(side="left", ipadx=6)
+        self._btn(botones, "Corregir dato", self._corregir_dato, height=30).pack(side="left", padx=(8, 0), ipadx=6)
         self._btn(
             botones, "Copiar cliente y crédito", lambda: self._copy_field(('Numero_Cliente', 'Credito_Renovado_Hijo')),
             height=30
@@ -2261,6 +2268,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         m.add_command(label="Marcar / desmarcar validada", accelerator="Espacio", command=self._toggle_selected_validation)
         m.add_command(label="Abrir en iTop", accelerator="Enter", command=self._open_selected_in_itop)
         m.add_command(label="Buscar el folio en iTop", command=lambda: self._open_selected_in_itop(buscar=True))
+        m.add_command(label="Corregir cliente o crédito…", accelerator="E", command=self._corregir_dato)
         if EQUIPO_ACTIVO:
             m.add_command(label="Pasar duda al validador…", accelerator="D", command=self._poner_duda)
         m.add_separator()
@@ -2585,6 +2593,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             ("Validar la seleccionada (Espacio)", self._toggle_selected_validation),
             ("Deshacer lo último (Ctrl+Z)", self._deshacer_ultimo),
             ("Abrir en iTop (Enter)", self._open_selected_in_itop),
+            ("Corregir cliente o crédito a cancelar (E)", self._corregir_dato),
             ("Ver el calendario de emisión", self._recordatorio_emision),
             ("Ver atajos de teclado (?)", self._show_shortcuts),
             ("Cambiar a modo oscuro" if not _TEMA["oscuro"] else "Cambiar a modo claro",
@@ -2967,6 +2976,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 **corte_opts
             )
             lote_info = self.engine.lote_info
+            # Lo corregido a mano (antes de validar en la base: así la base confirma el número bueno)
+            aplicar_correcciones(rows, dict(self.estado.data.get('correcciones') or {}))
             validaciones = {'ocr': dict(self.engine.ocr_info), 'sql': None,
                             'errores_lectura': list(getattr(self.engine, 'errores_lectura', []))}
             if sql_cfg and rows:
@@ -3007,6 +3018,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 messagebox.showerror("Error al extraer de Outlook", error_msg)
             return
 
+        # Una corrección guardada mientras se extraía: se pone ya; la base la confirma en la siguiente actualización
+        for r in aplicar_correcciones(rows, self.estado.data.get('correcciones') or {}):
+            if r.get('SQL_Estado'):
+                r['SQL_Estado'], r['SQL_Detalle'], r['SQL_Opciones'], r['SQL_Fecha_Alta'] = None, '', [], None
         self.all_rows = rows
         self.lote_info = lote_info
         self.validaciones = validaciones or {}
@@ -3568,6 +3583,117 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._refrescar_tras_accion()
         self._con_deshacer(f"Validaste {len(rids)} que marcó el equipo", lambda: self._restaurar_estado(rids, copia))
 
+    # ---- Corregir el cliente o el crédito a cancelar ----
+
+    def _corregir_dato(self):
+        """
+        Corrige el cliente o el crédito a cancelar de la renovación seleccionada (por ejemplo, con la renovación de ese
+        día que encontró la base): así al copiar y en el ticket único ya va el número bueno. Se guarda en este equipo y
+        se vuelve a poner en cada actualización; lo del correo se sigue viendo en el desglose.
+        """
+        rows = self._selected_rows()
+        if len(rows) != 1:
+            self._toast("Selecciona una sola renovación para corregirla.", COL["muted"], ms=4000)
+            return
+        r = rows[0]
+        antes = r.get('Correccion_Manual') or {}
+        win = ctk.CTkToplevel(self)
+        win.title(f"Corregir dato · {r.get('Numero_Ticket', '')}")
+        win.configure(fg_color=COL["bg"])
+        win.resizable(False, False)
+        win.transient(self)
+        ctk.CTkLabel(win, text="Corregir cliente o crédito a cancelar", font=F(17, True), text_color=COL["text"]).pack(
+            anchor="w", padx=22, pady=(18, 2))
+        correo = (f"El correo trae: cliente {antes.get('cliente', r.get('Numero_Cliente'))} · crédito "
+                  f"{antes.get('credito', r.get('Credito_Renovado_Hijo'))}")
+        ctk.CTkLabel(win, text=correo, font=F(12), text_color=COL["text_2"], anchor="w").pack(anchor="w", padx=22)
+        detalle = re.sub(r"\s+", " ", str(r.get('SQL_Detalle') or '')).strip()
+        if detalle:
+            ctk.CTkLabel(win, text=f"Base de datos: {detalle}", font=F(11), text_color=COL["muted"], justify="left",
+                         anchor="w", wraplength=440).pack(anchor="w", padx=22, pady=(6, 0))
+
+        campos = ctk.CTkFrame(win, fg_color="transparent")
+        campos.pack(fill="x", padx=22, pady=(14, 0))
+        ctk.CTkLabel(campos, text="Cliente", font=F(12), text_color=COL["text_2"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(campos, text="Crédito a cancelar", font=F(12), text_color=COL["text_2"]).grid(
+            row=0, column=1, sticky="w", padx=(12, 0))
+        ent_cli = ctk.CTkEntry(campos, width=200, height=34, font=F(13))
+        ent_cred = ctk.CTkEntry(campos, width=200, height=34, font=F(13))
+        ent_cli.grid(row=1, column=0)
+        ent_cred.grid(row=1, column=1, padx=(12, 0))
+        for ent, valor in ((ent_cli, r.get('Numero_Cliente')), (ent_cred, r.get('Credito_Renovado_Hijo'))):
+            if valor and not str(valor).upper().startswith('SIN'):
+                ent.insert(0, str(valor))
+
+        def poner(cli, cred):
+            for ent, valor in ((ent_cli, cli), (ent_cred, cred)):
+                ent.delete(0, "end")
+                ent.insert(0, valor)
+
+        opciones = r.get('SQL_Opciones') or []
+        if opciones:
+            ctk.CTkLabel(win, text="La base tiene:", font=F(12), text_color=COL["text_2"]).pack(
+                anchor="w", padx=22, pady=(12, 2))
+            for cli, cred, fecha in opciones:
+                texto = f"Usar {cred}  ·  cliente {cli}" + (f"  ·  alta {fecha:%d/%m/%Y}" if fecha else "")
+                self._btn(win, texto, lambda c=cli, n=cred: poner(c, n), "link", height=28, anchor="w").pack(
+                    anchor="w", padx=16)
+        lbl_error = ctk.CTkLabel(win, text="", font=F(11), text_color=COL["danger"])
+        lbl_error.pack(anchor="w", padx=22)
+
+        def guardar(_e=None):
+            cli, cred = re.sub(r"\D", "", ent_cli.get()), re.sub(r"\D", "", ent_cred.get())
+            if not re.fullmatch(r"\d{5,10}", cli) or not re.fullmatch(r"\d{3,8}", cred):
+                lbl_error.configure(text="Escribe el cliente (5 a 10 dígitos) y el crédito a cancelar (3 a 8 dígitos).")
+                return
+            win.destroy()
+            self._guardar_correccion(r, cli, cred)
+
+        def quitar():
+            win.destroy()
+            self._guardar_correccion(r, "", "")
+
+        botones = ctk.CTkFrame(win, fg_color="transparent")
+        botones.pack(fill="x", padx=22, pady=(8, 18))
+        self._btn(botones, "Guardar", guardar, "primary").pack(side="right", ipadx=12)
+        self._btn(botones, "Cancelar", win.destroy, "ghost").pack(side="right", padx=(0, 8))
+        if antes:
+            self._btn(botones, "Volver a lo del correo", quitar, "danger").pack(side="left")
+        for ent in (ent_cli, ent_cred):
+            ent.bind("<Return>", guardar)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.after(150, lambda: (win.lift(), win.focus_force(), ent_cred.focus_set(), ent_cred.select_range(0, "end")))
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+    def _guardar_correccion(self, r: dict, cliente: str, credito: str):
+        """Guarda la corrección (vacía = regresa lo del correo), la pone en pantalla y, con la base activa, actualiza
+        para que la base confirme el número nuevo."""
+        k = self._key_by_rid.get(r['Row_ID']) or row_key(r)
+        previo = f"cliente {r.get('Numero_Cliente')} · crédito {r.get('Credito_Renovado_Hijo')}"
+        quitar_correccion(r)
+        if cliente and aplicar_correccion(r, cliente, credito, datetime.now().isoformat(timespec='seconds')):
+            self.estado.corregir(k, cliente, credito)
+            accion, msg = "Corrigió el dato", (f"Corregido: cliente {cliente} · crédito {credito}. Al copiar y en el "
+                                               f"ticket único ya va así.")
+        else:
+            self.estado.corregir(k)
+            accion, msg = "Quitó la corrección", "Se regresó a lo que trae el correo."
+        self.estado.registrar([k], accion, f"{previo} → cliente {r.get('Numero_Cliente')} · crédito "
+                                           f"{r.get('Credito_Renovado_Hijo')}")
+        sql = bool(self.var_sql.get())
+        if sql:
+            # Lo que la base dijo era del número anterior: se vuelve a validar al actualizar
+            r['SQL_Estado'], r['SQL_Detalle'], r['SQL_Opciones'], r['SQL_Fecha_Alta'] = None, '', [], None
+        self._refrescar_tras_accion()
+        self._show_row_detail(r)
+        if sql and not self.is_extracting and self._ultima_busqueda:
+            msg += " Actualizando para confirmarlo en la base…"
+            self.after(200, lambda: self._start_extraction(auto=True))
+        self._toast(msg, COL["success"], ms=6000)
+
     def _poner_duda(self):
         """Usuario: deja una duda al validador sobre la renovación seleccionada (le llega por la carpeta compartida)."""
         if not self._es_usuario():
@@ -4111,6 +4237,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         for s in siblings:
             for campo in ('Numero_Cliente', 'Credito_Renovado_Hijo', 'Credito_Origen_Padre', 'Credito_Padre_Enviado'):
                 numeros.update(n.lstrip('0') for n in re.findall(r'\d{3,10}', str(s.get(campo, ''))))
+            for valor in [(s.get('Correccion_Manual') or {}).get(c) for c in ('cliente', 'credito')]:  # lo que traía el correo (se corrigió a mano)
+                numeros.update(n.lstrip('0') for n in re.findall(r'\d{3,10}', str(valor or '')))
         for n in numeros:
             if not n:
                 continue
