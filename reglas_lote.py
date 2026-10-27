@@ -27,6 +27,7 @@ from sql_renovaciones import (
     SQL_NO_EXISTE, SQL_SIN_RENOVACIONES, SQL_OTRA_FECHA,
     LEYENDA_NO_PROCEDE,
 )
+from lote_utils import pl
 
 # Estados de lote que no van en el ticket único de hoy (se ven en su filtro; el validador puede «Restaurar»)
 LOTE_EXCLUIDOS = (LOTE_ENVIADA, LOTE_SIGUIENTE, LOTE_CERRADA_SIN_ENVIO, LOTE_SIN_COMPROBAR)
@@ -156,7 +157,7 @@ def aplicar_reglas(rows: list) -> dict:
         if estado == LOTE_CERRADA_SIN_ENVIO:
             if r["Cerrado_Por_Error"]:
                 r["No_Enviada"], r["Cerrada_Sin_Envio"] = True, False
-                r["Lote_Resumen"] = f"NO ENVIADA ({_f(r.get('Dia_Lote'), '%d/%m')})  ·  cerrado por error  ·  va hoy"
+                r["Lote_Resumen"] = f"NO SALIÓ ({_f(r.get('Dia_Lote'), '%d/%m')})  ·  cerrado por error  ·  va hoy"
             elif r["Posible_Cierre_Error"]:
                 r["No_Enviada"], r["Cerrada_Sin_Envio"] = False, False
                 r["Lote_Resumen"] = "¿Cerrado por error?  ·  falta TZ_LOCK"
@@ -183,7 +184,7 @@ def aplicar_reglas(rows: list) -> dict:
         if r["Informativa_Tipo"]:
             conteo[r["Informativa_Tipo"]] += 1
             if r.get("No_Enviada"):
-                # No salió en su día, pero ya no se manda: no es un faltante ni dice «NO ENVIADA» en la tabla
+                # No salió en su día, pero ya no se manda: no es un faltante ni dice «NO SALIÓ» en la tabla
                 r["No_Enviada"] = False
                 r["Lote_Resumen"] = (f"No salió el {_f(r.get('Dia_Lote'), '%d/%m')}  ·  "
                                      + ("resuelto en iTop" if r["Informativa_Tipo"] == INFO_CERRADA else "no procede"))
@@ -217,6 +218,42 @@ def va_en_lote(r: dict) -> bool:
     return r.get("Lote_Estado") not in LOTE_EXCLUIDOS
 
 
+def grupos_del_dia(filas: list, descartadas=(), incluidas=(), solo_periodo: bool = False) -> dict:
+    """
+    Los grupos que usan a la vez los avisos y los indicadores (así no se contradicen):
+      'cerradas_error': se cerraron por error y sí van hoy;
+      'posibles_cierre': ¿se cerraron por error? (falta TZ_LOCK), fuera del lote;
+      'no_se_mandan': informativas fuera del lote (emitidas, resueltas en iTop, no proceden), y
+      'por_tipo': {Informativa_Tipo: cuántas} de esas.
+    No cuenta lo descartado. `incluidas`: lo que se metió a mano (va aunque las reglas digan que no).
+    `solo_periodo`: en la revisión semanal, solo lo del periodo.
+    """
+    descartadas, incluidas = set(descartadas), set(incluidas)
+    vivas = [r for r in filas if r.get("Row_ID") not in descartadas
+             and (not solo_periodo or r.get("En_Periodo", True))]
+
+    def fuera(r):
+        return not va_en_lote(r) and r.get("Row_ID") not in incluidas
+
+    no_se_mandan = [r for r in vivas if r.get("Informativa") and fuera(r)]
+    por_tipo = {}
+    for r in no_se_mandan:
+        por_tipo[r.get("Informativa_Tipo")] = por_tipo.get(r.get("Informativa_Tipo"), 0) + 1
+    return {
+        "cerradas_error": [r for r in vivas if r.get("Cerrado_Por_Error") and not fuera(r)],
+        "posibles_cierre": [r for r in vivas if r.get("Posible_Cierre_Error") and fuera(r)],
+        "no_se_mandan": no_se_mandan,
+        "por_tipo": por_tipo,
+    }
+
+
+def texto_no_se_mandan(por_tipo: dict) -> str:
+    """«1 ya se emitió · 2 resueltas en iTop» ('' si no hay)."""
+    textos = ((INFO_EMISION, "# ya se [emitió|emitieron]"), (INFO_CERRADA, "# [resuelta|resueltas] en iTop"),
+              (INFO_NO_PROCEDE, "# no [procede|proceden]"))
+    return " · ".join(pl(por_tipo[t], txt) for t, txt in textos if por_tipo.get(t))
+
+
 # ======================= Desglose del ticket =======================
 
 def _check_correo(r: dict) -> tuple:
@@ -232,6 +269,12 @@ def _check_correo(r: dict) -> tuple:
         return AVISO, f"Correo: leído de una captura de pantalla ({_limpio(r['Dato_Imagen'])}). Compáralo con la imagen."
     if "DISCREPANCIA" in str(r.get("Alerta_Renovacion", "")):
         return AVISO, f"Correo: trae dos números de cliente para este crédito ({cli}). Confirma cuál es."
+    if r.get("Clientes_Sin_Leer"):
+        nums = r["Clientes_Sin_Leer"]
+        uno = len(nums) == 1
+        return AVISO, (f"Correo: también trae {'el número' if uno else 'los números'} {', '.join(nums[:4])}"
+                       f"{'…' if len(nums) > 4 else ''}, que no se {'leyó' if uno else 'leyeron'} como cliente: "
+                       f"revisa que no falte una renovación.")
     parte = f" (renovación {r.get('Indice_En_Ticket')} de {r.get('Total_En_Ticket')})" if r.get("Es_Multiple") else ""
     return OK, f"Correo: cliente {cli} y crédito {cred}{parte}."
 
@@ -280,7 +323,7 @@ def _check_envio(r: dict) -> tuple:
     if r.get("No_Enviada_Emitida"):
         return INFO, f"Ticket único: no salió el {dia}, que era su día, y ya se emitió."
     if estado == LOTE_ENVIADA:
-        tarde = f", {r['Dias_Retraso']} día(s) tarde" if r.get("Dias_Retraso") else ""
+        tarde = f", {r['Dias_Retraso']} {'día' if r['Dias_Retraso'] == 1 else 'días'} tarde" if r.get("Dias_Retraso") else ""
         if r.get("Posible_Duplicado"):
             return AVISO, (f"Ticket único: ya había salido el {_f(r.get('Enviado_Fecha'), '%d/%m')}, antes de que "
                            f"llegara este incidente (¿solicitud duplicada?).")
@@ -388,12 +431,14 @@ def veredicto(r: dict, en_lote: bool = None, validada: bool = False, descartada:
     if r.get("Informativa") and not en_lote:
         tipo = r.get("Informativa_Tipo")
         titulo, accion, decide = {
-            INFO_EMISION: ("Ya se emitió · no se manda", "No la mandes: ya no se puede cancelar.", "Calendario"),
-            INFO_CERRADA: ("Incidente resuelto · no se manda", "No la mandes: el incidente ya se resolvió en iTop.", "iTop"),
-            INFO_NO_PROCEDE: ("No procede · no se manda",
-                              f"No la mandes. Si el incidente sigue abierto, respóndelo con: «{LEYENDA_NO_PROCEDE}».",
+            INFO_EMISION: ("No se manda: ya se emitió",
+                           "Nada que hacer: ya no se puede cancelar. Si el incidente sigue abierto, respóndelo.",
+                           "Calendario"),
+            INFO_CERRADA: ("No se manda: resuelta en iTop", "Nada que hacer.", "iTop"),
+            INFO_NO_PROCEDE: ("No se manda: no procede",
+                              f"Si el incidente sigue abierto, respóndelo con: «{LEYENDA_NO_PROCEDE}».",
                               "Base de datos"),
-        }.get(tipo, ("No se manda", "No la mandes.", None))
+        }.get(tipo, ("No se manda", "Nada que hacer.", None))
         return v(NO_SE_MANDA, "No se manda", titulo, accion, decide, va=False)
     if r.get("Posible_Cierre_Error") and not en_lote:
         return v(REVISAR, "¿Cerrada por error?", "¿Se cerró por error?",
@@ -411,7 +456,7 @@ def veredicto(r: dict, en_lote: bool = None, validada: bool = False, descartada:
             return v(SIGUIENTE, "Siguiente", "Va en el siguiente ticket único",
                      f"No va hoy: va en el ticket único del {_f(r.get('Dia_Lote'))}.", "Ticket único", va=False)
         if estado == LOTE_CERRADA_SIN_ENVIO:
-            return v(NO_SE_MANDA, "No se manda", "No se envió y ya se cerró",
+            return v(NO_SE_MANDA, "No se manda", "No salió y ya se cerró",
                      "No salió en su día y el incidente ya se cerró: no entra al lote («Restaurar» la incluye).",
                      "iTop", va=False)
         return v(SIN_COMPROBAR, "Sin comprobar", "Sin comprobar",

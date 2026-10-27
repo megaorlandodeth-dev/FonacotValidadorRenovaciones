@@ -21,6 +21,14 @@ from core_renovaciones import first_digits, guardar_json, LOTE_REZAGADA
 _EMOJI_RE = re.compile('[\U0001F000-\U0001FAFF☀-➿⬀-⯿⌚-⏿️‍]')
 
 
+def pl(n: int, texto: str) -> str:
+    """
+    Concordancia con el número: «# [renovación|renovaciones] ya se [emitió|emitieron]» -> «1 renovación ya se emitió» o
+    «3 renovaciones ya se emitieron». # es el número; de cada [uno|varios] queda el que toca.
+    """
+    return re.sub(r"\[([^|\]]*)\|([^\]]*)\]", lambda m: m.group(1) if n == 1 else m.group(2), texto).replace("#", str(n))
+
+
 def plain_text(value) -> str:
     """Quita emojis/íconos de los textos del motor para mostrarlos en tablas y reportes con aspecto sobrio."""
     s = str(value or '').replace('➔', '→')
@@ -29,15 +37,15 @@ def plain_text(value) -> str:
 
 
 def lote_corto(etiqueta: str) -> str:
-    """'Rezagada 22/10 14:53 (el ticket está en el concentrado pero NO este…)' -> 'Rezagada 22/10 14:53 · otros datos en el concentrado'."""
+    """'Rezagada 22/10 14:53 (el incidente viene en el ticket único pero NO este…)' -> '… · otros datos en el ticket único'."""
     m = re.match(r'(.*?)\s*\((.*)\)$', etiqueta or '', re.S)
     if not m:
         return etiqueta or ''
     base, motivo = m.groups()
-    if motivo.startswith("el ticket está en el concentrado"):
-        motivo = "otros datos en el concentrado"
-    elif motivo == "no está en el concentrado":
-        motivo = "no se envió"
+    if motivo.startswith("el incidente viene en el ticket único pero NO"):
+        motivo = "otros datos en el ticket único"
+    elif motivo == "no viene en el ticket único":
+        motivo = "no salió"
     return f"{base}  ·  {motivo}"
 
 
@@ -205,7 +213,7 @@ def build_lote_html(rows: list, validados: set, titulo: str = "") -> str:
     rezagadas = sum(1 for r in rows if r.get('Lote_Estado') == LOTE_REZAGADA)
     resumen = f"Total de renovaciones a cancelar: {len(rows)}"
     if rezagadas:
-        resumen += f" (incluye {rezagadas} rezagada(s) del día anterior)"
+        resumen += f" (incluye {pl(rezagadas, '# [rezagada|rezagadas]')} del día anterior)"
     partes.append(f'<p style="font-family:Segoe UI,Arial;font-size:10pt">{escape(resumen)}</p>')
     return "\n".join(partes)
 

@@ -1146,6 +1146,33 @@ class RenovacionTicketParser:
             'origen_extraccion': 'Datos Incompletos'
         }]
 
+    # Antes de un número de 7 dígitos que no es de cliente (teléfono, folio, nómina…)
+    _NO_ES_CLIENTE = re.compile(
+        r'(?:tel[ée]?f?o?n?o?|cel(?:ular)?|ext(?:ensi[óo]n)?|folio|caso|ticket|incidente|n[óo]mina|empleado|gafete|trabajo|empresa|patr[óo]n|social)'
+        r'\b[^\n]{0,20}$', re.I)
+
+    @classmethod
+    def clientes_sin_leer(cls, texto: str, items: list) -> list:
+        """
+        Red de seguridad: números de 7 dígitos (como los de cliente) que trae el correo y no quedaron como cliente ni
+        crédito de ninguna renovación. Si hay, quizá falta una renovación; no cambia lo leído, solo se avisa.
+        """
+        leidos = set()
+        for i in items:
+            leidos.update(first_digits(x) for x in
+                          [i.get('cliente'), i.get('credito_renovado'), i.get('credito_padre')]
+                          + list(i.get('clientes_ticket') or []))
+        texto = unir_numeros_separados(texto or '')
+        faltan = []
+        for m in re.finditer(r'(?<![\d.,/-])\d{7}(?![\d]|[.,/-]\d)', texto):
+            num = m.group(0)
+            if num.lstrip('0') in leidos or num in faltan:
+                continue
+            if cls._NO_ES_CLIENTE.search(texto[max(0, m.start() - 30):m.start()]):
+                continue
+            faltan.append(num)
+        return faltan
+
     @classmethod
     def parse_and_disaggregate_email(
         cls,
@@ -1185,6 +1212,7 @@ class RenovacionTicketParser:
             if completos(otros) > completos(items):
                 items, descripcion = otros, texto
         total_in_ticket = len(items)
+        sin_leer = cls.clientes_sin_leer(f"{resumen}\n{descripcion}", items)
 
         rows = []
         for idx, item in enumerate(items, 1):
@@ -1228,6 +1256,7 @@ class RenovacionTicketParser:
                 'Credito_Renovado_Hijo': cred_ren,
                 'Credito_Origen_Padre': cred_pad or "-",
                 'Clientes_Ticket': list(item.get('clientes_ticket') or []),
+                'Clientes_Sin_Leer': sin_leer,
                 'Subtipo_Renovacion': subtipo,
                 'Motivo': motivo,
                 'Sucursal': item.get('sucursal', '') or base['localidad'][:35],
@@ -1967,7 +1996,7 @@ def clasificar_lotes(
                 r['Dias_Retraso'] = (f_env - dia).days
                 poner(r, LOTE_ENVIADA,
                       f"📨 Enviada tarde en {asunto(conc)} del {f_env:%d/%m}; debía ir en el del {dia:%d/%m} "
-                      f"({r['Dias_Retraso']} día(s) después)",
+                      f"({r['Dias_Retraso']} {'día' if r['Dias_Retraso'] == 1 else 'días'} después)",
                       f"Enviada tarde {f_env:%d/%m}  ·  debía ir {dia:%d/%m}")
             else:
                 poner(r, LOTE_ENVIADA, f"📨 Ya enviada en {asunto(conc)} del {f_env:%d/%m}", f"Enviada {f_env:%d/%m}")
@@ -1984,7 +2013,7 @@ def clasificar_lotes(
                 motivo_ticket = (f"DATOS EQUIVOCADOS en el ticket único del {_fecha_concentrado(ticket_hit):%d/%m}: "
                                  f"{r['Error_Envio']}")
             else:
-                motivo_ticket = "el ticket está en el concentrado pero NO este Cliente+Crédito"
+                motivo_ticket = "el incidente viene en el ticket único pero NO este Cliente+Crédito"
                 if en_conc:
                     motivo_ticket += "; ahí viene " + ", ".join(f"Cliente {f['cliente']} Crédito {f['credito']}" for f in en_conc)
         equivocada = "datos equivocados  ·  " if r['Error_Envio'] else ""
@@ -2028,15 +2057,15 @@ def clasificar_lotes(
                 continue
             if motivo_ticket:
                 motivo, corto = motivo_ticket, ("datos equivocados en el ticket único" if r['Error_Envio']
-                                                else "otros datos en el concentrado")
+                                                else "otros datos en el ticket único")
             elif junto_al_envio:
-                motivo, corto = f"llegó mientras se enviaba el ticket único ({junto_al_envio:%H:%M})", "llegó junto al envío"
+                motivo, corto = f"llegó mientras se enviaba el ticket único de las {junto_al_envio:%H:%M}", "llegó junto al envío"
             elif not es_habil(llegada.date()):
                 motivo, corto = ("llegó en fin de semana" if llegada.weekday() >= 5 else "llegó en día inhábil"), "día inhábil"
             elif llegada.date() in cortes:
-                motivo, corto = f"llegó después del envío del ticket único ({cortes[llegada.date()]:%H:%M})", "después del envío"
+                motivo, corto = f"llegó después del envío del ticket único de las {cortes[llegada.date()]:%H:%M}", "después del envío"
             elif metodo == 'concentrado':
-                motivo, corto = "no está en el concentrado", "no se envió"
+                motivo, corto = "no viene en el ticket único", "no salió"
             elif metodo == 'marca':
                 motivo, corto = "después de la última marca", "después de la marca"
             else:
@@ -2052,12 +2081,12 @@ def clasificar_lotes(
                 f_c = cierre.get('fecha_dt')
                 cuando = f" el {f_c:%d/%m}" if f_c else ""
                 poner(r, LOTE_CERRADA_SIN_ENVIO,
-                      f"❌ NO SE ENVIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}) y el incidente ya se cerró{cuando}",
-                      f"NO ENVIADA ({dia:%d/%m})  ·  {equivocada}cerrado{cuando}")
+                      f"❌ NO SALIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}) y el incidente ya se cerró{cuando}",
+                      f"NO SALIÓ ({dia:%d/%m})  ·  {equivocada}cerrado{cuando}")
             else:
                 poner(r, LOTE_REZAGADA,
-                      f"❌ NO SE ENVIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}); se suma al lote {de_hoy}",
-                      f"NO ENVIADA ({dia:%d/%m})  ·  {equivocada}{va_hoy}")
+                      f"❌ NO SALIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}); se suma al lote {de_hoy}",
+                      f"NO SALIÓ ({dia:%d/%m})  ·  {equivocada}{va_hoy}")
         elif dia == dia_anterior and metodo == 'marca':
             if llegada <= marca:
                 poner(r, LOTE_ENVIADA, f"📨 Enviada (antes de la marca {marca:%d/%m %H:%M})", "Enviada (marca local)")
