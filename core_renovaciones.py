@@ -740,10 +740,6 @@ class RenovacionTicketParser:
             r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|y|Y|\-|\+)\s*[C\-\d]+)+)',
             r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?[C\-]?[^\S\n]*(\d{3,7})\b',
             r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b',
-            # La etiqueta cierra el renglón y abajo solo vienen los créditos: «renovaciones de crédito\n45375, 45377,45380,»
-            # (de 3 a 6 dígitos: un número de cliente solo en el renglón de abajo no se toma como crédito)
-            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones))[^\S\n]*[:#\.]?[^\S\n]*\n[^\S\n]*'
-            r'((?:\d{3,6}[^\S\n]*(?:,|y|Y|\-)[^\S\n]*)*\d{3,6})[^\S\n]*[,\.]?[^\S\n]*(?=\n|$)'
         ]
 
         for pat in multi_credit_label_patterns:
@@ -761,6 +757,23 @@ class RenovacionTicketParser:
                     if token in clientes_found or token in creditos_padre_found:
                         continue
                     if token not in creditos_renovados_found:
+                        creditos_renovados_found.append(token)
+
+        # Último recurso, solo si no se encontró ningún crédito: la etiqueta cierra el renglón y abajo solo vienen los
+        # créditos («renovaciones de crédito\n45375, 45377,45380,»). De 3 a 6 dígitos (un número de cliente solo no
+        # cuenta) y no si el renglón es de otra cosa («Analista de Crédito\n2609», «capacidad de crédito\n15000»).
+        if not creditos_renovados_found:
+            for m in re.finditer(
+                    r'^([^\n]*\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)))[^\S\n]*[:#\.]?[^\S\n]*\n[^\S\n]*'
+                    r'((?:\d{3,6}[^\S\n]*(?:,|y|Y|\-)[^\S\n]*)*\d{3,6})[^\S\n]*[,\.]?[^\S\n]*(?=\n|$)',
+                    full_context, re.I | re.M):
+                if re.search(r'\b(analista|ejecutiv[oa]s?|capacidad|folio|depto|departamento|[áa]rea|gerencia|gerente|'
+                             r'jef[ea]|coordinaci[óo]n|direcci[óo]n|subdirecci[óo]n|sistema|monto|importe|saldo|'
+                             r'l[íi]mite|sucursal|oficina)\b', m.group(1), re.I):
+                    continue
+                for token in re.findall(r'\b\d{3,6}\b', m.group(2)):
+                    if (cls._is_valid_number_token(token, 3, 6) and token not in clientes_found
+                            and token not in creditos_padre_found and token not in creditos_renovados_found):
                         creditos_renovados_found.append(token)
 
         # Patrón Cliente + Crédito con signos: "+ 7239770+50074", "-8220974-60117", "+ 2431191 + 20757 + 20758",

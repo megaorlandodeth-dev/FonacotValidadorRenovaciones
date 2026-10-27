@@ -184,13 +184,14 @@ def corte_que_bloquea(alta: date, envio: date):
 
 def dia_de_envio(r: dict, lote_actual: date = None):
     """
-    Día del ticket único en que sale (o salió) la renovación: el del ticket único en que vino; si va en el lote que se
-    está armando, el de ese lote; si no, el día en que debía ir ('Dia_Lote') o, sin eso, el día en que llegó.
+    Día del ticket único en que sale (o salió) la renovación: el del ticket único en que vino; si va (o iría, si se
+    cerró por error) en el lote que se está armando, el de ese lote; si no, el día en que debía ir ('Dia_Lote') o, sin
+    eso, el día en que llegó.
     """
-    from core_renovaciones import LOTE_HOY, LOTE_REZAGADA
+    from core_renovaciones import LOTE_CERRADA_SIN_ENVIO, LOTE_HOY, LOTE_REZAGADA
     if r.get('Enviado_Fecha'):
         return r['Enviado_Fecha']
-    if lote_actual and r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA):
+    if lote_actual and r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA, LOTE_CERRADA_SIN_ENVIO):
         return lote_actual
     if r.get('Dia_Lote'):
         return r['Dia_Lote']
@@ -219,7 +220,7 @@ def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
     """
     n = 0
     for r in rows:
-        r['Bloqueo_Emision'], r['Bloqueo_Tipo'] = '', ''
+        r['Bloqueo_Emision'], r['Bloqueo_Tipo'], r['Bloqueo_Corto'] = '', '', ''
         llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
         llegada = llegada.date() if isinstance(llegada, datetime) else llegada
         alta = r.get('SQL_Fecha_Alta') or llegada
@@ -231,6 +232,9 @@ def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
         sale = f" y sale en el ticket único del {envio:%d/%m/%Y}" if envio != llegada else ""
         origen = (f"se dio de alta el {alta:%d/%m/%Y} y el incidente llegó el {llegada:%d/%m/%Y}"
                   if r.get('SQL_Fecha_Alta') else f"el incidente llegó el {llegada:%d/%m/%Y}")
+        desde = (f"se dio de alta el {alta:%d/%m}" if r.get('SQL_Fecha_Alta') else f"llegó el {llegada:%d/%m}")
+        r['Bloqueo_Corto'] = (f"{desde} y {corte[1]} pasó antes del ticket único del {envio:%d/%m}"
+                              .replace(f" ({corte[0]:%d/%m/%Y})", f" del {corte[0]:%d/%m}").replace("de el ", "del "))
         if emision:
             r['Bloqueo_Tipo'] = 'emision'
             r['Bloqueo_Emision'] = (f"YA NO SE PUEDE CANCELAR: {origen}{sale}, "
