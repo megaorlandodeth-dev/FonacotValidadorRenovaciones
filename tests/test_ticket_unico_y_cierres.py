@@ -178,9 +178,9 @@ class TestCierreItop(unittest.TestCase):
 
     def test_textos_cortos_de_la_tabla(self):
         self.assertEqual(
-            lote_corto("Rezagada 22/10 14:53 (el ticket está en el concentrado pero NO este Cliente+Crédito; ahí viene Cliente 1 Crédito 2)"),
-            "Rezagada 22/10 14:53  ·  otros datos en el concentrado")
-        self.assertEqual(lote_corto("Rezagada 22/10 12:56 (no está en el concentrado)"), "Rezagada 22/10 12:56  ·  no se envió")
+            lote_corto("Rezagada 22/10 14:53 (el incidente viene en el ticket único pero NO este Cliente+Crédito; ahí viene Cliente 1 Crédito 2)"),
+            "Rezagada 22/10 14:53  ·  otros datos en el ticket único")
+        self.assertEqual(lote_corto("Rezagada 22/10 12:56 (no viene en el ticket único)"), "Rezagada 22/10 12:56  ·  no salió")
         self.assertEqual(lote_corto("Lote de hoy"), "Lote de hoy")
 
 

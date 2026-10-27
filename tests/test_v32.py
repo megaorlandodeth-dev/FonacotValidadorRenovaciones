@@ -293,5 +293,86 @@ class TestArchivoDeLaClave(unittest.TestCase):
         self.assertEqual(clave_validador.OPCION_CREAR, "--crear-clave-validador")
 
 
+class TestPlurales(unittest.TestCase):
+    def test_concuerda_con_el_numero(self):
+        from lote_utils import pl
+        texto = "# [renovación ya se emitió|renovaciones ya se emitieron]"
+        self.assertEqual(pl(1, texto), "1 renovación ya se emitió")
+        self.assertEqual(pl(3, texto), "3 renovaciones ya se emitieron")
+        self.assertEqual(pl(0, "# no [salió|salieron]"), "0 no salieron")
+        self.assertEqual(pl(2, "Se [validará|validarán] # [fila|filas]."), "Se validarán 2 filas.")
+
+
+class TestRedDeSeguridadClientes(unittest.TestCase):
+    """Si el correo trae más números de 7 dígitos que clientes leídos, se avisa (quizá falta una renovación)."""
+
+    def leer(self, texto):
+        return Parser.parse_and_disaggregate_email("CANCELACION DE RENOVACION", "", texto, datetime(2026, 10, 27, 9),
+                                                   "I-1", "2609", "N")
+
+    def test_avisa_el_numero_que_no_se_leyo(self):
+        rows = self.leer("Cliente 4919283 crédito 71470\nTambién el 6210399 por favor")
+        self.assertEqual(rows[0]['Clientes_Sin_Leer'], ["6210399"])
+        nivel, texto = reglas._check_correo(rows[0])
+        self.assertEqual(nivel, reglas.AVISO)
+        self.assertIn("el número 6210399, que no se leyó como cliente", texto)
+
+    def test_no_avisa_telefonos_ni_centro_de_trabajo(self):
+        rows = self.leer("Cliente 4919283 crédito 71470\nTel. 5551234\nCentro de trabajo Grupo Bimbo 1234567\n"
+                         "Folio 7654321")
+        self.assertEqual(rows[0]['Clientes_Sin_Leer'], [])
+        self.assertEqual(reglas._check_correo(rows[0])[0], reglas.OK)
+
+    def test_no_avisa_lo_ya_leido(self):
+        rows = self.leer("Cliente 4919283 crédito 71470\nCliente 5864479 crédito 56572")
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r['Clientes_Sin_Leer'] == [] for r in rows))
+
+
+class TestGruposDelDia(unittest.TestCase):
+    """Avisos e indicadores salen de la misma función: no se contradicen."""
+
+    def setUp(self):
+        self.filas = [
+            dict(Row_ID="a", Cerrado_Por_Error=True, Lote_Estado=reglas.LOTE_CERRADA_SIN_ENVIO),
+            dict(Row_ID="b", Cerrado_Por_Error=True, Lote_Estado=reglas.LOTE_CERRADA_SIN_ENVIO),
+            dict(Row_ID="c", Informativa=True, Informativa_Tipo=reglas.INFO_EMISION),
+            dict(Row_ID="d", Informativa=True, Informativa_Tipo=reglas.INFO_CERRADA),
+            dict(Row_ID="e", Informativa=True, Informativa_Tipo=reglas.INFO_CERRADA),
+            dict(Row_ID="f", Informativa=True, Informativa_Tipo=reglas.INFO_CERRADA, En_Periodo=False),
+            dict(Row_ID="g", Posible_Cierre_Error=True, Lote_Estado=reglas.LOTE_CERRADA_SIN_ENVIO),
+        ]
+
+    def ids(self, filas):
+        return [r['Row_ID'] for r in filas]
+
+    def test_grupos(self):
+        g = reglas.grupos_del_dia(self.filas, descartadas={"b"}, incluidas={"d"})
+        self.assertEqual(self.ids(g['cerradas_error']), ["a"])  # la descartada no cuenta
+        self.assertEqual(self.ids(g['posibles_cierre']), ["g"])
+        self.assertEqual(self.ids(g['no_se_mandan']), ["c", "e", "f"])  # la metida a mano sí va
+        self.assertEqual(reglas.texto_no_se_mandan(g['por_tipo']), "1 ya se emitió · 2 resueltas en iTop")
+
+    def test_revision_solo_lo_del_periodo(self):
+        g = reglas.grupos_del_dia(self.filas, solo_periodo=True)
+        self.assertNotIn("f", self.ids(g['no_se_mandan']))
+
+    def test_sin_nada(self):
+        self.assertEqual(reglas.texto_no_se_mandan({}), "")
+
+
+class TestTextosDelRecuadro(unittest.TestCase):
+    def test_emitida_dice_que_hacer(self):
+        r = renovacion(Informativa=True, Informativa_Tipo=reglas.INFO_EMISION, Lote_Estado=reglas.LOTE_HOY)
+        v = reglas.veredicto(r, en_lote=False)
+        self.assertEqual(v['titulo'], "No se manda: ya se emitió")
+        self.assertTrue(v['accion'].startswith("Nada que hacer"))
+
+    def test_resuelta_en_itop(self):
+        r = renovacion(Informativa=True, Informativa_Tipo=reglas.INFO_CERRADA)
+        v = reglas.veredicto(r, en_lote=False)
+        self.assertEqual((v['titulo'], v['accion']), ("No se manda: resuelta en iTop", "Nada que hacer."))
+
+
 if __name__ == "__main__":
     unittest.main()
