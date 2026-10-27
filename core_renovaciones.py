@@ -739,7 +739,11 @@ class RenovacionTicketParser:
             r'(?:ya\s+renovado|cr[ée]dito\s+nuevo|cr[ée]dito\s+renovado|cr[ée]dito\s+hijo|pagar[ée])\s*[:\.\-\(]*\s*([C\-\d,\s yY]{3,35})',
             r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|y|Y|\-|\+)\s*[C\-\d]+)+)',
             r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?[C\-]?[^\S\n]*(\d{3,7})\b',
-            r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b'
+            r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b',
+            # La etiqueta cierra el renglón y abajo solo vienen los créditos: «renovaciones de crédito\n45375, 45377,45380,»
+            # (de 3 a 6 dígitos: un número de cliente solo en el renglón de abajo no se toma como crédito)
+            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones))[^\S\n]*[:#\.]?[^\S\n]*\n[^\S\n]*'
+            r'((?:\d{3,6}[^\S\n]*(?:,|y|Y|\-)[^\S\n]*)*\d{3,6})[^\S\n]*[,\.]?[^\S\n]*(?=\n|$)'
         ]
 
         for pat in multi_credit_label_patterns:
