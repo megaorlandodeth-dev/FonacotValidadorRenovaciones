@@ -100,6 +100,14 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
    - **El rojo gana:** una renovación que no se envió o salió mal se ve en rojo aunque la hayas validado antes.
    - La marca *última considerada* solo la deja el lote de hoy al copiarlo o crear el correo (no el Excel, ni una revisión, ni un lote pasado).
 
+**Novedades v3.2:**
+   - **Cada aviso se puede abrir:** los avisos rojos y ámbar van uno por renglón; clic en uno (*›*) y el desglose muestra solo esas renovaciones (vista *Las del aviso*), con el detalle de la primera abajo. Si el panel de detalle estaba oculto, se abre.
+   - **Lo resuelto en iTop no es «NO enviada»:** si una renovación no salió en su día pero el incidente ya se resolvió (y no se cerró por error), ya no cuenta como *NO enviada* ni en el resumen ni en *Por día*: se ve como *no se manda* y aparte, en ámbar. Solo cuenta lo que sigue abierto o se cerró por error. Los avisos de *Valídalas*, *APP con plazo menor* y *CR_CEDULAS* ya solo cuentan las que todavía van.
+   - **El usuario vuelve a elegir el periodo** (*Periodo de recepción*).
+   - **Cada perfil guarda su gafete:** al pasar de Validador a Usuario ya no se queda el gafete del compañero que el validador estaba revisando (antes no se podía cambiar porque en modo *Concentrado* el campo está deshabilitado). La primera vez se pide el gafete del usuario.
+   - **Contraseña del validador:** para entrar al perfil Validador se pide una contraseña. La primera vez que alguien entra como validador la crea (mínimo 6 caracteres); no se guarda la contraseña sino su huella (PBKDF2) en `validador_clave.json`, junto a la app: **reparte ese archivo con la app** para que todos los equipos pidan la misma. *Recordarla en este equipo* la guarda en el Administrador de credenciales de Windows; se cambia con *Cambiar la contraseña del validador* (menú de perfil o Ctrl+K).
+   - **Trabajo en equipo apagado por ahora** (`EQUIPO_ACTIVO = False` en la app): sin columna *Equipo*, sin *Pasar duda* ni *Validar lo del equipo*. El código sigue ahí para activarlo después.
+
 **Novedades v3.1:**
    - **Trabajo en equipo (carpeta compartida):** cada analista y el validador ponen la misma carpeta en *Configuración → Trabajo en equipo* (una carpeta de red `\\servidor\...`, o de OneDrive/SharePoint sincronizada) y pulsan *Probar*. No hace falta servidor ni base de datos nueva.
      - **Analista:** cada vez que valida (o deja una duda) la app escribe su archivo `marcas_<gafete>.json` en la carpeta: qué renovaciones validó, a qué hora, sus dudas y su avance. Cada quien escribe solo el suyo (se escribe a un temporal y se reemplaza, nadie lee un archivo a medias).
@@ -192,7 +200,8 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 - `lote_utils.py`: Persistencia de validaciones, tabla del lote (texto/HTML) y portapapeles con formato.
 - `reglas_lote.py`: Qué va en el lote y qué solo es informativo (emisión, resuelto, no procede, cerrado por error) y el veredicto con las comprobaciones del desglose.
 - `sql_renovaciones.py` / `calendario_cedulas.py`: Validación en la base (Oracle) y calendario de emisión y cierres de mes.
-- `equipo_compartido.py`: Trabajo en equipo por carpeta compartida (cada analista publica sus marcas; el validador las lee).
+- `equipo_compartido.py`: Trabajo en equipo por carpeta compartida (apagado en la v3.2).
+- `clave_validador.py`: Contraseña del perfil Validador (solo guarda su huella en `validador_clave.json`).
 - `tests/`: Pruebas automáticas del parser, del corte/rezagadas y de las utilidades del lote (no requieren Outlook).
 - `Ejecutar_Validador_Renovaciones.bat`: Script de inicio rápido.
 
@@ -221,7 +230,8 @@ Se guarda en `%USERPROFILE%\.fonacot_validador_renovaciones_config.json`. Ademá
 - `perfil`: `"usuario"` o `"validador"`. Vacío = se pregunta al abrir.
 - `perfil_fijo`: `true` para que no se pueda cambiar de perfil desde la app (lo fija quien instala). El usuario sí puede cambiar su gafete.
 - `avanzar_al_validar`: al validar una renovación se pasa sola a la siguiente pendiente (`true` por omisión).
-- `carpeta_compartida`: carpeta del equipo para *Trabajo en equipo* (vacío = cada quien por su lado). Todos deben poder escribir en ella.
+- `gafete_usuario` / `agente_validador`: el gafete del perfil Usuario y el compañero que el validador tenía puesto (cada perfil, el suyo).
+- `carpeta_compartida`: carpeta del equipo para *Trabajo en equipo* (apagado en la v3.2).
 - `tema`: `"claro"` u `"oscuro"`. `letra_grande`: filas y letra más grandes en las tablas (el perfil de usuario ya las usa).
 - `pedir_motivo`: al descartar o restaurar se pide el motivo para la bitácora (`true` por omisión).
 - `itop_url_template`: para otro servidor de iTop, p. ej. `https://servidor/pages/UI.php?operation=details&class={clase}&id={id}` (admite `{id}`, `{ref}`, `{clase}`). Vacío = servidor de FONACOT.

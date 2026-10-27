@@ -61,6 +61,10 @@ def _f(d, formato="%d/%m/%Y") -> str:
     return d.strftime(formato) if d else ""
 
 
+def _su_ticket(r: dict) -> str:
+    return f"el ticket único del {_f(r['Dia_Lote'])}" if r.get("Dia_Lote") else "el ticket único de su día"
+
+
 def _cierre_txt(r: dict) -> str:
     c = r.get("Cierre_iTop") or {}
     partes = [f"se resolvió el {_f(c.get('fecha_dt'), '%d/%m %H:%M')}" if c.get("fecha_dt") else "se resolvió"]
@@ -115,6 +119,18 @@ def aplicar_reglas(rows: list) -> dict:
             conteo["cerrado_por_error"] += 1
         elif texto:
             r["Posible_Cierre_Error"] = texto
+        if r.get("Lote_Estado") == LOTE_CERRADA_SIN_ENVIO and (r.get("No_Enviada") or r.get("Cerrada_Sin_Envio")):
+            if r["Cerrado_Por_Error"]:
+                r["No_Enviada"], r["Cerrada_Sin_Envio"] = True, False
+            else:
+                # No salió en su día pero el incidente ya se resolvió (y no por error): no es un faltante, no se manda
+                r["No_Enviada"], r["Cerrada_Sin_Envio"] = False, True
+                r["Informativa_Tipo"] = INFO_CERRADA
+                r["Informativa"] = f"No salió en {_su_ticket(r)}, pero el incidente ya {_cierre_txt(r)}: no se manda"
+                r["Lote_Etiqueta"] = f"🔒 {r['Informativa']}"
+                r["Lote_Resumen"] = "Resuelto en iTop  ·  no se manda"
+                conteo[INFO_CERRADA] += 1
+                continue
         if r.get("Lote_Estado") not in LOTE_POR_ENVIAR and not r["Cerrado_Por_Error"]:
             continue
         if r.get("Bloqueo_Tipo") == "emision" or r.get("SQL_Cedula"):
@@ -135,6 +151,22 @@ def aplicar_reglas(rows: list) -> dict:
             conteo[r["Informativa_Tipo"]] += 1
     conteo["informativas"] = conteo[INFO_EMISION] + conteo[INFO_CERRADA] + conteo[INFO_NO_PROCEDE]
     return conteo
+
+
+def recontar_envios(info: dict, rows: list):
+    """
+    Después de aplicar_reglas: lo que no salió en su día pero ya se resolvió en iTop deja de contar como «NO enviada»
+    (en el resumen, en los avisos y en la pestaña «Por día»). Solo cuenta lo que sigue abierto o se cerró por error.
+    """
+    if not info:
+        return
+    base = [r for r in rows if r.get("En_Periodo", True)] if info.get("revision") else rows
+    info["no_enviadas"] = sum(1 for r in base if r.get("No_Enviada"))
+    info["cerradas_sin_envio"] = sum(1 for r in base if r.get("Cerrada_Sin_Envio"))
+    for d in info.get("por_dia") or []:
+        suyas = [r for r in base if r.get("Dia_Lote") == d["dia"]]
+        d["no_enviadas"] = sum(1 for r in suyas if r.get("No_Enviada"))
+        d["cerradas"] = sum(1 for r in suyas if r.get("Cerrada_Sin_Envio"))
 
 
 def va_en_lote(r: dict) -> bool:
@@ -220,7 +252,9 @@ def _check_envio(r: dict) -> tuple:
     if estado == LOTE_SIGUIENTE:
         return INFO, f"Ticket único: {etiqueta}."
     if estado == LOTE_CERRADA_SIN_ENVIO:
-        return MAL, f"Ticket único: {etiqueta}."
+        if r.get("Cerrado_Por_Error"):
+            return MAL, f"Ticket único: no salió en {_su_ticket(r)}, que era su día. Va hoy."
+        return INFO, f"Ticket único: no salió en {_su_ticket(r)}, pero el incidente ya se resolvió en iTop: no se manda."
     if estado == LOTE_SIN_COMPROBAR:
         return AVISO, f"Ticket único: {etiqueta}."
     return INFO, f"Ticket único: {etiqueta or 'sin datos del envío'}."
