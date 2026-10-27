@@ -23,7 +23,7 @@ from core_renovaciones import (
     LOTE_SIN_COMPROBAR,
 )
 from sql_renovaciones import (
-    SQL_OK, SQL_APP_PLAZO, SQL_SUGERENCIA, SQL_SIN_DATOS, SQL_ES_PADRE, SQL_PADRE_CORREGIDO, SQL_NO_PROCEDE, SQL_PROBLEMAS,
+    SQL_OK, SQL_MESA_CREDITO, SQL_SE_ENVIA, SQL_SUGERENCIA, SQL_SIN_DATOS, SQL_ES_PADRE, SQL_PADRE_CORREGIDO, SQL_NO_PROCEDE, SQL_PROBLEMAS,
     SQL_NO_EXISTE, SQL_SIN_RENOVACIONES, SQL_OTRA_FECHA,
     LEYENDA_NO_PROCEDE,
 )
@@ -100,7 +100,7 @@ def cerrado_por_error(r: dict) -> tuple:
         return "", False
     cierre = r.get("Cierre_iTop") or {}
     motivo = _sin_acentos(f"{cierre.get('motivo', '')} {cierre.get('codigo', '')}")
-    if not _DICE_OTRO_DIA.search(motivo) or r.get("SQL_Estado") not in (SQL_OK, SQL_APP_PLAZO):
+    if not _DICE_OTRO_DIA.search(motivo) or r.get("SQL_Estado") not in SQL_SE_ENVIA:
         return "", False
     lock = r.get("SQL_Tz_Lock")
     if lock not in (None, 0):
@@ -108,6 +108,7 @@ def cerrado_por_error(r: dict) -> tuple:
     alta = r.get("SQL_Fecha_Alta")
     base = (f"la base dice que la renovación {r.get('Credito_Renovado_Hijo')} se dio de alta el {_f(alta)}"
             + (" (el mismo día que llegó el incidente)" if r.get("SQL_Estado") == SQL_OK
+               else " y la manda la Mesa de Crédito: sí va" if r.get("SQL_Estado") == SQL_MESA_CREDITO
                else " y la generó la APP con plazo menor: sí va"))
     if lock == 0:
         return (f"CERRADO POR ERROR: el incidente {_cierre_txt(r)}, pero {base}, no se mandó en el ticket único y no "
@@ -218,7 +219,12 @@ def va_en_lote(r: dict) -> bool:
     return r.get("Lote_Estado") not in LOTE_EXCLUIDOS
 
 
-def grupos_del_dia(filas: list, descartadas=(), incluidas=(), solo_periodo: bool = False) -> dict:
+def es_del_dia(r: dict, desde) -> bool:
+    """¿Le toca el ticket único de `desde` o uno posterior? (sin `desde`, o si no tiene día: sí)."""
+    return desde is None or not r.get("Dia_Lote") or r["Dia_Lote"] >= desde
+
+
+def grupos_del_dia(filas: list, descartadas=(), incluidas=(), solo_periodo: bool = False, desde=None) -> dict:
     """
     Los grupos que usan a la vez los avisos y los indicadores (así no se contradicen):
       'cerradas_error': se cerraron por error y sí van hoy;
@@ -227,6 +233,8 @@ def grupos_del_dia(filas: list, descartadas=(), incluidas=(), solo_periodo: bool
       'por_tipo': {Informativa_Tipo: cuántas} de esas.
     No cuenta lo descartado. `incluidas`: lo que se metió a mano (va aunque las reglas digan que no).
     `solo_periodo`: en la revisión semanal, solo lo del periodo.
+    `desde`: en el lote del día, «no se mandan» solo cuenta las de ese ticket único o de después (las de días
+    anteriores se ven aparte, en «No se mandan (todas)», de todos los días).
     """
     descartadas, incluidas = set(descartadas), set(incluidas)
     vivas = [r for r in filas if r.get("Row_ID") not in descartadas
@@ -235,7 +243,7 @@ def grupos_del_dia(filas: list, descartadas=(), incluidas=(), solo_periodo: bool
     def fuera(r):
         return not va_en_lote(r) and r.get("Row_ID") not in incluidas
 
-    no_se_mandan = [r for r in vivas if r.get("Informativa") and fuera(r)]
+    no_se_mandan = [r for r in vivas if r.get("Informativa") and fuera(r) and es_del_dia(r, desde)]
     por_tipo = {}
     for r in no_se_mandan:
         por_tipo[r.get("Informativa_Tipo")] = por_tipo.get(r.get("Informativa_Tipo"), 0) + 1
@@ -285,7 +293,7 @@ def _checks_base(r: dict, sql_activo: bool) -> list:
     if not estado:
         checks.append((INFO, "Base de datos: no se validó" + (
             "." if sql_activo else " (actívala en Configuración → Validaciones automáticas para confirmarla).")))
-    elif estado in (SQL_OK, SQL_APP_PLAZO):
+    elif estado in SQL_SE_ENVIA:
         checks.append((OK, f"Base de datos: {detalle}."))
     elif estado in (SQL_SUGERENCIA, SQL_PADRE_CORREGIDO):
         checks.append((AVISO, f"Base de datos: {detalle}."))
@@ -311,7 +319,8 @@ def _check_calendario(r: dict) -> tuple:
                        f"emitió. Revisa el calendario de FONACOT.")
     if r.get("Bloqueo_Tipo") == "cierre":
         return AVISO, f"Calendario: pasó el cierre de mes: {corto}. Solo con autorización."
-    desde = f"el alta ({_f(r['SQL_Fecha_Alta'], '%d/%m')})" if r.get("SQL_Fecha_Alta") else "que llegó"
+    alta = r.get("SQL_Fecha_Alta") or r.get("Fecha_Alta_Correo")
+    desde = f"el alta ({_f(alta, '%d/%m')})" if alta else "que llegó"
     return OK, f"Calendario: desde {desde} no ha pasado ninguna emisión ni cierre de mes."
 
 
@@ -518,7 +527,7 @@ def comparacion(r: dict, en_lote: bool = None) -> list:
     cli_inc = r.get("Cliente_Enviado", cli) if "Cliente_Enviado" in r else cli
     cred_inc = r.get("Credito_Padre_Enviado") or cred
     alta, llegada = r.get("SQL_Fecha_Alta"), r.get("Fecha_Llegada_DT") or r.get("Fecha_DT")
-    confirma = estado in (SQL_OK, SQL_APP_PLAZO, SQL_PADRE_CORREGIDO)
+    confirma = estado in SQL_SE_ENVIA + (SQL_PADRE_CORREGIDO,)
     sin_base = not estado or estado == SQL_SIN_DATOS
 
     # Columna de la base de datos

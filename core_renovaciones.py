@@ -191,6 +191,17 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def es_mesa_credito(resumen: str, descripcion: str) -> bool:
+    """
+    Correo de la Mesa de Crédito («…asignar los siguientes registros de renovación al grupo de la Mesa de Crédito para
+    revisión y concentración, a fin de dar seguimiento a la cancelación en CREDERE»): manda renovaciones de otros días
+    que sí se cancelan, siempre que no les haya tocado la emisión ni el cierre de mes.
+    """
+    texto = normalize_text(f"{resumen} {descripcion}")
+    return (('mesa de credito' in texto and ('credere' in texto or 'concentracion' in texto))
+            or 'seguimiento a la cancelacion en credere' in texto)
+
+
 class RenovacionTicketParser:
     """
     Parser de alta precisión para correos de iTop FONACOT enfocado en:
@@ -1213,6 +1224,7 @@ class RenovacionTicketParser:
                 items, descripcion = otros, texto
         total_in_ticket = len(items)
         sin_leer = cls.clientes_sin_leer(f"{resumen}\n{descripcion}", items)
+        mesa = es_mesa_credito(resumen, descripcion)
 
         rows = []
         for idx, item in enumerate(items, 1):
@@ -1258,6 +1270,7 @@ class RenovacionTicketParser:
                 'Clientes_Ticket': list(item.get('clientes_ticket') or []),
                 'Clientes_Sin_Leer': sin_leer,
                 'Subtipo_Renovacion': subtipo,
+                'Mesa_Credito': mesa,
                 'Motivo': motivo,
                 'Sucursal': item.get('sucursal', '') or base['localidad'][:35],
                 'Fecha_Operacion': item.get('fecha_op', ''),

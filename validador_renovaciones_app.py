@@ -31,6 +31,7 @@ from sql_renovaciones import (
     SQL_PROBLEMAS,
     SQL_SUGERENCIA,
     SQL_APP_PLAZO,
+    SQL_MESA_CREDITO,
     SQL_PADRE_CORREGIDO,
 )
 import reglas_lote as reglas
@@ -158,7 +159,8 @@ FILTRO_NUEVAS = "Nuevas"
 FILTRO_LISTAS = "Listas para enviar"
 FILTRO_VALIDADAS = "Validadas"
 FILTRO_ENVIADAS = "Ya enviadas"
-FILTRO_INFORMATIVAS = "No se mandan"
+FILTRO_INFORMATIVAS = "No se mandan"  # las del lote: de su ticket único o de después
+FILTRO_INFORMATIVAS_TODAS = "No se mandan (todas)"  # de todos los días
 FILTRO_SIGUIENTE = "Para el siguiente lote"
 FILTRO_PAPELERA = "Descartadas"
 FILTRO_CERRADAS = "Cerradas en iTop"
@@ -176,12 +178,12 @@ FILTROS_PRINCIPALES = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_M
 FILTROS_USUARIO = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_ENVIADAS, FILTRO_INFORMATIVAS]
 # Filtros cuyo número ya está en un indicador (En el lote, Avance, Revisar, Ya enviadas, No se mandan): no se repite
 FILTROS_SIN_CONTEO = {FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_ENVIADAS, FILTRO_INFORMATIVAS}
-FILTROS_SECUNDARIOS = ([FILTRO_EQUIPO, FILTRO_DUDAS] if EQUIPO_ACTIVO else []) + [FILTRO_LISTAS, FILTRO_INFORMATIVAS, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE,
+FILTROS_SECUNDARIOS = ([FILTRO_EQUIPO, FILTRO_DUDAS] if EQUIPO_ACTIVO else []) + [FILTRO_LISTAS, FILTRO_INFORMATIVAS, FILTRO_INFORMATIVAS_TODAS, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE,
                        FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS, FILTRO_ENVIADAS, FILTRO_SIGUIENTE,
                        FILTRO_PAPELERA]
 # Vistas que muestran filas aunque estén fuera del lote de hoy (revisión de envíos e informativas)
 FILTROS_REVISION = (FILTRO_ENVIADAS, FILTRO_SIGUIENTE, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE,
-                    FILTRO_SIN_COMPROBAR, FILTRO_INFORMATIVAS, FILTRO_CERRADAS)
+                    FILTRO_SIN_COMPROBAR, FILTRO_INFORMATIVAS, FILTRO_INFORMATIVAS_TODAS, FILTRO_CERRADAS)
 
 # Colores del veredicto de cada renovación (banner del desglose): (fondo, borde, texto, ícono)
 VEREDICTO_ESTILO = {
@@ -1196,9 +1198,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             self.seg_modo.grid_remove()
             self.var_modo.set("AGENTE")
             self.seg_tipo.set(TIPOS_REVISION[0])
-            hoy = datetime.now().date()
-            self.cal_start.set_date(hoy)
-            self.cal_end.set_date(hoy)
+            if self.cal_start.get_date() != self.cal_end.get_date():
+                # Venía de una semana (validador): su lote es de un día
+                hoy = datetime.now().date()
+                self.cal_start.set_date(hoy)
+                self.cal_end.set_date(hoy)
         else:
             self.seg_modo.grid()
             self.var_modo.set(self.config_data.get("modo_operacion", "CONCENTRADO"))
@@ -1225,7 +1229,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             self.btn_correo.pack(side="left", ipadx=8)
 
         self.cmb_quick_filter.configurar(FILTROS_USUARIO if usuario else FILTROS_PRINCIPALES,
-                                         [] if usuario else FILTROS_SECUNDARIOS)
+                                         [FILTRO_INFORMATIVAS_TODAS] if usuario else FILTROS_SECUNDARIOS)
         if usuario:
             self.menu_vistas.pack_forget()
         else:
@@ -1368,7 +1372,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         cards.grid_columnconfigure((0, 1), weight=1, uniform="perfil")
 
         def cerrar():
-            # Sin elegir: como usuario (el validador pide contraseña); el gafete y el perfil se cambian en el botón de perfil
+            # Sin elegir: como usuario; el gafete y el perfil se cambian en el botón de perfil
             win.destroy()
             if not elegido["listo"]:
                 self.config_data["perfil"] = PERFIL_USUARIO
@@ -1710,7 +1714,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         seg = ctk.CTkSegmentedButton(filtros, values=FILTROS_PRINCIPALES, font=F(12), height=32)
         seg.pack(side="left")
         menu = ctk.CTkOptionMenu(
-            filtros, values=[OTRAS_VISTAS] + FILTROS_SECUNDARIOS, width=160, height=32, font=F(12),
+            filtros, values=[OTRAS_VISTAS] + FILTROS_SECUNDARIOS, width=175, height=32, font=F(12),
             dropdown_font=F(12), dynamic_resizing=False
         )
         menu.pack(side="left", padx=(10, 0))
@@ -2596,7 +2600,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                      ("Exportar a Excel (Ctrl+E)", self._export_excel),
                      ("Validar visibles", self._validate_all_visible),
                      ("Revisión semanal: esta semana", lambda: self._revisar_semana(0))]
-        filtros = self.cmb_quick_filter.principales + ([] if usuario else FILTROS_SECUNDARIOS)
+        filtros = self.cmb_quick_filter.principales + ([FILTRO_INFORMATIVAS_TODAS] if usuario else FILTROS_SECUNDARIOS)
         cmds += [(f"Ver: {f}", lambda f=f: self._apply_filter(f)) for f in dict.fromkeys(filtros)]
         return cmds
 
@@ -2811,7 +2815,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if bloqueadas:
             def ver():
                 win.destroy()
-                self._apply_filter(FILTRO_INFORMATIVAS)
+                self._apply_filter(FILTRO_INFORMATIVAS_TODAS)
             self._btn(botones, "Ver las que ya no se mandan", ver, "secondary").pack(side="right", padx=(0, 8))
         win.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
@@ -2865,13 +2869,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             return
 
         if self._es_usuario():
-            # El usuario solo ve su lote de hoy, por su gafete
+            # El usuario ve su lote de un día (el que eligió en «Periodo de recepción»), por su gafete
             self.var_modo.set("AGENTE")
             self.seg_tipo.set(TIPOS_REVISION[0])
-            if not auto:
-                hoy = datetime.now().date()
-                self.cal_start.set_date(hoy)
-                self.cal_end.set_date(hoy)
         modo = self.var_modo.get()
         agente_filter = self.ent_agente.get().strip()
         if modo == "AGENTE" and not agente_filter:
@@ -3295,7 +3295,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if not revision:
             # Lo que iba al lote pero ya no se manda (informativo) y lo que necesita algo antes de enviarse
             # Solo las que de verdad van hoy (no las descartadas ni las que ya se emitieron)
-            grupos = reglas.grupos_del_dia(self.all_rows, self.discarded_row_ids, self.forced_included_row_ids)
+            grupos = reglas.grupos_del_dia(self.all_rows, self.discarded_row_ids, self.forced_included_row_ids,
+                                           desde=self._desde_lote())
             mal_cerradas = grupos['cerradas_error']
             if mal_cerradas:
                 rojo = True
@@ -3343,6 +3344,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             if res.get('error_tz_lock'):
                 avisos.append((f"No se pudo leer TZ_LOCK (para saber si un incidente se cerró por error): "
                                f"{res['error_tz_lock']}", None))
+            mesa = [r for r in pendientes if r.get('SQL_Estado') == SQL_MESA_CREDITO]
+            if mesa:
+                avisos.append((f"{pl(len(mesa), '# [renovación es de otro día pero la manda|renovaciones son de otro día pero las manda]')} la Mesa de "
+                               f"Crédito: sí {pl(len(mesa), '[va|van]')} (no les tocó la emisión ni el cierre de mes).", ids(mesa)))
             app_plazo = [r for r in pendientes if r.get('SQL_Estado') == SQL_APP_PLAZO]
             if app_plazo:
                 avisos.append((f"{pl(len(app_plazo), '# [renovación es de otro día pero la generó|renovaciones son de otro día pero las generó]')} la APP con plazo "
@@ -3619,6 +3624,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
     # ================= FILTRADO Y VISTAS =================
 
+    def _desde_lote(self):
+        """Día del lote que se ve (None en la revisión semanal): «No se mandan» solo trae las de ese día o de después."""
+        if not self.lote_info or self.lote_info.get('revision'):
+            return None
+        return self.lote_info.get('lote_actual')
+
     def _fuera_de_lote(self, r: dict) -> bool:
         """Fuera del ticket único de hoy: ya enviada, del siguiente, informativa (emitida, resuelta, no procede)…"""
         return not va_en_lote(r) and r['Row_ID'] not in self.forced_included_row_ids
@@ -3687,7 +3698,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 FILTRO_ERRORES: lambda: bool(r.get('Error_Envio')),
                 FILTRO_SQL: lambda: r.get('SQL_Estado') in SQL_PROBLEMAS,
                 FILTRO_ENVIADAS: lambda: lote in (LOTE_ENVIADA, LOTE_EN_CONCENTRADO),
-                FILTRO_INFORMATIVAS: lambda: bool(r.get('Informativa') and fuera),
+                FILTRO_INFORMATIVAS: lambda: bool(r.get('Informativa') and fuera
+                                                  and reglas.es_del_dia(r, self._desde_lote())),
+                FILTRO_INFORMATIVAS_TODAS: lambda: bool(r.get('Informativa') and fuera),
                 FILTRO_CERRADAS: lambda: bool(r.get('Cerrado_iTop')),
                 FILTRO_SIGUIENTE: lambda: lote == LOTE_SIGUIENTE,
                 FILTRO_NO_ENVIADAS: lambda: bool(r.get('No_Enviada')),
@@ -3744,7 +3757,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         # 1. KPIs por veredicto
         revision = bool(self.lote_info and self.lote_info.get('revision'))
         grupos = reglas.grupos_del_dia(self.all_rows, self.discarded_row_ids, self.forced_included_row_ids,
-                                       solo_periodo=revision)
+                                       solo_periodo=revision, desde=self._desde_lote())
         # ¿Se cerró por error? también se revisa
         alert_rows = [r for r in active_rows if self._tiene_alerta(r)] + grupos['posibles_cierre']
         listas = [r for r in active_rows if self._veredicto(r)['nivel'] == reglas.LISTA]

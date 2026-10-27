@@ -8,8 +8,9 @@ Solo consulta (SELECT). Primera consulta: FECHA_ALTA, CUENTA (No. de cliente) y 
 - si al incidente le falta el crédito: la renovación que el cliente tiene ese día;
 - si le falta el cliente: de qué cliente es esa renovación.
 Segunda consulta (SALDOS, CR_DISPOSICIONES, CR_CEDULAS_DETALLE), para las de días anteriores: solo se envían si las
-generó la APP (sucursal 104) con un plazo menor; si no, «No procede, la renovación es de otro día». También avisa
-si la renovación ya emitió (está en CR_CEDULAS_DETALLE).
+generó la APP (sucursal 104) con un plazo menor; si no, «No procede, la renovación es de otro día». Las que manda la
+Mesa de Crédito (renovaciones de otros días) sí se envían: solo las detiene la emisión o el cierre de mes (calendario).
+También avisa si la renovación ya emitió (está en CR_CEDULAS_DETALLE).
 Si el crédito que manda el incidente no es una renovación del cliente, se busca como crédito padre (OPERACION): si lo
 es, se avisa cuál es su renovación (la que hay que cancelar).
 
@@ -33,10 +34,13 @@ SQL_SUGERENCIA = "SUGERENCIA"
 SQL_SIN_DATOS = "SIN_DATOS"
 SQL_APP_PLAZO = "APP_PLAZO"      # de otro día, pero la generó la APP con plazo menor: sí se envía
 SQL_NO_PROCEDE = "NO_PROCEDE"    # de otro día: «No procede, la renovación es de otro día»
+SQL_MESA_CREDITO = "MESA_CREDITO"  # de otro día, pero la manda la Mesa de Crédito: sí se envía
 SQL_ES_PADRE = "ES_PADRE"        # mandaron el crédito padre (origen) en vez de la renovación
 SQL_PADRE_CORREGIDO = "PADRE_CORREGIDO"  # traía el padre: se puso su renovación (hijo) como crédito a cancelar; validar
 # Estados que indican que el dato del incidente no cuadra con la base
 SQL_PROBLEMAS = (SQL_OTRA_FECHA, SQL_NO_EXISTE, SQL_SIN_RENOVACIONES, SQL_NO_PROCEDE, SQL_ES_PADRE)
+# La base confirma la renovación y sí se envía
+SQL_SE_ENVIA = (SQL_OK, SQL_APP_PLAZO, SQL_MESA_CREDITO)
 LEYENDA_NO_PROCEDE = "No procede, la renovación es de otro día"
 SUCURSAL_APP = 104
 
@@ -590,7 +594,12 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
     for i, ((c, cr, ref), (estado, texto)) in enumerate(zip(todos, resultados)):
         alta = _alta(c, cr, por_cliente)
         if estado == SQL_OTRA_FECHA and alta and alta < ref:
-            if error_detalle:
+            if i < len(rows) and rows[i].get('Mesa_Credito'):
+                estado, texto = SQL_MESA_CREDITO, (
+                    f"De otro día pero se envía: la renovación {cr} se dio de alta el {alta:%d/%m/%Y} y el incidente "
+                    f"llegó el {ref:%d/%m/%Y}; la manda la Mesa de Crédito (sus renovaciones de otros días sí se "
+                    f"cancelan si no les tocó la emisión ni el cierre de mes)")
+            elif error_detalle:
                 texto += f" No se pudo hacer la segunda consulta (APP / plazo): {error_detalle}"
             else:
                 pista = re.search(r' Ese día tiene: .*$', texto)  # «¿no será la de ese día?»
@@ -633,7 +642,8 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
 def texto_corto(estado: str) -> str:
     return {SQL_OK: "✔ Existe", SQL_OTRA_FECHA: "⚠ Otra fecha", SQL_NO_EXISTE: "✖ No existe",
             SQL_SIN_RENOVACIONES: "✖ Sin renovaciones", SQL_SUGERENCIA: "💡 Sugerencia", SQL_SIN_DATOS: "—",
-            SQL_APP_PLAZO: "✔ APP, plazo menor", SQL_NO_PROCEDE: "✖ No procede (otro día)",
+            SQL_APP_PLAZO: "✔ APP, plazo menor", SQL_MESA_CREDITO: "✔ Mesa de Crédito",
+            SQL_NO_PROCEDE: "✖ No procede (otro día)",
             SQL_ES_PADRE: "⚠ Es el padre", SQL_PADRE_CORREGIDO: "⚠ Era el padre"}.get(estado, "")
 
 

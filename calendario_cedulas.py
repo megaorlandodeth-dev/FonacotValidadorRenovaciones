@@ -224,14 +224,24 @@ def emision_que_bloquea(alta: date, envio: date):
     return gens[0] if gens else None
 
 
+def fecha_del_correo(r: dict):
+    """La «Fecha» de la tabla de CREDERE (correo de la Mesa de Crédito): cuándo se hizo la renovación. None si no trae."""
+    m = re.search(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', str(r.get('Fecha_Operacion') or ''))
+    try:
+        return date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
+    except ValueError:
+        return None
+
+
 def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
     """
     Pone 'Bloqueo_Emision' (texto) y 'Bloqueo_Tipo' en las renovaciones dadas de alta antes de una emisión o de un
     cierre de mes que pasó antes del ticket único en que salen:
     - 'emision': ya se emitió; no se puede cancelar (solo informativa).
     - 'cierre': pasó el cierre de mes; solo se cancela con autorización.
-    La fecha de alta es la de la base ('SQL_Fecha_Alta'); sin ella se usa la llegada del incidente (la renovación se dio
-    de alta ese día o antes, así que si con la llegada ya pasó un corte, con el alta real también).
+    La fecha de alta es la de la base ('SQL_Fecha_Alta'); sin ella, la «Fecha» que trae el correo (Mesa de Crédito) si
+    es anterior a la llegada, o la llegada del incidente (la renovación se dio de alta ese día o antes, así que si con
+    la llegada ya pasó un corte, con el alta real también). Sin base, la del correo queda en 'Fecha_Alta_Correo'.
     `lote_actual`: día del lote que se está armando.
     """
     n = 0
@@ -239,7 +249,9 @@ def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
         r['Bloqueo_Emision'], r['Bloqueo_Tipo'], r['Bloqueo_Corto'] = '', '', ''
         llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
         llegada = llegada.date() if isinstance(llegada, datetime) else llegada
-        alta = r.get('SQL_Fecha_Alta') or llegada
+        del_correo = fecha_del_correo(r)
+        r['Fecha_Alta_Correo'] = del_correo if not r.get('SQL_Fecha_Alta') and del_correo and del_correo < llegada else None
+        alta = r.get('SQL_Fecha_Alta') or r['Fecha_Alta_Correo'] or llegada
         envio = dia_de_envio(r, lote_actual)
         emision = emision_que_bloquea(alta, envio)
         corte = emision or corte_que_bloquea(alta, envio)
@@ -247,9 +259,10 @@ def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
         if not corte:
             continue
         sale = f" y sale en el ticket único del {envio:%d/%m/%Y}" if envio != llegada else ""
-        origen = (f"se dio de alta el {alta:%d/%m/%Y} y el incidente llegó el {llegada:%d/%m/%Y}"
-                  if r.get('SQL_Fecha_Alta') else f"el incidente llegó el {llegada:%d/%m/%Y}")
-        desde = (f"se dio de alta el {alta:%d/%m}" if r.get('SQL_Fecha_Alta') else f"llegó el {llegada:%d/%m}")
+        con_alta = r.get('SQL_Fecha_Alta') or r['Fecha_Alta_Correo']
+        origen = (f"se dio de alta el {alta:%d/%m/%Y}" + (" (según el correo)" if r['Fecha_Alta_Correo'] else "")
+                  + f" y el incidente llegó el {llegada:%d/%m/%Y}" if con_alta else f"el incidente llegó el {llegada:%d/%m/%Y}")
+        desde = (f"se dio de alta el {alta:%d/%m}" if con_alta else f"llegó el {llegada:%d/%m}")
         r['Bloqueo_Corto'] = (f"{desde} y {corte[1]} pasó antes del ticket único del {envio:%d/%m}"
                               .replace(f" ({corte[0]:%d/%m/%Y})", f" del {corte[0]:%d/%m}").replace("de el ", "del "))
         if emision:
