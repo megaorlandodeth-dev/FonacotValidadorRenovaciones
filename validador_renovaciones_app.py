@@ -68,7 +68,6 @@ from lote_utils import (
     INTRO_TICKET_UNICO_DEFAULT
 )
 import equipo_compartido as equipo
-import clave_validador
 import registro
 
 
@@ -122,6 +121,13 @@ COL = {
 _TEMA = {"oscuro": False}
 
 
+def _luminancia(r: float, g: float, b: float) -> float:
+    """Luminancia relativa (WCAG) de un color con canales 0..1."""
+    def lineal(c):
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * lineal(r) + 0.7152 * lineal(g) + 0.0722 * lineal(b)
+
+
 def _oscurecer(color: str) -> str:
     """#RRGGBB claro -> su equivalente oscuro (fondos claros a oscuros, textos oscuros a claros, mismo tono)."""
     r, g, b = (int(color[i:i + 2], 16) / 255 for i in (1, 3, 5))
@@ -129,7 +135,13 @@ def _oscurecer(color: str) -> str:
     lum = 0.09 + (1 - lum) * 0.84
     if lum < 0.25:
         s *= 0.55  # fondos: tinte apagado, sin colores chillones
-    r, g, b = colorsys.hls_to_rgb(h, lum, min(s, 1))
+    s = min(s, 1)
+    # Textos y acentos: el rojo, el violeta o el índigo invertidos quedaban apagados sobre el fondo oscuro.
+    # Se aclaran hasta tener contraste de al menos 5:1 con el fondo (los grises tenues, 3:1).
+    piso = 0.3 if lum >= 0.45 else 0.15 if lum >= 0.38 else 0
+    while lum < 0.92 and _luminancia(*colorsys.hls_to_rgb(h, lum, s)) < piso:
+        lum += 0.02
+    r, g, b = colorsys.hls_to_rgb(h, lum, s)
     return "#{:02X}{:02X}{:02X}".format(*(round(v * 255) for v in (r, g, b)))
 
 
@@ -567,7 +579,6 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.after(800, self._schedule_auto_refresh)
         self.after(2500, self._equipo_tick)
         if self.config_data.get("perfil") in PERFILES:
-            self.after(400, self._verificar_perfil_al_abrir)
             self.after(1500, lambda: self._recordatorio_emision(auto=True))
         else:
             self.after(600, self._elegir_perfil)
@@ -1240,12 +1251,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             m.add_command(label="Cambiar mi gafete…", command=self._cambiar_gafete)
         if not self.config_data.get("perfil_fijo"):
             otro = PERFIL_VALIDADOR if self._es_usuario() else PERFIL_USUARIO
-            m.add_command(label=f"Cambiar a {PERFILES[otro]}" + ("  (con contraseña)" if otro == PERFIL_VALIDADOR else ""),
-                          command=lambda: self._cambiar_perfil(otro))
-        if not self._es_usuario():
-            m.add_command(label="Cambiar la contraseña del validador…", command=self._cambiar_clave_validador)
-            if clave_validador.recordada():
-                m.add_command(label="Olvidar la contraseña en este equipo", command=self._olvidar_clave_validador)
+            m.add_command(label=f"Cambiar a {PERFILES[otro]}", command=lambda: self._cambiar_perfil(otro))
         m.add_separator()
         m.add_command(label="Atajos de teclado", command=self._show_shortcuts)
         b = self.btn_perfil
@@ -1277,11 +1283,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
     def _cambiar_perfil(self, perfil: str, gafete: str = None) -> bool:
         """
         Cada perfil guarda su gafete: el del usuario es el suyo; el del validador, el compañero que estaba revisando
-        (así el usuario no hereda el gafete que el validador tenía puesto). El validador pide contraseña.
+        (así el usuario no hereda el gafete que el validador tenía puesto).
         """
         previo = self.config_data.get("perfil")
-        if perfil == PERFIL_VALIDADOR and previo != PERFIL_VALIDADOR and not self._autorizar_validador():
-            return False
         if previo == PERFIL_USUARIO and self.ent_agente.get().strip():
             self.config_data["gafete_usuario"] = self.ent_agente.get().strip()
         if perfil == PERFIL_USUARIO:
@@ -1307,136 +1311,6 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._aplicar_perfil()
         return True
 
-    # ---- Contraseña del validador ----
-
-    def _dialogo_clave(self, titulo: str, texto: str, confirmar: bool = False, recordar: bool = False):
-        """Ventana con la contraseña oculta. Regresa (clave, recordar) o None si se canceló."""
-        win = ctk.CTkToplevel(self)
-        win.title(titulo)
-        win.configure(fg_color=COL["bg"])
-        win.resizable(False, False)
-        win.transient(self)
-        ctk.CTkLabel(win, text=texto, font=F(12), text_color=COL["text"], justify="left", wraplength=380).pack(
-            anchor="w", padx=22, pady=(20, 10))
-        ent = ctk.CTkEntry(win, width=380, height=34, show="•", font=F(13), placeholder_text="Contraseña")
-        ent.pack(padx=22)
-        ent2 = None
-        if confirmar:
-            ent2 = ctk.CTkEntry(win, width=380, height=34, show="•", font=F(13), placeholder_text="Repítela")
-            ent2.pack(padx=22, pady=(8, 0))
-        var_rec = tk.BooleanVar(value=False)
-        if recordar:
-            ctk.CTkCheckBox(win, text="Recordarla en este equipo (Administrador de credenciales de Windows)",
-                            variable=var_rec, font=F(11)).pack(anchor="w", padx=22, pady=(10, 0))
-        lbl_error = ctk.CTkLabel(win, text="", font=F(11), text_color=COL["danger"])
-        lbl_error.pack(anchor="w", padx=22)
-        res = {"valor": None}
-
-        def aceptar(_e=None):
-            clave = ent.get()
-            if confirmar and clave != ent2.get():
-                lbl_error.configure(text="Las dos contraseñas no coinciden.")
-                return
-            if confirmar and len(clave) < clave_validador.MINIMO:
-                lbl_error.configure(text=f"Usa al menos {clave_validador.MINIMO} caracteres.")
-                return
-            res["valor"] = (clave, bool(var_rec.get()))
-            win.destroy()
-
-        botones = ctk.CTkFrame(win, fg_color="transparent")
-        botones.pack(fill="x", padx=22, pady=(10, 18))
-        self._btn(botones, "Aceptar", aceptar, "primary").pack(side="right", ipadx=10)
-        self._btn(botones, "Cancelar", win.destroy, "ghost").pack(side="right", padx=(0, 8))
-        for e in (ent, ent2):
-            if e is not None:
-                e.bind("<Return>", aceptar)
-        win.bind("<Escape>", lambda e: win.destroy())
-        win.after(150, lambda: (win.lift(), win.focus_force(), ent.focus_set()))
-        try:
-            win.grab_set()
-        except tk.TclError:
-            pass
-        self.wait_window(win)
-        return res["valor"]
-
-    def _autorizar_validador(self) -> bool:
-        """
-        Pide la contraseña del validador. True si se puede entrar. Si falta validador_clave.json no deja crear otra
-        (cualquiera entraría como validador): solo se crea abriendo la app con --crear-clave-validador.
-        """
-        if not clave_validador.existe() and clave_validador.OPCION_CREAR not in sys.argv:
-            messagebox.showwarning(
-                "Perfil Validador",
-                f"Falta el archivo {os.path.basename(clave_validador.ARCHIVO)} con la contraseña del validador en:\n"
-                f"{os.path.dirname(clave_validador.ARCHIVO)}\n\nPídeselo a quien instaló la app y cópialo ahí. Si tú "
-                f"la instalas, abre la app con la opción {clave_validador.OPCION_CREAR} para crear la contraseña.")
-            return False
-        if not clave_validador.existe():
-            res = self._dialogo_clave(
-                "Contraseña del validador",
-                "Todavía no hay contraseña para el perfil Validador. Créala ahora (solo la deben saber los validadores).\n\n"
-                f"No se guarda la contraseña, solo su huella, en {os.path.basename(clave_validador.ARCHIVO)} junto a la "
-                "app: repártelo con la app "
-                "para que en todos los equipos se pida la misma.", confirmar=True)
-            if not res:
-                return False
-            error = clave_validador.crear(res[0])
-            if error:
-                messagebox.showerror("Contraseña del validador", error)
-                return False
-            return True
-        if clave_validador.verificar(clave_validador.recordada()):
-            return True
-        for intento in range(3):
-            res = self._dialogo_clave("Perfil Validador", "Escribe la contraseña del validador:" if not intento
-                                      else "Contraseña incorrecta. Vuelve a escribirla:", recordar=True)
-            if not res:
-                return False
-            if clave_validador.verificar(res[0]):
-                if res[1]:
-                    clave_validador.recordar(res[0])
-                return True
-        messagebox.showwarning("Perfil Validador", "Contraseña incorrecta.")
-        return False
-
-    def _cambiar_clave_validador(self):
-        if self._es_usuario():
-            return
-        if clave_validador.existe():
-            res = self._dialogo_clave("Cambiar contraseña", "Escribe la contraseña actual del validador:")
-            if not res:
-                return
-            if not clave_validador.verificar(res[0]):
-                messagebox.showwarning("Cambiar contraseña", "La contraseña actual no es correcta.")
-                return
-        res = self._dialogo_clave("Cambiar contraseña",
-                                  "Escribe la nueva contraseña del validador. Después reparte el archivo "
-                                  f"{os.path.basename(clave_validador.ARCHIVO)} con la app.", confirmar=True)
-        if not res:
-            return
-        error = clave_validador.crear(res[0])
-        if error:
-            messagebox.showerror("Cambiar contraseña", error)
-            return
-        clave_validador.olvidar()
-        self._toast(f"Contraseña cambiada. Reparte {os.path.basename(clave_validador.ARCHIVO)} con la app.",
-                    COL["success"], ms=8000)
-
-    def _olvidar_clave_validador(self):
-        clave_validador.olvidar()
-        self._toast("Este equipo ya no recuerda la contraseña del validador.", COL["muted"], ms=4000)
-
-    def _verificar_perfil_al_abrir(self):
-        """Si se abre en Validador, pide la contraseña; sin ella entra como usuario (o pregunta el perfil)."""
-        if self.config_data.get("perfil") != PERFIL_VALIDADOR or self._autorizar_validador():
-            return
-        if self.config_data.get("gafete_usuario"):
-            self._cambiar_perfil(PERFIL_USUARIO, self.config_data["gafete_usuario"])
-        else:
-            self.config_data["perfil"] = ""
-            self._save_config()
-            self._elegir_perfil()
-
     def _elegir_perfil(self):
         """Primera vez: ¿usuario (analista) o validador? El usuario escribe su gafete."""
         win = ctk.CTkToplevel(self)
@@ -1458,7 +1332,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 ent.focus_set()
                 return
             if not self._cambiar_perfil(perfil, gafete):
-                return  # Sin la contraseña del validador se queda en la bienvenida
+                return
             elegido["listo"] = True
             win.destroy()
             self.after(400, lambda: self._recordatorio_emision(auto=True))
@@ -1487,8 +1361,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                   height=38).pack(fill="x", padx=18, pady=(12, 18))
         cv = tarjeta(1, "Validador", ["El lote de todos o de un compañero, y la revisión semanal.",
                                       "Valida renovación por renovación con el desglose.",
-                                      "Arma y manda el correo del ticket único.",
-                                      "Pide la contraseña del validador."], C("#0F766E"))
+                                      "Arma y manda el correo del ticket único."], C("#0F766E"))
         ctk.CTkFrame(cv, fg_color="transparent", height=1).pack(expand=True, fill="both", padx=18)
         self._btn(cv, "Entrar como validador", lambda: entrar(PERFIL_VALIDADOR), height=38).pack(
             fill="x", side="bottom", padx=18, pady=(12, 18))
@@ -2315,7 +2188,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.txt_detail.configure(state="disabled")
 
         self.txt_body = ctk.CTkTextbox(parent, font=F(12), wrap="word")
-        self.txt_body.tag_config("hl", background=C("#FEF08A"), foreground=C("#713F12"))
+        # Resaltado: el amarillo invertido quedaba verde olivo con texto naranja (no se leía); en oscuro, su propio par
+        fondo, texto = ("#854D0E", "#FEF3C7") if _TEMA["oscuro"] else ("#FEF08A", "#713F12")
+        self.txt_body.tag_config("hl", background=fondo, foreground=texto)
 
     def _colocar_detalle(self, derecha: bool):
         """A la derecha: desglose arriba (más alto) y correo abajo. Abajo: desglose a la izquierda (más ancho) y correo."""
@@ -2720,7 +2595,6 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             cmds += [("Crear correo Ticket Único (Ctrl+M)", self._crear_correo_lote),
                      ("Exportar a Excel (Ctrl+E)", self._export_excel),
                      ("Validar visibles", self._validate_all_visible),
-                     ("Cambiar la contraseña del validador", self._cambiar_clave_validador),
                      ("Revisión semanal: esta semana", lambda: self._revisar_semana(0))]
         filtros = self.cmb_quick_filter.principales + ([] if usuario else FILTROS_SECUNDARIOS)
         cmds += [(f"Ver: {f}", lambda f=f: self._apply_filter(f)) for f in dict.fromkeys(filtros)]
