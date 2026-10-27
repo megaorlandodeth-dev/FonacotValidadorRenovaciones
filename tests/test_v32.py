@@ -30,7 +30,7 @@ class TestCerradasNoSonFaltantes(unittest.TestCase):
         self.assertEqual(reglas.veredicto(r)['nivel'], reglas.NO_SE_MANDA)
         nivel, texto = reglas._check_envio(r)
         self.assertEqual(nivel, reglas.INFO)
-        self.assertIn("no se manda", texto)
+        self.assertIn("ya se resolvió", texto)
 
     def test_cerrada_por_error_si_es_no_enviada(self):
         # Dice que es de otro día, la base dice que no y no está bloqueada (TZ_LOCK = 0): sí va
@@ -39,7 +39,7 @@ class TestCerradasNoSonFaltantes(unittest.TestCase):
         self.assertTrue(r['Cerrado_Por_Error'])
         self.assertTrue(r['No_Enviada'])
         self.assertFalse(r['Cerrada_Sin_Envio'])
-        self.assertEqual(reglas._check_envio(r)[0], reglas.MAL)
+        self.assertEqual(reglas._check_envio(r)[0], reglas.AVISO)  # no es un error: va hoy
 
     def test_abierta_no_cambia(self):
         r = renovacion(No_Enviada=True)
@@ -84,6 +84,95 @@ class TestCreditosEnElRenglonDeAbajo(unittest.TestCase):
         # El número de 7 dígitos del renglón de abajo es el cliente, no un crédito
         filas = creditos("No se ve en el sistema de crédito\n4919283\nfavor de cancelar la renovación 71470")
         self.assertEqual([cred for _cli, cred in filas], ["71470"])
+
+    def test_firma_o_capacidad_abajo_no_son_creditos(self):
+        # Solo es el último recurso: si ya hay crédito no se usa, y no se toma de renglones que son de otra cosa
+        filas = creditos("Favor de cancelar la renovación 71470 del cliente 4919283\nAtentamente\n"
+                         "Analista de Crédito\n2609\nSucursal Centro")
+        self.assertEqual([cred for _cli, cred in filas], ["71470"])
+        self.assertNotIn("15000", [cred for _cli, cred in creditos(
+            "Cliente 4919283, favor de cancelar su renovación.\nSu capacidad de crédito\n15000\n")])
+
+
+class TestUnaSolaDecision(unittest.TestCase):
+    """v3.2: una sola decisión por prioridad; lo que no decide no la contradice."""
+
+    def emitida_cerrada(self, **extra):
+        return cerrada("Es de otro día", No_Enviada=True, Dia_Lote=date(2026, 10, 26), Bloqueo_Tipo='emision',
+                       Bloqueo_Emision="YA NO SE PUEDE CANCELAR: ... ya se emitió",
+                       Bloqueo_Corto="se dio de alta el 23/10 y la generación de la emisión de noviembre 2026 del 25/10 "
+                                     "pasó antes del ticket único del 27/10", **extra)
+
+    def test_ya_se_emitio_gana_al_cierre_por_error(self):
+        r = self.emitida_cerrada()
+        conteo = reglas.aplicar_reglas([r])
+        self.assertEqual(r['Informativa_Tipo'], reglas.INFO_EMISION)
+        self.assertEqual((r['Cerrado_Por_Error'], r['No_Enviada']), ('', False))
+        self.assertTrue(r['No_Enviada_Emitida'])
+        self.assertEqual(conteo['cerrado_por_error'], 0)
+        self.assertIn("ya se emitió", r['Lote_Resumen'])
+        ver = reglas.veredicto(r)
+        self.assertEqual(ver['nivel'], reglas.NO_SE_MANDA)
+        self.assertTrue(ver['checks'][0][1].startswith("Calendario: ya se emitió"))
+        self.assertEqual(ver['principales'], 1)
+        # Lo demás queda como dato: sin ✖ ni ⚠ que contradigan «no se manda»
+        self.assertFalse([e for e, _t in ver['checks'][1:] if e in (reglas.MAL, reglas.AVISO)])
+        self.assertNotIn("POR ERROR", " ".join(t for _e, t in ver['checks']))
+
+    def test_descartada_y_ademas_emitida(self):
+        r = self.emitida_cerrada()
+        reglas.aplicar_reglas([r])
+        ver = reglas.veredicto(r, descartada=True)
+        self.assertEqual(ver['nivel'], reglas.DESCARTADA)
+        self.assertIn("De todos modos no se manda: ya se emitió", ver['accion'])
+        self.assertFalse([e for e, _t in ver['checks'] if e == reglas.AVISO])
+
+    def test_salio_con_datos_equivocados_se_corrige(self):
+        for estado in (reglas.LOTE_ENVIADA, reglas.LOTE_EN_CONCENTRADO):
+            r = renovacion(Lote_Estado=estado, Enviado_Fecha=date(2026, 10, 26), Error_Envio="crédito 10431")
+            reglas.aplicar_reglas([r])
+            ver = reglas.veredicto(r)
+            self.assertEqual(ver['nivel'], reglas.CORREGIR, estado)
+            self.assertTrue(ver['checks'][0][1].startswith("Ticket único: salió con datos equivocados"))
+
+    def test_posible_cierre_por_error_se_revisa(self):
+        r = cerrada("Es de otro día", SQL_Tz_Lock=None, Dia_Lote=date(2026, 10, 26))
+        conteo = reglas.aplicar_reglas([r])
+        self.assertTrue(r['Posible_Cierre_Error'])
+        self.assertEqual((r['Informativa'], r['No_Enviada'], r['Cerrada_Sin_Envio']), ('', False, False))
+        self.assertEqual(conteo['posible_cierre_error'], 1)
+        self.assertFalse(reglas.va_en_lote(r))
+        ver = reglas.veredicto(r)
+        self.assertEqual((ver['nivel'], ver['titulo']), (reglas.REVISAR, "¿Se cerró por error?"))
+        self.assertIn("POSIBLE CIERRE POR ERROR", ver['checks'][0][1])
+
+    def test_atrasada_con_autorizacion(self):
+        r = renovacion(Lote_Estado=reglas.LOTE_REZAGADA, No_Enviada=True, Dia_Lote=date(2026, 10, 26),
+                       Bloqueo_Tipo='cierre', Bloqueo_Emision="NECESITA AUTORIZACIÓN: ...", Bloqueo_Corto="x")
+        reglas.aplicar_reglas([r])
+        ver = reglas.veredicto(r)
+        self.assertEqual(ver['nivel'], reglas.AUTORIZACION)
+        self.assertIn("mándala hoy", ver['accion'])
+        self.assertEqual(reglas._check_envio(r)[0], reglas.AVISO)
+
+    def test_textos_cortos(self):
+        r = cerrada("Ya no requiere " * 30, Dia_Lote=date(2026, 10, 26))
+        reglas.aplicar_reglas([r])
+        itop = [t for _e, t in reglas.comprobaciones(r) if t.startswith("iTop")][0]
+        self.assertLess(len(itop), 80)  # el motivo completo está en «Cierre en iTop», no se repite
+        self.assertEqual(reglas._limpio("⏰ salió (en el ticket único (17:56))"), "salió (en el ticket único de las 17:56)")
+
+    def test_recontar_emitidas(self):
+        filas = [self.emitida_cerrada(), renovacion(No_Enviada=True, Lote_Estado=reglas.LOTE_REZAGADA)]
+        reglas.aplicar_reglas(filas)
+        info = {'no_enviadas': 2, 'cerradas_sin_envio': 0, 'por_dia': []}
+        reglas.recontar_envios(info, filas)
+        self.assertEqual((info['no_enviadas'], info['emitidas_sin_envio']), (1, 1))
+
+    def test_comparacion_de_la_atrasada(self):
+        r = cerrada("Es de otro día", No_Enviada=True, Dia_Lote=date(2026, 10, 26))
+        reglas.aplicar_reglas([r])
+        self.assertIn("le tocaba el 26/10/2026", str(reglas.comparacion(r, en_lote=True)))
 
 
 class TestClaveValidador(unittest.TestCase):
