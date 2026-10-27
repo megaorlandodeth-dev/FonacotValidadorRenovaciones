@@ -100,6 +100,22 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
    - **El rojo gana:** una renovación que no se envió o salió mal se ve en rojo aunque la hayas validado antes.
    - La marca *última considerada* solo la deja el lote de hoy al copiarlo o crear el correo (no el Excel, ni una revisión, ni un lote pasado).
 
+**Novedades v3.1:**
+   - **Trabajo en equipo (carpeta compartida):** cada analista y el validador ponen la misma carpeta en *Configuración → Trabajo en equipo* (una carpeta de red `\\servidor\...`, o de OneDrive/SharePoint sincronizada) y pulsan *Probar*. No hace falta servidor ni base de datos nueva.
+     - **Analista:** cada vez que valida (o deja una duda) la app escribe su archivo `marcas_<gafete>.json` en la carpeta: qué renovaciones validó, a qué hora, sus dudas y su avance. Cada quien escribe solo el suyo (se escribe a un temporal y se reemplaza, nadie lee un archivo a medias).
+     - **Validador:** cada 15 segundos lee los archivos del día y le aparece en la columna **Equipo** quién validó qué (*✓ Nancy 11:32*) o la duda (*? Nancy: …*), con un aviso *Equipo: Nancy (2609) validó 3 y dejó 1 duda* y el botón *Ver*. Vistas *Marcadas por el equipo* y *Dudas del equipo*; en *Por compañero*, *Marcó el analista* (*3 de 4*) y *Última señal* (*sin señal* si no publica hace 30 min).
+     - **Validar lo del equipo:** valida de una vez lo que ya marcaron, con vista previa; lo que tiene algo que revisar se queda fuera para que lo revises tú. Se reconoce la renovación aunque el analista no tenga la base de datos (trae el crédito padre y el validador ya lo cambió por la renovación).
+     - **Pasar duda al validador:** tecla **D** o clic derecho (analista).
+   - **Bandeja del analista:** *Te faltan X de Y* con barra de avance y *Siguiente pendiente*; al terminar, *✔ Listo* con el botón grande *Copiar mis renovaciones*. El panel izquierdo empieza plegado y las filas son más grandes.
+   - **Comparación en el desglose:** *Incidente | Base de datos | Ticket único* para el cliente, el crédito y la fecha, con ✔/⚠/✖ por renglón.
+   - **Deshacer:** validar, descartar, restaurar y validar en bloque se deshacen con **Ctrl+Z** o el botón *Deshacer* del aviso.
+   - **Bitácora por renovación** en el desglose (validada, descartada, restaurada, duda…). Al descartar o restaurar se pide el motivo (`pedir_motivo`).
+   - **Validar visibles con vista previa:** dice cuántas se validan y deja fuera las que hay que revisar y las que no van en el ticket único.
+   - **Barra de color** al inicio de cada fila (verde validada, ámbar revisar, rojo corregir, gris no se manda) en vez de pintar toda la fila; los filtros rápidos dicen cuántas hay (*Revisar 3*).
+   - **Teclado:** **J/K** bajan y suben, **?** muestra los atajos y **Ctrl+K** abre la paleta de comandos (escribe lo que quieres hacer).
+   - **Recordatorio de emisión sin ventana:** al extraer sale como aviso abajo a la derecha (*Ver calendario*), sin tapar el desglose.
+   - **Modo oscuro** y **letra grande** en *Configuración → Apariencia* (el modo oscuro se aplica al volver a abrir).
+
 **Novedades v3.0:**
    - **Dos perfiles: Usuario y Validador.** La primera vez se elige el perfil (se cambia con el botón de perfil, arriba a la derecha).
      - **Usuario (analista):** solo ve *Mis renovaciones de hoy* por su gafete: sin revisión semanal, periodo, correo del ticket único ni descartes. Su botón es **Copiar mis renovaciones**, que copia solo la tabla con el formato del ticket único (sin saludo) para pasársela a quien manda el ticket único.
@@ -176,6 +192,7 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 - `lote_utils.py`: Persistencia de validaciones, tabla del lote (texto/HTML) y portapapeles con formato.
 - `reglas_lote.py`: Qué va en el lote y qué solo es informativo (emisión, resuelto, no procede, cerrado por error) y el veredicto con las comprobaciones del desglose.
 - `sql_renovaciones.py` / `calendario_cedulas.py`: Validación en la base (Oracle) y calendario de emisión y cierres de mes.
+- `equipo_compartido.py`: Trabajo en equipo por carpeta compartida (cada analista publica sus marcas; el validador las lee).
 - `tests/`: Pruebas automáticas del parser, del corte/rezagadas y de las utilidades del lote (no requieren Outlook).
 - `Ejecutar_Validador_Renovaciones.bat`: Script de inicio rápido.
 
@@ -204,6 +221,9 @@ Se guarda en `%USERPROFILE%\.fonacot_validador_renovaciones_config.json`. Ademá
 - `perfil`: `"usuario"` o `"validador"`. Vacío = se pregunta al abrir.
 - `perfil_fijo`: `true` para que no se pueda cambiar de perfil desde la app (lo fija quien instala). El usuario sí puede cambiar su gafete.
 - `avanzar_al_validar`: al validar una renovación se pasa sola a la siguiente pendiente (`true` por omisión).
+- `carpeta_compartida`: carpeta del equipo para *Trabajo en equipo* (vacío = cada quien por su lado). Todos deben poder escribir en ella.
+- `tema`: `"claro"` u `"oscuro"`. `letra_grande`: filas y letra más grandes en las tablas (el perfil de usuario ya las usa).
+- `pedir_motivo`: al descartar o restaurar se pide el motivo para la bitácora (`true` por omisión).
 - `itop_url_template`: para otro servidor de iTop, p. ej. `https://servidor/pages/UI.php?operation=details&class={clase}&id={id}` (admite `{id}`, `{ref}`, `{clase}`). Vacío = servidor de FONACOT.
 - `ultimo_lote`: marca de la última renovación considerada (se actualiza al copiar el lote o crear el correo de hoy).
 - `dias_inhabiles` / `feriados_oficiales`: días inhábiles capturados en pantalla y si se suman los feriados oficiales.

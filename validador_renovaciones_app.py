@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import colorsys
 import threading
 import webbrowser
 from datetime import datetime, timedelta
@@ -29,7 +30,6 @@ from sql_renovaciones import (
     TABLA_DEFAULT,
     SQL_PROBLEMAS,
     SQL_SUGERENCIA,
-    SQL_OTRA_FECHA,
     SQL_APP_PLAZO,
     SQL_PADRE_CORREGIDO,
 )
@@ -57,6 +57,7 @@ from core_renovaciones import (
 from lote_utils import (
     EstadoValidaciones,
     row_key,
+    llaves_fila,
     build_ticket_unico_tsv,
     build_ticket_unico_html,
     set_clipboard_html,
@@ -64,9 +65,10 @@ from lote_utils import (
     lote_corto,
     INTRO_TICKET_UNICO_DEFAULT
 )
+import equipo_compartido as equipo
 
 
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 
 # Perfiles: el usuario (analista) solo ve su lote del día por su gafete; el validador ve todo y arma el ticket único
 PERFIL_USUARIO, PERFIL_VALIDADOR = "usuario", "validador"
@@ -110,6 +112,25 @@ COL = {
     "danger_soft": "#FEF2F2",
 }
 
+# Modo oscuro: la misma paleta con la luminosidad invertida (se elige en Configuración y se aplica al abrir)
+_TEMA = {"oscuro": False}
+
+
+def _oscurecer(color: str) -> str:
+    """#RRGGBB claro -> su equivalente oscuro (fondos claros a oscuros, textos oscuros a claros, mismo tono)."""
+    r, g, b = (int(color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    h, lum, s = colorsys.rgb_to_hls(r, g, b)
+    lum = 0.09 + (1 - lum) * 0.84
+    if lum < 0.25:
+        s *= 0.55  # fondos: tinte apagado, sin colores chillones
+    r, g, b = colorsys.hls_to_rgb(h, lum, min(s, 1))
+    return "#{:02X}{:02X}{:02X}".format(*(round(v * 255) for v in (r, g, b)))
+
+
+def C(color: str) -> str:
+    """Color fijo del código según el tema (claro tal cual; oscuro, invertido)."""
+    return _oscurecer(color) if _TEMA["oscuro"] else color
+
 FILTRO_TODAS = "Todas"
 FILTRO_PENDIENTES = "Pendientes"
 FILTRO_ALERTAS = "Revisar"
@@ -128,11 +149,13 @@ FILTRO_TARDE = "Enviadas tarde"
 FILTRO_SIN_COMPROBAR = "Sin comprobar"
 FILTRO_ERRORES = "Datos equivocados en el ticket único"
 FILTRO_SQL = "No cuadran con la base (SQL)"
+FILTRO_EQUIPO = "Marcadas por el equipo"
+FILTRO_DUDAS = "Dudas del equipo"
 OTRAS_VISTAS = "Otras vistas"
 
 FILTROS_PRINCIPALES = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_MULTIPLES, FILTRO_REZAGADAS, FILTRO_NUEVAS]
 FILTROS_USUARIO = [FILTRO_TODAS, FILTRO_PENDIENTES, FILTRO_ALERTAS, FILTRO_ENVIADAS, FILTRO_INFORMATIVAS]
-FILTROS_SECUNDARIOS = [FILTRO_LISTAS, FILTRO_INFORMATIVAS, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE,
+FILTROS_SECUNDARIOS = [FILTRO_EQUIPO, FILTRO_DUDAS, FILTRO_LISTAS, FILTRO_INFORMATIVAS, FILTRO_NO_ENVIADAS, FILTRO_ERRORES, FILTRO_SQL, FILTRO_TARDE,
                        FILTRO_SIN_COMPROBAR, FILTRO_CERRADAS, FILTRO_VALIDADAS, FILTRO_ENVIADAS, FILTRO_SIGUIENTE,
                        FILTRO_PAPELERA]
 # Vistas que muestran filas aunque estén fuera del lote de hoy (revisión de envíos e informativas)
@@ -152,6 +175,26 @@ VEREDICTO_ESTILO = {
     reglas.SIN_COMPROBAR: ("#FFFBEB", "#FDE68A", "#92400E", "?"),
 }
 NIVELES_REVISAR = (reglas.REVISAR, reglas.CORREGIR, reglas.AUTORIZACION)
+
+
+def _tema_guardado() -> str:
+    """El tema elegido («claro» u «oscuro»), leído antes de crear la ventana."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("tema", "claro")
+    except (OSError, ValueError, AttributeError):
+        return "claro"
+
+
+def _aplicar_paleta(oscuro: bool):
+    """Pasa la paleta al modo oscuro (una sola vez, antes de crear widgets)."""
+    if not oscuro or _TEMA["oscuro"]:
+        return
+    _TEMA["oscuro"] = True
+    for k, v in COL.items():
+        COL[k] = _oscurecer(v)
+    for k, (fondo, borde, texto, icono) in VEREDICTO_ESTILO.items():
+        VEREDICTO_ESTILO[k] = (_oscurecer(fondo), _oscurecer(borde), _oscurecer(texto), icono)
 HINT_EXTRAER = "Lee Outlook y arma el lote del día  ·  F5"
 TIPOS_REVISION = ("Lote del día", "Revisión semanal")
 
@@ -178,9 +221,14 @@ POSICIONES_DETALLE = (("derecha", "Desglose a la derecha de la tabla"), ("abajo"
 
 ATAJOS = [
     ("F5", "Extraer y validar renovaciones"),
+    ("Ctrl + K", "Buscar cualquier acción escribiendo (filtros, copiar, correo, tema…)"),
     ("Ctrl + F", "Ir al buscador (Esc lo limpia)"),
     ("Espacio / doble clic", "Marcar o desmarcar como validada (y pasa a la siguiente pendiente)"),
+    ("Ctrl + Z", "Deshacer lo último (validar, descartar, restaurar…)"),
     ("N", "Ir a la siguiente pendiente"),
+    ("J  /  K", "Renovación siguiente / anterior"),
+    ("D", "Pasar una duda al validador (usuario)"),
+    ("?", "Ver estos atajos"),
     ("Enter", "Abrir el ticket seleccionado en iTop"),
     ("Supr", "Descartar las filas seleccionadas"),
     ("Ctrl + C", "Copiar las filas seleccionadas"),
@@ -232,7 +280,7 @@ class TooltipCeldas:
         self.tip.wm_overrideredirect(True)
         self.tip.attributes("-topmost", True)
         tk.Label(
-            self.tip, text=texto, justify="left", wraplength=520, font=(FONT, 10), bg="#FFFFFF", fg=COL["text"],
+            self.tip, text=texto, justify="left", wraplength=520, font=(FONT, 10), bg=C("#FFFFFF"), fg=COL["text"],
             relief="solid", borderwidth=1, padx=8, pady=5
         ).pack()
         self.tip.wm_geometry(f"+{x + 14}+{y + 18}")
@@ -250,7 +298,7 @@ class TooltipCeldas:
 
 def _aplicar_tema():
     """Ajusta el tema de CustomTkinter antes de crear widgets: Segoe UI, esquinas discretas y colores neutros."""
-    ctk.set_appearance_mode("Light")
+    ctk.set_appearance_mode("Dark" if _TEMA["oscuro"] else "Light")
     ctk.set_default_color_theme("blue")
     t = ctk.ThemeManager.theme
 
@@ -322,6 +370,7 @@ class SelectorFiltro:
         self.seg, self.menu, self.on_change = seg, menu, on_change
         self._valor = None
         self.principales = list(FILTROS_PRINCIPALES)
+        self._etiquetas = {f: f for f in self.principales}  # filtro -> texto del botón (con su conteo)
         seg.configure(command=self._desde_seg)
         menu.configure(command=self._desde_menu)
         self.set(FILTRO_TODAS)
@@ -329,9 +378,18 @@ class SelectorFiltro:
     def configurar(self, principales: list, secundarios: list):
         """Cambia los filtros (cada perfil tiene los suyos)."""
         self.principales = list(principales)
+        self._etiquetas = {f: f for f in self.principales}
         self.seg.configure(values=self.principales)
         self.menu.configure(values=[OTRAS_VISTAS] + [f for f in secundarios if f not in self.principales])
         self.set(self._valor if self._valor in self.principales + list(secundarios) else FILTRO_TODAS)
+
+    def contar(self, conteos: dict):
+        """Pone cuántas renovaciones hay en cada filtro rápido: «Revisar 3»."""
+        etiquetas = {f: f"{f}  {conteos[f]}" if conteos.get(f) is not None else f for f in self.principales}
+        if etiquetas != self._etiquetas:
+            self._etiquetas = etiquetas
+            self.seg.configure(values=[etiquetas[f] for f in self.principales])
+            self.set(self._valor)
 
     def get(self) -> str:
         return self._valor
@@ -339,7 +397,7 @@ class SelectorFiltro:
     def set(self, valor: str):
         self._valor = valor
         if valor in self.principales:
-            self.seg.set(valor)
+            self.seg.set(self._etiquetas.get(valor, valor))
             self.menu.set(OTRAS_VISTAS)
             self.menu.configure(fg_color=COL["track"], button_color=COL["track"], text_color=COL["text_2"])
         else:
@@ -347,8 +405,8 @@ class SelectorFiltro:
             self.menu.set(valor)
             self.menu.configure(fg_color=COL["primary_soft"], button_color=COL["primary_soft"], text_color=COL["primary"])
 
-    def _desde_seg(self, valor):
-        self.set(valor)
+    def _desde_seg(self, etiqueta):
+        self.set(next((f for f, e in self._etiquetas.items() if e == etiqueta), etiqueta))
         self.on_change()
 
     def _desde_menu(self, valor):
@@ -437,6 +495,7 @@ class PestanasSubrayadas:
 
 class FonacotValidadorRenovacionesApp(ctk.CTk):
     def __init__(self):
+        _aplicar_paleta(_tema_guardado() == "oscuro")
         _aplicar_tema()
         super().__init__()
 
@@ -475,6 +534,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._vars_columnas = []
         self._secciones = {}          # {panel: [(título, marco, línea, etiqueta, primera)]} para ocultarlas por perfil
         self._veredictos = {}         # {Row_ID: veredicto} del último refresco (tabla, indicadores y desglose)
+        self._deshacer = []           # [(descripción, función que lo revierte)] lo último arriba
+        self._barras = {}             # {color: imagen} de la barra de estado de cada fila
+        # Trabajo en equipo: lo que publicaron los analistas en la carpeta compartida (lo lee el validador)
+        self._equipo = {"analistas": [], "marcas": {}, "errores": []}
+        self._equipo_vistas = set()   # llaves ya avisadas (para avisar solo lo nuevo)
+        self._equipo_leyendo = False
+        self._publicar_job = None
+        self._equipo_estado = ""
 
         self._build_ui()
         self._build_context_menus()
@@ -484,6 +551,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.after(300, self._init_accounts)
         self.after(500, self._tick_clock)
         self.after(800, self._schedule_auto_refresh)
+        self.after(2500, self._equipo_tick)
         if self.config_data.get("perfil") in PERFILES:
             self.after(1500, lambda: self._recordatorio_emision(auto=True))
         else:
@@ -499,6 +567,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "perfil_fijo": False,
             # Al validar con Espacio se pasa sola a la siguiente renovación pendiente
             "avanzar_al_validar": True,
+            # Carpeta compartida del equipo: los analistas publican lo que marcan y el validador lo ve (vacía = solo local)
+            "carpeta_compartida": "",
+            # "claro" u "oscuro" (se aplica al abrir) y letra grande en la tabla
+            "tema": "claro",
+            "letra_grande": False,
+            # Pedir el motivo al descartar o meter a mano una renovación (queda en la bitácora)
+            "pedir_motivo": True,
             "account": "",
             "modo_operacion": "CONCENTRADO",  # "CONCENTRADO" o "AGENTE"
             "agente_filter": "2609",
@@ -585,7 +660,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "correo_para": self.ent_correo_para.get().strip(),
                 "correo_cc": self.ent_correo_cc.get().strip(),
                 "auto_refresh": bool(self.var_auto.get()),
-                "auto_refresh_min": self.cmb_auto_min.get().strip() or "10"
+                "auto_refresh_min": self.cmb_auto_min.get().strip() or "10",
+                "carpeta_compartida": self.ent_carpeta.get().strip(),
             })
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config_data, f, indent=2, ensure_ascii=False)
@@ -663,14 +739,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
     def _btn(self, parent, text: str, command, kind: str = "secondary", **kw) -> ctk.CTkButton:
         estilos = {
-            "primary": dict(fg_color=COL["primary"], hover_color=COL["primary_h"], text_color="#FFFFFF", border_width=0),
+            "primary": dict(fg_color=COL["primary"], hover_color=COL["primary_h"], text_color=C("#FFFFFF"), border_width=0),
             "secondary": dict(
                 fg_color=COL["surface"], hover_color=COL["track"], text_color=COL["text"],
                 border_width=1, border_color=COL["border_strong"]
             ),
             "danger": dict(
                 fg_color=COL["surface"], hover_color=COL["danger_soft"], text_color=COL["danger"],
-                border_width=1, border_color="#FECACA"
+                border_width=1, border_color=C("#FECACA")
             ),
             "ghost": dict(fg_color="transparent", hover_color=COL["track"], text_color=COL["text_2"], border_width=0),
             "link": dict(fg_color="transparent", hover_color=COL["primary_soft"], text_color=COL["primary"], border_width=0),
@@ -694,7 +770,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.btn_panel.pack(side="left", padx=(0, 8))
         ctk.CTkLabel(
             brand, text="F", width=34, height=34, corner_radius=8,
-            fg_color=COL["primary"], text_color="#FFFFFF", font=F(17, True)
+            fg_color=COL["primary"], text_color=C("#FFFFFF"), font=F(17, True)
         ).pack(side="left")
         names = ctk.CTkFrame(brand, fg_color="transparent")
         names.pack(side="left", padx=(12, 0))
@@ -881,8 +957,35 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.btn_config.pack(fill="x", padx=6, pady=(8, 0))
         adv = self.config_avanzada = ctk.CTkFrame(side, fg_color="transparent")
 
+        # Trabajo en equipo: carpeta compartida donde cada analista publica lo que marca y el validador lo ve
+        sec = self._section(adv, "Trabajo en equipo", first=True)
+        self.ent_carpeta = self._field(sec, 0, "Carpeta compartida del equipo", self.config_data.get("carpeta_compartida", ""),
+                                       r"\\servidor\renovaciones")
+        botones = ctk.CTkFrame(sec, fg_color="transparent")
+        botones.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._btn(botones, "Elegir…", self._elegir_carpeta, height=28, font=F(12)).pack(side="left", ipadx=4)
+        self._btn(botones, "Probar", self._probar_carpeta, height=28, font=F(12)).pack(side="left", padx=(6, 0), ipadx=4)
+        self.lbl_equipo = ctk.CTkLabel(
+            sec, text="Los analistas publican lo que marcan; el validador lo ve en su lote.", font=F(11),
+            text_color=COL["muted"], justify="left", anchor="w", wraplength=230
+        )
+        self.lbl_equipo.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # Apariencia
+        sec = self._section(adv, "Apariencia")
+        self.var_oscuro = tk.BooleanVar(value=self.config_data.get("tema") == "oscuro")
+        ctk.CTkSwitch(
+            sec, text="Modo oscuro (al reabrir)", variable=self.var_oscuro, onvalue=True, offvalue=False,
+            command=self._cambiar_tema, font=F(12), switch_width=36, switch_height=18
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.var_letra = tk.BooleanVar(value=bool(self.config_data.get("letra_grande")))
+        ctk.CTkSwitch(
+            sec, text="Letra grande en la tabla", variable=self.var_letra, onvalue=True, offvalue=False,
+            command=self._cambiar_letra, font=F(12), switch_width=36, switch_height=18
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         # Corte
-        sec = self._section(adv, "Envío del ticket único", first=True)
+        sec = self._section(adv, "Envío del ticket único")
         self.var_aplicar_corte = tk.BooleanVar(value=self.config_data.get("aplicar_corte", True))
         ctk.CTkSwitch(
             sec, text="Sumar rezagadas del día anterior", variable=self.var_aplicar_corte,
@@ -1059,7 +1162,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             b.pack_forget()
         if usuario:
             self.btn_copiar.configure(text="Copiar mis renovaciones", fg_color=COL["primary"], hover_color=COL["primary_h"],
-                                      text_color="#FFFFFF", border_width=0, font=F(12, True))
+                                      text_color=C("#FFFFFF"), border_width=0, font=F(12, True))
             self.btn_copiar.pack(side="left", ipadx=10)
         else:
             self.btn_copiar.configure(text="Copiar lote", fg_color=COL["surface"], hover_color=COL["track"],
@@ -1074,12 +1177,15 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             self.menu_vistas.pack_forget()
         else:
             self.menu_vistas.pack(side="left", padx=(10, 0), before=self.btn_columnas)
-        for b in (self.btn_validar_visibles, self.btn_descartar, self.btn_restaurar):
+        for b in (self.btn_validar_visibles, self.btn_equipo, self.btn_descartar, self.btn_restaurar):
             b.pack_forget()
         if not usuario:
             self.btn_validar_visibles.pack(side="left", padx=(8, 0), ipadx=6)
+            if self._carpeta_equipo():
+                self.btn_equipo.pack(side="left", padx=(8, 0), ipadx=6)
             self.btn_descartar.pack(side="left", padx=(8, 4), ipadx=6)
             self.btn_restaurar.pack(side="left", ipadx=6)
+        self._estilo_tabla()
         self._aplicar_vista()
         self._refresh_views()
         self._actualizar_encabezado()
@@ -1111,6 +1217,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             self._aplicar_perfil()
 
     def _cambiar_perfil(self, perfil: str, gafete: str = None):
+        if perfil == PERFIL_USUARIO and self.config_data.get("perfil") != PERFIL_USUARIO:
+            # El analista casi no toca la configuración: el panel izquierdo empieza plegado (Ctrl+B lo abre)
+            self.config_data.setdefault("vista", dict(VISTA_DEFAULT))["configuracion"] = False
         self.config_data["perfil"] = perfil
         if gafete:
             self.ent_agente.delete(0, "end")
@@ -1170,7 +1279,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                   height=38).pack(fill="x", padx=18, pady=(12, 18))
         cv = tarjeta(1, "Validador", ["El lote de todos o de un compañero, y la revisión semanal.",
                                       "Valida renovación por renovación con el desglose.",
-                                      "Arma y manda el correo del ticket único."], "#0F766E")
+                                      "Arma y manda el correo del ticket único."], C("#0F766E"))
         ctk.CTkFrame(cv, fg_color="transparent", height=1).pack(expand=True, fill="both", padx=18)
         self._btn(cv, "Entrar como validador", lambda: entrar(PERFIL_VALIDADOR), height=38).pack(
             fill="x", side="bottom", padx=18, pady=(12, 18))
@@ -1245,16 +1354,16 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         Aviso bajo el título: rojo si hay renovaciones que no se enviaron en su día (clic = verlas),
         ámbar si no se encontró el correo concentrado del día anterior o hay días sin comprobar.
         """
-        self.notice = ctk.CTkFrame(parent, fg_color=COL["warning_soft"], corner_radius=8, border_width=1, border_color="#FDE68A")
+        self.notice = ctk.CTkFrame(parent, fg_color=COL["warning_soft"], corner_radius=8, border_width=1, border_color=C("#FDE68A"))
         self.notice.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        self.notice_bar = ctk.CTkFrame(self.notice, width=3, height=1, corner_radius=2, fg_color="#F59E0B")
+        self.notice_bar = ctk.CTkFrame(self.notice, width=3, height=1, corner_radius=2, fg_color=C("#F59E0B"))
         self.notice_bar.pack(side="left", fill="y", padx=(10, 0), pady=8)
         self.btn_notice_mas = ctk.CTkButton(
             self.notice, text="", width=10, height=24, corner_radius=6, font=F(11, True), fg_color="transparent",
-            hover_color="#FDE68A", text_color="#92400E", command=self._toggle_avisos
+            hover_color=C("#FDE68A"), text_color=C("#92400E"), command=self._toggle_avisos
         )
         self.lbl_notice = ctk.CTkLabel(
-            self.notice, text="", font=F(12), text_color="#92400E", justify="left", anchor="w", wraplength=900
+            self.notice, text="", font=F(12), text_color=C("#92400E"), justify="left", anchor="w", wraplength=900
         )
         self.lbl_notice.pack(side="left", fill="x", expand=True, padx=12, pady=6)
         self.notice.bind(
@@ -1271,15 +1380,15 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         """Muestra el primer aviso (el más importante); los demás con «+N avisos»."""
         self._avisos = [avisos] if isinstance(avisos, str) else list(avisos)
         if rojo:
-            self.notice.configure(fg_color=COL["danger_soft"], border_color="#FECACA")
-            self.notice_bar.configure(fg_color="#DC2626")
-            self.lbl_notice.configure(text_color="#991B1B")
-            self.btn_notice_mas.configure(text_color="#991B1B", hover_color="#FECACA")
+            self.notice.configure(fg_color=COL["danger_soft"], border_color=C("#FECACA"))
+            self.notice_bar.configure(fg_color=C("#DC2626"))
+            self.lbl_notice.configure(text_color=C("#991B1B"))
+            self.btn_notice_mas.configure(text_color=C("#991B1B"), hover_color=C("#FECACA"))
         else:
-            self.notice.configure(fg_color=COL["warning_soft"], border_color="#FDE68A")
-            self.notice_bar.configure(fg_color="#F59E0B")
-            self.lbl_notice.configure(text_color="#92400E")
-            self.btn_notice_mas.configure(text_color="#92400E", hover_color="#FDE68A")
+            self.notice.configure(fg_color=COL["warning_soft"], border_color=C("#FDE68A"))
+            self.notice_bar.configure(fg_color=C("#F59E0B"))
+            self.lbl_notice.configure(text_color=C("#92400E"))
+            self.btn_notice_mas.configure(text_color=C("#92400E"), hover_color=C("#FDE68A"))
         self._notice_filtro = filtro
         cursor = "hand2" if filtro else ""
         self.notice.configure(cursor=cursor)
@@ -1312,14 +1421,59 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             kpi_bar.grid_columnconfigure(i, weight=1, uniform="kpi")
 
         # Lo que importa del día, por veredicto: qué va en el ticket único, qué falta revisar y qué ya no se manda
-        self.lbl_kpi_renovaciones = self._kpi(kpi_bar, 0, "En el lote", "Van en el ticket único de hoy", "#0B5CAD", FILTRO_TODAS)
-        self.lbl_kpi_listas = self._kpi(kpi_bar, 1, "Listas", "Todo cuadra: listas para enviar", "#16A34A", FILTRO_LISTAS)
-        self.lbl_kpi_alertas = self._kpi(kpi_bar, 2, "Revisar", "Corrige o revisa antes de enviar", "#DC2626", FILTRO_ALERTAS)
-        self.lbl_kpi_enviadas = self._kpi(kpi_bar, 3, "Ya enviadas", "Ya salieron en un ticket único", "#0F766E", FILTRO_ENVIADAS)
-        self.lbl_kpi_info = self._kpi(kpi_bar, 4, "No se mandan", "Emitidas, resueltas o no proceden", "#64748B",
+        self.lbl_kpi_renovaciones = self._kpi(kpi_bar, 0, "En el lote", "Van en el ticket único de hoy", C("#0B5CAD"), FILTRO_TODAS)
+        self.lbl_kpi_listas = self._kpi(kpi_bar, 1, "Listas", "Todo cuadra: listas para enviar", C("#16A34A"), FILTRO_LISTAS)
+        self.lbl_kpi_alertas = self._kpi(kpi_bar, 2, "Revisar", "Corrige o revisa antes de enviar", C("#DC2626"), FILTRO_ALERTAS)
+        self.lbl_kpi_enviadas = self._kpi(kpi_bar, 3, "Ya enviadas", "Ya salieron en un ticket único", C("#0F766E"), FILTRO_ENVIADAS)
+        self.lbl_kpi_info = self._kpi(kpi_bar, 4, "No se mandan", "Emitidas, resueltas o no proceden", C("#64748B"),
                                       FILTRO_INFORMATIVAS)
-        self.lbl_kpi_validados = self._kpi(kpi_bar, 5, "Avance", "Clic para ver pendientes", "#4F46E5", FILTRO_PENDIENTES,
+        self.lbl_kpi_validados = self._kpi(kpi_bar, 5, "Avance", "Clic para ver pendientes", C("#4F46E5"), FILTRO_PENDIENTES,
                                            progreso=True)
+
+        # Usuario: en vez de indicadores, una bandeja con lo que le falta y, al terminar, el botón para copiar
+        self.hero = hero = ctk.CTkFrame(parent, fg_color=COL["surface"], corner_radius=10, border_width=1,
+                                        border_color=COL["border"])
+        hero.grid(row=2, column=0, sticky="ew", pady=(10, 10))
+        hero.grid_remove()
+        hero.grid_columnconfigure(0, weight=1)
+        self.lbl_hero = ctk.CTkLabel(hero, text="", font=F(20, True), text_color=COL["text"], anchor="w")
+        self.lbl_hero.grid(row=0, column=0, sticky="w", padx=18, pady=(12, 0))
+        self.lbl_hero_sub = ctk.CTkLabel(hero, text="", font=F(12), text_color=COL["muted"], anchor="w", justify="left")
+        self.lbl_hero_sub.grid(row=1, column=0, sticky="w", padx=18)
+        self.hero_progress = ctk.CTkProgressBar(hero, height=8, corner_radius=4, progress_color=COL["success"])
+        self.hero_progress.grid(row=2, column=0, sticky="ew", padx=18, pady=(8, 14))
+        self.hero_progress.set(0)
+        self.btn_hero = self._btn(hero, "Copiar mis renovaciones", self._copy_batch_to_clipboard, "primary",
+                                  height=42, font=F(14, True))
+        self.btn_hero_siguiente = self._btn(hero, "Siguiente pendiente  (N)", self._siguiente_pendiente, height=38,
+                                            font=F(13))
+
+    def _pintar_hero(self, active_rows: list, val_count: int):
+        """Bandeja del usuario: «Te faltan X de Y» y, cuando termina, «Listo» con el botón de copiar."""
+        total, faltan = len(active_rows), len(active_rows) - val_count
+        revisar = sum(1 for r in active_rows if r['Row_ID'] not in self.validated_row_ids and self._tiene_alerta(r))
+        dudas = sum(1 for r in active_rows if self.estado.duda(self._key_by_rid.get(r['Row_ID'], '')))
+        self.btn_hero.grid_forget()
+        self.btn_hero_siguiente.grid_forget()
+        if not self.all_rows:
+            titulo, sub, color = "Extrae tu lote de hoy", "Presiona «Extraer y validar» (F5) para leer tus correos de iTop.", \
+                COL["text"]
+        elif not total:
+            titulo, sub, color = "No tienes renovaciones para el ticket único de hoy", \
+                "Lo que llegó ya salió, es del siguiente o no se manda.", COL["text"]
+        elif faltan:
+            titulo, color = f"Te faltan {faltan} de {total}", COL["text"]
+            sub = f"{val_count} validadas  ·  {revisar} de las que faltan tienen algo que revisar" + (
+                f"  ·  {dudas} duda(s) al validador" if dudas else "")
+            self.btn_hero_siguiente.grid(row=0, column=1, rowspan=3, padx=18)
+        else:
+            titulo, color = f"✔ Listo: validaste tus {total} renovaciones", COL["success"]
+            sub = ("El validador ya las ve en la carpeta compartida. También puedes copiarlas y pasárselas."
+                   if self._carpeta_equipo() else "Cópialas y pásalas a quien manda el ticket único.")
+            self.btn_hero.grid(row=0, column=1, rowspan=3, padx=18)
+        self.lbl_hero.configure(text=titulo, text_color=color)
+        self.lbl_hero_sub.configure(text=sub)
+        self.hero_progress.set(val_count / total if total else 0)
 
     def _kpi(self, parent, col, titulo, subtitulo, acento, filtro, progreso=False):
         # Una sola línea por tarjeta (punto, título y número): ocupa poco alto; con el mouse encima, el título dice qué cuenta
@@ -1400,6 +1554,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._btn(acciones, "Siguiente pendiente  ➜", self._siguiente_pendiente).pack(side="left", padx=(8, 0), ipadx=6)
         self.btn_validar_visibles = self._btn(acciones, "Validar visibles", self._validate_all_visible)
         self.btn_validar_visibles.pack(side="left", padx=(8, 0), ipadx=6)
+        self.btn_equipo = self._btn(acciones, "Validar lo del equipo", self._aceptar_equipo)
+        self.btn_equipo.pack(side="left", padx=(8, 0), ipadx=6)
         self.btn_descartar = self._btn(acciones, "Descartar", self._discard_selected_rows, "danger")
         self.btn_descartar.pack(side="left", padx=(8, 4), ipadx=6)
         self.btn_restaurar = self._btn(acciones, "Restaurar", self._restore_selected_rows, "ghost")
@@ -1520,10 +1676,17 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         style.configure(
             "Renovaciones.Treeview",
             background=COL["surface"], fieldbackground=COL["surface"], foreground=COL["text"],
-            rowheight=int(32 * s), borderwidth=0, relief="flat", font=(FONT, 10)
+            borderwidth=0, relief="flat"
         )
+        self._estilo_tabla()
         # Sin marco ni anillo de foco alrededor de la tabla
         style.layout("Renovaciones.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        # Columna #0 (barra de estado del desglose): solo la imagen, sin sangría ni triángulo de árbol que la tapen
+        style.layout("Renovaciones.Treeview.Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+            ("Treeitem.image", {"side": "left", "sticky": ""}),
+            ("Treeitem.focus", {"side": "left", "sticky": "", "children": [("Treeitem.text", {"side": "left", "sticky": ""})]}),
+        ]})])
+        style.configure("Renovaciones.Treeview", indent=0)
         style.configure(
             "Renovaciones.Treeview.Heading",
             background=COL["subtle"], foreground=COL["muted"], font=(FONT_SB, 9), relief="flat",
@@ -1555,12 +1718,34 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             fieldbackground=[("readonly", COL["surface"])], background=[("active", COL["track"])]
         )
 
-    def _make_tree(self, parent, headers: dict, selectmode="extended") -> ttk.Treeview:
+    def _estilo_tabla(self):
+        """Alto de renglón y letra de las tablas: más grandes con «Letra grande» o en el perfil de usuario."""
+        s = self._scaling()
+        grande = bool(self.config_data.get("letra_grande")) or self._es_usuario()
+        ttk.Style().configure("Renovaciones.Treeview", rowheight=int((40 if grande else 32) * s),
+                              font=(FONT, 11 if grande else 10))
+        ttk.Style().configure("Renovaciones.Treeview.Heading", font=(FONT_SB, 10 if grande else 9))
+
+    def _barra(self, color: str) -> tk.PhotoImage:
+        """Barra de color al inicio de la fila (el estado se lee por color, ícono y texto: no solo por color)."""
+        if color not in self._barras:
+            alto = int(26 * self._scaling())
+            img = tk.PhotoImage(width=6, height=alto)
+            img.put(COL["surface"], to=(0, 0, 6, alto))
+            img.put(color, to=(0, 2, 4, alto - 2))
+            self._barras[color] = img
+        return self._barras[color]
+
+    def _make_tree(self, parent, headers: dict, selectmode="extended", barra: bool = False) -> ttk.Treeview:
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_rowconfigure(0, weight=1)
         tree = ttk.Treeview(
-            parent, columns=tuple(headers.keys()), show="headings", style="Renovaciones.Treeview", selectmode=selectmode
+            parent, columns=tuple(headers.keys()), show="tree headings" if barra else "headings",
+            style="Renovaciones.Treeview", selectmode=selectmode
         )
+        if barra:
+            tree.column("#0", width=int(14 * self._scaling()), minwidth=10, stretch=False)
+            tree.heading("#0", text="")
         for col, (text, width, anchor) in headers.items():
             self._headers[(str(tree), col)] = text
             tree.heading(col, text=text, anchor=anchor, command=lambda c=col, t=tree: self._on_heading_click(t, c))
@@ -1568,20 +1753,24 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             tree.column(col, width=int(width * self._scaling()), minwidth=50, anchor=anchor, stretch=False)
 
         # Colores por estado, suaves (los de alerta ganan a la franja alterna porque cada fila lleva un solo tag)
-        tree.tag_configure("normal", background="#FFFFFF", foreground=COL["text"])
-        tree.tag_configure("normal_alt", background="#FAFBFC", foreground=COL["text"])
-        tree.tag_configure("multiple", background="#FFFBEB", foreground="#92400E")      # Ámbar: varias renovaciones en 1 ticket
-        tree.tag_configure("incompleto", background="#FEF2F2", foreground="#B91C1C")    # Rojo: falta cliente o crédito
-        tree.tag_configure("duplicado", background="#FDF2F8", foreground="#9D174D")     # Rosa: crédito repetido en otro ticket
-        tree.tag_configure("reasignado", background="#FFF7ED", foreground="#9A3412")    # Naranja: reasignado
-        tree.tag_configure("rezagada", background="#EEF2FF", foreground="#3730A3")      # Índigo: rezagada del día anterior
-        tree.tag_configure("fuera_lote", background="#FFFFFF", foreground=COL["faint"])  # Gris: ya enviada / después del corte
-        tree.tag_configure("validado", background="#F0FDF4", foreground="#166534")      # Verde: validada
-        tree.tag_configure("cerrado", background="#F5F3FF", foreground="#5B21B6")       # Violeta: ya cerrado en iTop
+        tree.tag_configure("normal", background=C("#FFFFFF"), foreground=COL["text"])
+        tree.tag_configure("normal_alt", background=C("#FAFBFC"), foreground=COL["text"])
+        tree.tag_configure("multiple", background=C("#FFFBEB"), foreground=C("#92400E"))      # Ámbar: varias renovaciones en 1 ticket
+        tree.tag_configure("incompleto", background=C("#FEF2F2"), foreground=C("#B91C1C"))    # Rojo: falta cliente o crédito
+        tree.tag_configure("duplicado", background=C("#FDF2F8"), foreground=C("#9D174D"))     # Rosa: crédito repetido en otro ticket
+        tree.tag_configure("reasignado", background=C("#FFF7ED"), foreground=C("#9A3412"))    # Naranja: reasignado
+        tree.tag_configure("rezagada", background=C("#EEF2FF"), foreground=C("#3730A3"))      # Índigo: rezagada del día anterior
+        tree.tag_configure("fuera_lote", background=C("#FFFFFF"), foreground=COL["faint"])  # Gris: ya enviada / después del corte
+        tree.tag_configure("validado", background=C("#F0FDF4"), foreground=C("#166534"))      # Verde: validada
+        tree.tag_configure("cerrado", background=C("#F5F3FF"), foreground=C("#5B21B6"))       # Violeta: ya cerrado en iTop
         tree.tag_configure("descartado", background=COL["subtle"], foreground=COL["faint"])  # Gris: descartada
-        tree.tag_configure("no_enviada", background="#FEE2E2", foreground="#991B1B")    # Rojo fuerte: no se envió en su día
-        tree.tag_configure("informativa", background="#F8FAFC", foreground="#64748B")   # Gris: ya no se manda (informativa)
-        tree.tag_configure("lista", background="#FFFFFF", foreground=COL["text"])        # Lista para enviar (sin validar)
+        tree.tag_configure("no_enviada", background=C("#FEE2E2"), foreground=C("#991B1B"))    # Rojo fuerte: no se envió en su día
+        tree.tag_configure("informativa", background=C("#F8FAFC"), foreground=C("#64748B"))   # Gris: ya no se manda (informativa)
+        tree.tag_configure("lista", background=C("#FFFFFF"), foreground=COL["text"])        # Lista para enviar (sin validar)
+        # Desglose: filas sin pintar; el estado va en la barra de color y en el texto del veredicto
+        tree.tag_configure("fila", background=COL["surface"], foreground=COL["text"])
+        tree.tag_configure("fila_alt", background=COL["subtle"], foreground=COL["text"])
+        tree.tag_configure("apagada", background=COL["surface"], foreground=COL["faint"])
 
         vsb = ctk.CTkScrollbar(parent, orientation="vertical", command=tree.yview, width=12)
         hsb = ctk.CTkScrollbar(parent, orientation="horizontal", command=tree.xview, height=12)
@@ -1594,6 +1783,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
     def _build_tab_desglose(self):
         self.tree_desglose = self._make_tree(self.tab_desglose, {
             "validado": ("Veredicto", 130, "w"),
+            "equipo": ("Equipo", 150, "w"),
             "ticket": ("Ticket iTop", 105, "center"),
             "parte": ("Parte", 64, "center"),
             "cliente": ("No. cliente", 115, "center"),
@@ -1608,8 +1798,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "alerta_asig": ("Asignación", 240, "w"),
             "motivo": ("Motivo", 230, "w"),
             "fecha": ("Llegada", 135, "center"),
-        })
+        }, barra=True)
         self.tree_desglose.bind("<<TreeviewSelect>>", self._on_select_desglose_row)
+        for tecla, accion in (("j", lambda: self._mover_seleccion(1)), ("k", lambda: self._mover_seleccion(-1)),
+                              ("d", self._poner_duda)):
+            self.tree_desglose.bind(f"<{tecla}>", lambda e, a=accion: a())
+            self.tree_desglose.bind(f"<{tecla.upper()}>", lambda e, a=accion: a())
         self.tree_desglose.bind("<Double-1>", lambda e: self._toggle_selected_validation())
         self.tree_desglose.bind("<space>", lambda e: self._toggle_selected_validation())
         self.tree_desglose.bind("<Return>", lambda e: self._open_selected_in_itop())
@@ -1649,6 +1843,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             "rezagadas": ("Rezagadas", 110, "center"),
             "validados": ("Validadas", 130, "center"),
             "pendientes": ("Pendientes", 110, "center"),
+            "equipo_marcadas": ("Marcó el analista", 150, "center"),
+            "equipo_senal": ("Última señal", 150, "center"),
         }, selectmode="browse")
 
     def _build_tab_enviado(self):
@@ -1806,20 +2002,24 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.txt_detail.tag_config("ok", foreground=COL["success"])
         self.txt_detail.tag_config("warn", foreground=COL["warning"])
         self.txt_detail.tag_config("muted", foreground=COL["muted"])
-        self.txt_detail.tag_config("cierre", foreground="#5B21B6")
-        self.txt_detail.tag_config("error", foreground="#B91C1C")
+        self.txt_detail.tag_config("cierre", foreground=C("#5B21B6"))
+        self.txt_detail.tag_config("error", foreground=C("#B91C1C"))
         # Encabezados de sección y renglones con sangría (en el Text de tk: CTkTextbox no deja poner fuente a un tag)
         interno = self.txt_detail._textbox
         interno.tag_configure("seccion", font=(FONT_SB, 9), foreground=COL["muted"], spacing1=10, spacing3=4)
         interno.tag_configure("check", lmargin1=4, lmargin2=26, spacing1=3, spacing3=3)
         interno.tag_configure("dato", font=(FONT_SB, 11), foreground=COL["text"])
+        s = self._scaling()
+        interno.tag_configure("tabla", tabs=(int(95 * s), int(235 * s), int(470 * s)), lmargin1=4, lmargin2=4,
+                              spacing1=2, spacing3=2)
+        interno.tag_configure("tabla_enc", font=(FONT_SB, 9), foreground=COL["muted"])
 
         self.txt_detail.insert("1.0", "Aquí sale el desglose del ticket: el veredicto de cada renovación, qué hacer y "
                                       "las comprobaciones (correo, base de datos, calendario, ticket único e iTop).")
         self.txt_detail.configure(state="disabled")
 
         self.txt_body = ctk.CTkTextbox(parent, font=F(12), wrap="word")
-        self.txt_body.tag_config("hl", background="#FEF08A", foreground="#713F12")
+        self.txt_body.tag_config("hl", background=C("#FEF08A"), foreground=C("#713F12"))
 
     def _colocar_detalle(self, derecha: bool):
         """A la derecha: desglose arriba (más alto) y correo abajo. Abajo: desglose a la izquierda (más ancho) y correo."""
@@ -1859,6 +2059,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         m.add_command(label="Marcar / desmarcar validada", accelerator="Espacio", command=self._toggle_selected_validation)
         m.add_command(label="Abrir en iTop", accelerator="Enter", command=self._open_selected_in_itop)
         m.add_command(label="Buscar el folio en iTop", command=lambda: self._open_selected_in_itop(buscar=True))
+        m.add_command(label="Pasar duda al validador…", accelerator="D", command=self._poner_duda)
         m.add_separator()
         m.add_command(label="Copiar No. cliente", command=lambda: self._copy_field(('Numero_Cliente',)))
         m.add_command(label="Copiar crédito a cancelar", command=lambda: self._copy_field(('Credito_Renovado_Hijo',)))
@@ -1885,6 +2086,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.bind("<Control-m>", lambda e: self._crear_correo_lote())
         self.bind("<Control-C>", lambda e: self._copy_batch_to_clipboard())  # Ctrl+Shift+C
         self.bind("<Control-b>", lambda e: self._toggle_sidebar())
+        self.bind("<Control-k>", lambda e: self._paleta_comandos())
+        self.bind("<Control-z>", lambda e: None if self._escribiendo(e) else self._deshacer_ultimo())
+        self.bind("<question>", lambda e: None if self._escribiendo(e) else self._show_shortcuts())
+
+    @staticmethod
+    def _escribiendo(e) -> bool:
+        """El foco está en un campo de texto (ahí las teclas son para escribir)."""
+        return isinstance(e.widget, (tk.Entry, tk.Text))
 
     # ================= EVENTOS GENERALES =================
 
@@ -1975,7 +2184,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         threading.Thread(target=trabajo, daemon=True).start()
 
     def _sql_probado(self, texto: str, ok: bool):
-        self.lbl_sql_estado.configure(text=texto, text_color=COL["success"] if ok else "#B91C1C")
+        self.lbl_sql_estado.configure(text=texto, text_color=COL["success"] if ok else C("#B91C1C"))
         if ok:
             self._save_config()
 
@@ -2075,30 +2284,181 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         )
         win.after(150, win.focus_force)
 
-    def _toast(self, msg: str, color: str = COL["primary"], ms: int = 7000):
-        """Aviso flotante en la esquina inferior derecha que se cierra solo (o con clic)."""
+    def _toast(self, msg: str, color: str = None, ms: int = 7000, accion: tuple = None):
+        """
+        Aviso flotante en la esquina inferior derecha que se cierra solo (o con clic). `accion`: (texto, función) para
+        un botón, p. ej. («Deshacer», …). Solo hay un aviso a la vez: el nuevo reemplaza al anterior.
+        """
         try:
-            win = ctk.CTkToplevel(self)
+            previo = getattr(self, "_toast_win", None)
+            if previo is not None and previo.winfo_exists():
+                previo.destroy()
+            # Siempre oscuro (en el tema oscuro, un poco más claro que el fondo)
+            fondo, texto = ("#1F2937", "#F9FAFB") if not _TEMA["oscuro"] else ("#334155", "#F9FAFB")
+            win = self._toast_win = ctk.CTkToplevel(self)
             win.overrideredirect(True)
             win.attributes("-topmost", True)
-            win.configure(fg_color="#1F2937")
-            frame = ctk.CTkFrame(win, fg_color="#1F2937", corner_radius=0)
+            win.configure(fg_color=fondo)
+            frame = ctk.CTkFrame(win, fg_color=fondo, corner_radius=0)
             frame.pack(fill="both", expand=True)
-            strip = ctk.CTkFrame(frame, width=4, corner_radius=2, fg_color=color)
+            strip = ctk.CTkFrame(frame, width=4, height=4, corner_radius=2, fg_color=color or COL["primary"])
             strip.pack(side="left", fill="y", padx=(12, 0), pady=12)
             lbl = ctk.CTkLabel(
-                frame, text=msg, text_color="#F9FAFB", font=F(12), wraplength=360, justify="left", anchor="w"
+                frame, text=msg, text_color=texto, font=F(12), wraplength=360, justify="left", anchor="w"
             )
-            lbl.pack(side="left", padx=(12, 18), pady=12)
+            lbl.pack(side="left", padx=(12, 12 if accion else 18), pady=12)
+            if accion:
+                def hacer():
+                    win.destroy()
+                    accion[1]()
+                ctk.CTkButton(frame, text=accion[0], command=hacer, height=28, width=10, corner_radius=6, font=F(12, True),
+                              fg_color="transparent", hover_color="#475569", text_color="#93C5FD").pack(
+                    side="left", padx=(0, 12), ipadx=6)
             win.update_idletasks()
-            x = self.winfo_rootx() + self.winfo_width() - win.winfo_width() - 24
-            y = self.winfo_rooty() + self.winfo_height() - win.winfo_height() - 48
-            win.geometry(f"+{x}+{y}")
+            # Del tamaño que pide su contenido (CTkToplevel nace de 200x200 y escala lo que se le pase a geometry)
+            ancho, alto = frame.winfo_reqwidth(), frame.winfo_reqheight()
+            x = self.winfo_rootx() + self.winfo_width() - ancho - 24
+            y = self.winfo_rooty() + self.winfo_height() - alto - 48
+            tk.Toplevel.wm_geometry(win, f"{ancho}x{alto}+{x}+{y}")
             for w in (frame, lbl, strip):
                 w.bind("<Button-1>", lambda e: win.destroy())
             win.after(ms, lambda: win.winfo_exists() and win.destroy())
         except Exception:
             self.lbl_status.configure(text=msg)
+
+    # ================= DESHACER =================
+
+    def _con_deshacer(self, descripcion: str, revertir):
+        """Guarda cómo revertir lo que se acaba de hacer y lo avisa con el botón «Deshacer» (Ctrl+Z)."""
+        self._deshacer.append((descripcion, revertir))
+        del self._deshacer[:-20]
+        self._toast(f"{descripcion}.", COL["success"], ms=6000, accion=("Deshacer  Ctrl+Z", self._deshacer_ultimo))
+
+    def _deshacer_ultimo(self):
+        if not self._deshacer:
+            self._toast("No hay nada que deshacer.", COL["muted"], ms=2500)
+            return
+        descripcion, revertir = self._deshacer.pop()
+        revertir()
+        self._refresh_views()
+        self._mostrar_seleccion()
+        self._publicar_equipo()
+        self._toast(f"Se deshizo: {descripcion[0].lower()}{descripcion[1:]}.", COL["muted"], ms=3500)
+
+    def _mostrar_seleccion(self):
+        sel = self.tree_desglose.selection()
+        r = next((x for x in self.all_rows if sel and x['Row_ID'] == sel[0]), None)
+        if r:
+            self._show_row_detail(r)
+
+    def _estado_de(self, rids) -> tuple:
+        """Copia de las marcas de esas filas (para poder deshacer)."""
+        rids = set(rids)
+        return (rids & self.validated_row_ids, rids & self.discarded_row_ids, rids & self.forced_included_row_ids)
+
+    def _restaurar_estado(self, rids, copia):
+        """Regresa las marcas de esas filas a como estaban (en pantalla y en disco)."""
+        validadas, descartadas, incluidas = copia
+        rids = set(rids)
+        for conjunto, categoria, antes in ((self.validated_row_ids, 'validados', validadas),
+                                           (self.discarded_row_ids, 'descartados', descartadas),
+                                           (self.forced_included_row_ids, 'incluidos', incluidas)):
+            quitar, poner = (conjunto & rids) - antes, antes - conjunto
+            conjunto.difference_update(quitar)
+            conjunto.update(poner)
+            self.estado.set(categoria, self._keys_for(quitar), False)
+            self.estado.set(categoria, self._keys_for(poner), True)
+        self.estado.registrar(self._keys_for(rids), "Deshecho")
+
+    # ================= PALETA DE COMANDOS (Ctrl+K) =================
+
+    def _comandos(self) -> list:
+        """[(texto, función)] de todo lo que se puede hacer escribiendo en Ctrl+K."""
+        usuario = self._es_usuario()
+        cmds = [
+            ("Extraer y validar (F5)", self._start_extraction),
+            ("Copiar mis renovaciones" if usuario else "Copiar lote", self._copy_batch_to_clipboard),
+            ("Siguiente pendiente (N)", self._siguiente_pendiente),
+            ("Validar la seleccionada (Espacio)", self._toggle_selected_validation),
+            ("Deshacer lo último (Ctrl+Z)", self._deshacer_ultimo),
+            ("Abrir en iTop (Enter)", self._open_selected_in_itop),
+            ("Ver el calendario de emisión", self._recordatorio_emision),
+            ("Ver atajos de teclado (?)", self._show_shortcuts),
+            ("Cambiar a modo oscuro" if not _TEMA["oscuro"] else "Cambiar a modo claro",
+             lambda: (self.var_oscuro.set(not _TEMA["oscuro"]), self._cambiar_tema())),
+            ("Letra grande en la tabla: " + ("quitar" if self.config_data.get("letra_grande") else "poner"),
+             lambda: (self.var_letra.set(not self.config_data.get("letra_grande")), self._cambiar_letra())),
+            ("Ocultar o mostrar el panel izquierdo (Ctrl+B)", self._toggle_sidebar),
+        ]
+        if usuario:
+            cmds.insert(4, ("Pasar una duda al validador (D)", self._poner_duda))
+        else:
+            cmds += [("Crear correo Ticket Único (Ctrl+M)", self._crear_correo_lote),
+                     ("Exportar a Excel (Ctrl+E)", self._export_excel),
+                     ("Validar las que marcó el equipo", self._aceptar_equipo),
+                     ("Validar visibles", self._validate_all_visible),
+                     ("Revisión semanal: esta semana", lambda: self._revisar_semana(0))]
+        filtros = self.cmb_quick_filter.principales + ([] if usuario else FILTROS_SECUNDARIOS)
+        cmds += [(f"Ver: {f}", lambda f=f: self._apply_filter(f)) for f in dict.fromkeys(filtros)]
+        return cmds
+
+    def _paleta_comandos(self):
+        win = ctk.CTkToplevel(self)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(fg_color=COL["surface"])
+        marco = ctk.CTkFrame(win, fg_color=COL["surface"], corner_radius=10, border_width=1, border_color=COL["border_strong"])
+        marco.pack(fill="both", expand=True)
+        ent = ctk.CTkEntry(marco, width=520, height=38, font=F(14), placeholder_text="¿Qué quieres hacer? (Esc cierra)")
+        ent.pack(fill="x", padx=12, pady=(12, 6))
+        lista = tk.Listbox(marco, height=10, font=(FONT, 11), activestyle="none", borderwidth=0, highlightthickness=0,
+                           bg=COL["surface"], fg=COL["text"], selectbackground=COL["primary_soft"],
+                           selectforeground=COL["text"])
+        lista.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        comandos = self._comandos()
+        visibles = []
+
+        def filtrar(_e=None):
+            palabras = ent.get().lower().split()
+            visibles[:] = [c for c in comandos if all(p in c[0].lower() for p in palabras)]
+            lista.delete(0, "end")
+            for texto, _ in visibles:
+                lista.insert("end", f"  {texto}")
+            if visibles:
+                lista.selection_set(0)
+
+        def mover(paso):
+            if not visibles:
+                return "break"
+            i = (lista.curselection() or (0,))[0]
+            i = max(0, min(len(visibles) - 1, i + paso))
+            lista.selection_clear(0, "end")
+            lista.selection_set(i)
+            lista.see(i)
+            return "break"
+
+        def ejecutar(_e=None):
+            sel = lista.curselection()
+            if visibles and sel:
+                accion = visibles[sel[0]][1]
+                win.destroy()
+                self.after(50, accion)
+
+        ent.bind("<KeyRelease>", lambda e: e.keysym in ("Up", "Down", "Return") or filtrar())
+        ent.bind("<Down>", lambda e: mover(1))
+        ent.bind("<Up>", lambda e: mover(-1))
+        ent.bind("<Return>", ejecutar)
+        lista.bind("<Double-1>", ejecutar)
+        for w in (win, ent, lista):
+            w.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<FocusOut>", lambda e: win.after(150, lambda: win.winfo_exists() and win.focus_get() is None
+                                                   and win.destroy()))
+        filtrar()
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + int(self.winfo_height() * 0.18)
+        win.geometry(f"+{x}+{y}")
+        win.after(60, lambda: (win.focus_force(), ent.focus_set()))
 
     # ================= RELOJ, CUENTA REGRESIVA Y AUTO-ACTUALIZACIÓN =================
 
@@ -2119,7 +2479,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             restante = f"{h} h {m:02d} min" if h else f"{m} min"
             text = f"{now:%H:%M}  ·  Ticket único de hoy pendiente  ·  habitual {habitual:%H:%M} (en {restante})"
             if mins > 60:
-                bg, fg = COL["success_soft"], "#047857"
+                bg, fg = COL["success_soft"], C("#047857")
             elif mins > 15:
                 bg, fg = COL["warning_soft"], COL["warning"]
             else:
@@ -2181,13 +2541,20 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._save_config()
 
         fecha, texto = proximos[0]
+        if auto:
+            # Sin ventana que tape el trabajo: un aviso con el botón para ver el calendario
+            msg = f"📅 Próximo corte: {texto} el {fecha:%d/%m} ({self._cuando(fecha, hoy)})."
+            if bloqueadas:
+                msg += f"\n{len(bloqueadas)} renovación(es) ya pasaron la emisión: solo informativas, no se mandan."
+            self._toast(msg, COL["warning"], ms=15000, accion=("Ver calendario", self._recordatorio_emision))
+            return
         win = ctk.CTkToplevel(self)
         win.title("Recordatorio: calendario de emisión")
         win.resizable(False, False)
         win.transient(self)
         win.configure(fg_color=COL["surface"])
         urgente = (fecha - hoy).days <= 1 or bloqueadas
-        ctk.CTkFrame(win, height=6, corner_radius=0, fg_color="#DC2626" if urgente else "#F59E0B").pack(fill="x")
+        ctk.CTkFrame(win, height=6, corner_radius=0, fg_color=C("#DC2626") if urgente else C("#F59E0B")).pack(fill="x")
         cuerpo = ctk.CTkFrame(win, fg_color="transparent")
         cuerpo.pack(fill="both", padx=28, pady=(18, 8))
 
@@ -2197,7 +2564,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         renglon("📅  Calendario de emisión", F(17, True), arriba=0)
         renglon(f"Próximo corte: {texto}, {DIAS_SEMANA[fecha.weekday()]} {fecha:%d/%m/%Y} "
-                f"({self._cuando(fecha, hoy)}).", F(14, True), "#B91C1C" if urgente else COL["warning"], 12)
+                f"({self._cuando(fecha, hoy)}).", F(14, True), C("#B91C1C") if urgente else COL["warning"], 12)
         renglon(f"Lo dado de alta hasta el {fecha:%d/%m} se cancela solo si sale en un ticket único de ese día o antes. "
                 f"Ese día se puede mandar más de un ticket único: lo que llegue después del primero se manda en otro "
                 f"el mismo día. Después de la emisión ya no se puede cancelar (sale del lote y queda como informativa); "
@@ -2212,7 +2579,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if bloqueadas:
             tickets = sorted({r['Numero_Ticket'] for r in bloqueadas})
             renglon(f"⚠️  {len(bloqueadas)} renovación(es) ya se emitieron y salieron del lote (solo informativas): "
-                    f"{', '.join(tickets[:8])}{'…' if len(tickets) > 8 else ''}.", F(13, True), "#B91C1C", 14)
+                    f"{', '.join(tickets[:8])}{'…' if len(tickets) > 8 else ''}.", F(13, True), C("#B91C1C"), 14)
         elif not self.var_sql.get():
             renglon("Sin la base de datos se usa el día en que llegó el incidente; con «Validar en la base de datos» se "
                     "usa la fecha de alta de cada renovación (más exacto).", color=COL["muted"], arriba=14)
@@ -2229,7 +2596,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         siguiente = proximos[0][0]
         for i, (f, t) in enumerate(sorted(cortes_entre(hoy - timedelta(days=35), hoy + timedelta(days=100)).items()), 1):
             pasado = f < hoy
-            color = COL["faint"] if pasado else ("#B91C1C" if f == siguiente and urgente else
+            color = COL["faint"] if pasado else (C("#B91C1C") if f == siguiente and urgente else
                                                  COL["warning"] if f == siguiente else COL["text"])
             fuente = F(12, f == siguiente)
             cuando = "ya pasó" if pasado else self._cuando(f, hoy)
@@ -2265,7 +2632,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             f"Faltan {mins} min para la hora habitual del ticket único.\n"
             + (f"Hay {pendientes} de {len(active_rows)} renovaciones sin validar." if self.all_rows
                else "Aún no se han extraído las renovaciones de hoy (F5)."),
-            color="#EF4444", ms=12000
+            color=C("#EF4444"), ms=12000
         )
 
     def _on_auto_toggle(self):
@@ -2488,6 +2855,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             msg += f"  ·  {informativas} ya no se mandan (informativas)"
         self.lbl_status.configure(text=msg)
         self._aprender_texto_correo(lote_info)
+        # Equipo: el analista publica su avance; el validador lee lo que ya marcaron
+        self._publicar_equipo(ya=True)
+        self._leer_equipo()
         if not (lote_info and lote_info.get('revision')):
             self.after(300, lambda: self._recordatorio_emision(auto=True))
 
@@ -2808,6 +3178,226 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if not self.lote_info:
             self._actualizar_encabezado()
 
+    # ================= TRABAJO EN EQUIPO (carpeta compartida) =================
+
+    def _carpeta_equipo(self) -> str:
+        return (self.config_data.get("carpeta_compartida") or "").strip()
+
+    def _elegir_carpeta(self):
+        carpeta = filedialog.askdirectory(title="Carpeta compartida del equipo", initialdir=self._carpeta_equipo() or None)
+        if carpeta:
+            self.ent_carpeta.delete(0, "end")
+            self.ent_carpeta.insert(0, os.path.normpath(carpeta))
+            self._probar_carpeta()
+
+    def _probar_carpeta(self):
+        self._save_config()
+        error = equipo.carpeta_valida(self._carpeta_equipo())
+        self._estado_equipo(error or ("Lista: tus marcas se publican ahí." if self._es_usuario()
+                                      else "Lista: aquí verás lo que marca el equipo."), bool(error))
+        if not error:
+            if not self._es_usuario() and not self.btn_equipo.winfo_manager():
+                self.btn_equipo.pack(side="left", padx=(8, 0), ipadx=6, after=self.btn_validar_visibles)
+            self._publicar_equipo(ya=True)
+            self._leer_equipo()
+
+    def _estado_equipo(self, texto: str, error: bool = False):
+        self._equipo_estado = texto
+        self.lbl_equipo.configure(text=texto, text_color=COL["danger"] if error else COL["muted"])
+
+    def _dia_equipo(self):
+        dia = (self.lote_info or {}).get('lote_actual') or datetime.now().date()
+        return dia.date() if isinstance(dia, datetime) else dia
+
+    def _publicar_equipo(self, ya: bool = False):
+        """Usuario: publica en la carpeta compartida lo que validó y sus dudas (un segundo después del último cambio)."""
+        if not self._es_usuario() or not self._carpeta_equipo() or not self.all_rows:
+            return
+        if self._publicar_job:
+            self.after_cancel(self._publicar_job)
+        self._publicar_job = self.after(50 if ya else 900, self._publicar_ahora)
+
+    def _publicar_ahora(self):
+        self._publicar_job = None
+        carpeta, gafete = self._carpeta_equipo(), self.ent_agente.get().strip()
+        if not carpeta or not gafete:
+            return
+        validados = self.estado.data.get('validados', {})
+        marcas, en_lote = {}, []
+        for r in self.all_rows:
+            llaves = llaves_fila(r)
+            k = llaves[0]
+            fuera = self._fuera_de_lote(r) or r['Row_ID'] in self.discarded_row_ids
+            if not fuera:
+                en_lote.append(r)
+            nota = self.estado.duda(k)
+            if nota:
+                hora = (self.estado.data['dudas'].get(k) or {}).get('hora')
+                marcas[k] = equipo.marca(r, equipo.DUDA, datetime.fromisoformat(hora) if hora else None, nota, llaves)
+            elif r['Row_ID'] in self.validated_row_ids and not fuera:
+                hora = validados.get(k)
+                marcas[k] = equipo.marca(r, equipo.VALIDADA, datetime.fromisoformat(hora) if hora else None, "", llaves)
+        avance = {"total": len(en_lote), "validadas": sum(1 for r in en_lote if r['Row_ID'] in self.validated_row_ids),
+                  "revisar": sum(1 for r in en_lote if r['Row_ID'] not in self.validated_row_ids and self._tiene_alerta(r)),
+                  "dudas": sum(1 for m in marcas.values() if m["estado"] == equipo.DUDA)}
+        nombre = next((r['Nombre_Asignado'] for r in self.all_rows if str(r.get('Gafete')) == gafete), "")
+        dia = self._dia_equipo()
+
+        def publicar():
+            error = equipo.publicar(carpeta, gafete, nombre, dia, marcas, avance)
+            self.after(0, lambda: self._estado_equipo(
+                error or f"Publicado a las {datetime.now():%H:%M}: {avance['validadas']} validada(s)"
+                         + (f", {avance['dudas']} duda(s)" if avance['dudas'] else "") + " para el validador.", bool(error)))
+        threading.Thread(target=publicar, daemon=True).start()
+
+    def _equipo_tick(self):
+        self.after(15000, self._equipo_tick)
+        self._leer_equipo()
+
+    def _leer_equipo(self):
+        """Validador: lee lo que publicó el equipo (en segundo plano, para no trabar la pantalla si la red tarda)."""
+        carpeta = self._carpeta_equipo()
+        if self._es_usuario() or not carpeta or self._equipo_leyendo:
+            return
+        self._equipo_leyendo = True
+        dia = self._dia_equipo()
+
+        def leer():
+            res = equipo.leer_equipo(carpeta, dia)
+            self.after(0, lambda: self._equipo_leido(res))
+        threading.Thread(target=leer, daemon=True).start()
+
+    def _equipo_leido(self, res: dict):
+        self._equipo_leyendo = False
+        firma = lambda d: {(k, m.get("estado"), m.get("hora")) for k, m in d["marcas"].items()}  # noqa: E731
+        cambio = firma(res) != firma(self._equipo)
+        nuevas = [m for k, m in res["marcas"].items() if (k, m.get("estado"), m.get("hora")) not in self._equipo_vistas]
+        self._equipo_vistas |= firma(res)
+        self._equipo = res
+        if res["errores"]:
+            self._estado_equipo(res["errores"][0], True)
+        else:
+            n = len(res["analistas"])
+            self._estado_equipo(f"{n} analista(s) publicando hoy · {len(res['marcas'])} marca(s). "
+                                f"Revisado a las {datetime.now():%H:%M}." if n else
+                                "Conectado. Ningún analista ha publicado hoy.")
+        if nuevas and self.all_rows:
+            por_quien = {}
+            for m in nuevas:
+                quien = f"{m.get('nombre') or 'Gafete'} ({m.get('gafete')})"
+                v, d = por_quien.get(quien, (0, 0))
+                por_quien[quien] = (v + (m.get("estado") == equipo.VALIDADA), d + (m.get("estado") == equipo.DUDA))
+            partes = [f"{q} validó {v}" + (f" y dejó {d} duda(s)" if d else "") if v else f"{q} dejó {d} duda(s)"
+                      for q, (v, d) in por_quien.items()]
+            self._toast("Equipo: " + "; ".join(partes) + ".", COL["primary"], ms=9000,
+                        accion=("Ver", lambda: self._apply_filter(FILTRO_DUDAS if any(
+                            m.get("estado") == equipo.DUDA for m in nuevas) else FILTRO_EQUIPO)))
+        if cambio and self.all_rows:
+            self._refresh_views()
+            self._mostrar_seleccion()
+
+    def _marca_equipo(self, r: dict):
+        """Lo que el equipo publicó de esta renovación (solo lo ve el validador)."""
+        if self._es_usuario() or not self._equipo["marcas"]:
+            return None
+        return equipo.marca_de_fila(llaves_fila(r), self._equipo["marcas"])
+
+    def _texto_equipo(self, r: dict) -> str:
+        """Columna «Equipo»: quién la marcó (validador) o la duda que dejaste (usuario)."""
+        if self._es_usuario():
+            nota = self.estado.duda(self._key_by_rid.get(r['Row_ID'], ''))
+            return f"? Duda: {nota}" if nota else ""
+        m = self._marca_equipo(r)
+        if not m:
+            return ""
+        hora = str(m.get("hora", ""))[11:16]
+        quien = (m.get("nombre") or "").split(" ")[0] or m.get("gafete")
+        return f"? {quien}: {m.get('nota')}" if m.get("estado") == equipo.DUDA else f"✓ {quien} {hora}"
+
+    def _aceptar_equipo(self):
+        """Validador: valida de una vez lo que el equipo ya marcó (menos lo que tiene algo que revisar)."""
+        active_rows, _ = self._get_active_and_filtered_rows()
+        marcadas = [(r, m) for r in active_rows if r['Row_ID'] not in self.validated_row_ids
+                    for m in [self._marca_equipo(r)] if m and m.get("estado") == equipo.VALIDADA]
+        if not marcadas:
+            messagebox.showinfo("Equipo", "No hay renovaciones marcadas por el equipo pendientes de validar.")
+            return
+        aceptar = [(r, m) for r, m in marcadas if not self._tiene_alerta(r)]
+        omitidas = [r for r, m in marcadas if self._tiene_alerta(r)]
+        texto = f"Se validarán {len(aceptar)} renovación(es) que el equipo ya marcó."
+        if omitidas:
+            texto += (f"\n\nSe dejan fuera {len(omitidas)} con algo que revisar (revísalas tú): "
+                      + ", ".join(r['Numero_Ticket'] for r in omitidas[:8]) + ("…" if len(omitidas) > 8 else ""))
+        if not aceptar or not messagebox.askyesno("Validar lo del equipo", texto + "\n\n¿Continuar?"):
+            if not aceptar:
+                messagebox.showinfo("Validar lo del equipo", texto)
+            return
+        rids = [r['Row_ID'] for r, _ in aceptar]
+        copia = self._estado_de(rids)
+        self.validated_row_ids.update(rids)
+        self.estado.set('validados', self._keys_for(rids), True)
+        for r, m in aceptar:
+            self.estado.registrar([self._key_by_rid.get(r['Row_ID'])],
+                                  f"Validada (la marcó {m.get('nombre') or m.get('gafete')} a las {str(m.get('hora'))[11:16]})",
+                                  guardar=False)
+        self.estado.save()
+        self._refresh_views()
+        self._con_deshacer(f"Validaste {len(rids)} que marcó el equipo", lambda: self._restaurar_estado(rids, copia))
+
+    def _poner_duda(self):
+        """Usuario: deja una duda al validador sobre la renovación seleccionada (le llega por la carpeta compartida)."""
+        if not self._es_usuario():
+            self._toast("Las dudas las dejan los analistas; aquí las ves en la columna «Equipo».", COL["muted"], ms=4000)
+            return
+        sel = self.tree_desglose.selection()
+        r = next((x for x in self.all_rows if sel and x['Row_ID'] == sel[0]), None)
+        if not r:
+            return
+        k = self._key_by_rid.get(r['Row_ID'])
+        previa = self.estado.duda(k)
+        dlg = ctk.CTkInputDialog(title="Duda para el validador",
+                                 text=f"{r['Numero_Ticket']} · cliente {r['Numero_Cliente']} · crédito "
+                                      f"{r['Credito_Renovado_Hijo']}\n\n¿Qué duda tienes? (vacío = quitar la duda)"
+                                      + (f"\n\nAhora: «{previa}»" if previa else ""))
+        nota = dlg.get_input()
+        if nota is None:
+            return
+        nota = nota.strip()
+        self.estado.poner_duda(k, nota)
+        self.estado.registrar([k], "Duda para el validador" if nota else "Quitó la duda", nota)
+        self._refresh_views()
+        self._show_row_detail(r)
+        self._publicar_equipo()
+        if not self._carpeta_equipo():
+            self._toast("Duda guardada. Para que le llegue al validador configura la carpeta compartida "
+                        "(Configuración → Trabajo en equipo).", COL["warning"], ms=8000)
+        else:
+            self._con_deshacer("Duda enviada al validador" if nota else "Duda quitada",
+                               lambda: (self.estado.poner_duda(k, previa), self._publicar_equipo()))
+
+    def _mover_seleccion(self, paso: int):
+        tree = self.tree_desglose
+        filas = list(tree.get_children(""))
+        if not filas:
+            return
+        actual = (tree.selection() or [None])[0]
+        i = filas.index(actual) + paso if actual in filas else 0
+        i = max(0, min(len(filas) - 1, i))
+        tree.selection_set(filas[i])
+        tree.focus(filas[i])
+        tree.see(filas[i])
+
+    def _cambiar_tema(self):
+        self.config_data["tema"] = "oscuro" if self.var_oscuro.get() else "claro"
+        self._save_config()
+        self._toast("El modo " + ("oscuro" if self.var_oscuro.get() else "claro") + " se aplica al volver a abrir la app.",
+                    COL["primary"], ms=5000)
+
+    def _cambiar_letra(self):
+        self.config_data["letra_grande"] = bool(self.var_letra.get())
+        self._save_config()
+        self._estilo_tabla()
+
     # ================= FILTRADO Y VISTAS =================
 
     def _fuera_de_lote(self, r: dict) -> bool:
@@ -2838,58 +3428,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         revision = bool(self.lote_info and self.lote_info.get('revision'))
         active_rows = []
         visible_rows = []
+        self._conteo_filtros = {f: 0 for f in self.cmb_quick_filter.principales}
         for r in self.all_rows:
             rid = r['Row_ID']
             is_disc = (rid in self.discarded_row_ids) or (auto_excl and r.get('Reasignado_A_Otro'))
-            is_val = rid in self.validated_row_ids
-            lote = r.get('Lote_Estado')
             fuera = self._fuera_de_lote(r)
-
             fuera_periodo = revision and not r.get('En_Periodo', True)
             if not is_disc and not fuera and not fuera_periodo:
                 active_rows.append(r)
-
-            if q_filter == FILTRO_PAPELERA:
-                if not is_disc:
-                    continue
-            elif q_filter in FILTROS_REVISION:
-                if revision and not r.get('En_Periodo', True):
-                    continue  # De la semana anterior: solo se escaneó para sumar rezagadas
-                if q_filter == FILTRO_ERRORES and not r.get('Error_Envio'):
-                    continue
-                if q_filter == FILTRO_SQL and r.get('SQL_Estado') not in SQL_PROBLEMAS:
-                    continue
-                if q_filter == FILTRO_ENVIADAS and lote not in (LOTE_ENVIADA, LOTE_EN_CONCENTRADO):
-                    continue
-                if q_filter == FILTRO_INFORMATIVAS and not (r.get('Informativa') and fuera):
-                    continue
-                if q_filter == FILTRO_CERRADAS and not r.get('Cerrado_iTop'):
-                    continue
-                if q_filter == FILTRO_SIGUIENTE and lote != LOTE_SIGUIENTE:
-                    continue
-                if q_filter == FILTRO_NO_ENVIADAS and not r.get('No_Enviada'):
-                    continue
-                if q_filter == FILTRO_TARDE and not r.get('Dias_Retraso'):
-                    continue
-                if q_filter == FILTRO_SIN_COMPROBAR and lote != LOTE_SIN_COMPROBAR:
-                    continue
-            else:
-                if is_disc or fuera or fuera_periodo:
-                    continue
-                if q_filter == FILTRO_REZAGADAS and lote != LOTE_REZAGADA:
-                    continue
-                if q_filter == FILTRO_LISTAS and self._veredicto(r)['nivel'] != reglas.LISTA:
-                    continue
-                if q_filter == FILTRO_MULTIPLES and not r.get('Es_Multiple'):
-                    continue
-                if q_filter == FILTRO_ALERTAS and not self._tiene_alerta(r):
-                    continue
-                if q_filter == FILTRO_PENDIENTES and is_val:
-                    continue
-                if q_filter == FILTRO_VALIDADAS and not is_val:
-                    continue
-                if q_filter == FILTRO_NUEVAS and not self._es_nueva(r):
-                    continue
 
             if search_txt:
                 haystack = (
@@ -2900,44 +3446,60 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 ).lower()
                 if search_txt not in haystack:
                     continue
-
-            visible_rows.append(r)
+            # Conteo de cada filtro rápido (para los botones: «Revisar 3»)
+            for f in self._conteo_filtros:
+                if self._pasa_filtro(r, f, is_disc, fuera, fuera_periodo, revision):
+                    self._conteo_filtros[f] += 1
+            if self._pasa_filtro(r, q_filter, is_disc, fuera, fuera_periodo, revision):
+                visible_rows.append(r)
 
         return active_rows, visible_rows
 
-    def _row_tag(self, r: dict, zebra_idx: int) -> str:
-        """El color de la fila sigue el veredicto: rojo corregir, ámbar revisar, gris no se manda, verde validada."""
-        rid = r['Row_ID']
-        nivel = self._veredicto(r)['nivel']
-        if rid in self.discarded_row_ids:
-            return "descartado"
-        if r.get('No_Enviada') or r.get('Error_Envio'):
-            return "informativa" if nivel == reglas.NO_SE_MANDA else "no_enviada"
-        if nivel == reglas.NO_SE_MANDA:
-            return "informativa"
-        if nivel == reglas.CORREGIR:
-            return "no_enviada"
-        if r.get('SQL_Estado') == SQL_OTRA_FECHA or nivel in (reglas.REVISAR, reglas.AUTORIZACION):
-            return "multiple"
-        if r.get('Falta_Hoy'):
-            return "rezagada"
-        if self._fuera_de_lote(r):
-            return "fuera_lote"
-        if rid in self.validated_row_ids:
-            return "validado"
-        if r.get('Cerrado_iTop'):
-            return "cerrado"
-        if r.get('Lote_Estado') == LOTE_REZAGADA or r.get('Falta_Hoy'):
-            return "rezagada"
-        if r.get('Datos_Incompletos'):
-            return "incompleto"
-        if r.get('Ticket_Duplicado'):
-            return "duplicado"
-        if r.get('Requiere_Validacion_Agente'):
-            return "reasignado"
-        if r.get('Es_Multiple') or r.get('Nivel_Alerta') == "multiple":
-            return "multiple"
-        return "normal_alt" if zebra_idx % 2 else "normal"
+    def _pasa_filtro(self, r: dict, q_filter: str, is_disc, fuera, fuera_periodo, revision) -> bool:
+        rid, lote = r['Row_ID'], r.get('Lote_Estado')
+        if q_filter == FILTRO_PAPELERA:
+            return bool(is_disc)
+        if q_filter in FILTROS_REVISION:
+            if revision and not r.get('En_Periodo', True):
+                return False  # De la semana anterior: solo se escaneó para sumar rezagadas
+            return {
+                FILTRO_ERRORES: lambda: bool(r.get('Error_Envio')),
+                FILTRO_SQL: lambda: r.get('SQL_Estado') in SQL_PROBLEMAS,
+                FILTRO_ENVIADAS: lambda: lote in (LOTE_ENVIADA, LOTE_EN_CONCENTRADO),
+                FILTRO_INFORMATIVAS: lambda: bool(r.get('Informativa') and fuera),
+                FILTRO_CERRADAS: lambda: bool(r.get('Cerrado_iTop')),
+                FILTRO_SIGUIENTE: lambda: lote == LOTE_SIGUIENTE,
+                FILTRO_NO_ENVIADAS: lambda: bool(r.get('No_Enviada')),
+                FILTRO_TARDE: lambda: bool(r.get('Dias_Retraso')),
+                FILTRO_SIN_COMPROBAR: lambda: lote == LOTE_SIN_COMPROBAR,
+            }.get(q_filter, lambda: True)()
+        if is_disc or fuera or fuera_periodo:
+            return False
+        is_val = rid in self.validated_row_ids
+        return {
+            FILTRO_REZAGADAS: lambda: lote == LOTE_REZAGADA,
+            FILTRO_LISTAS: lambda: self._veredicto(r)['nivel'] == reglas.LISTA,
+            FILTRO_MULTIPLES: lambda: bool(r.get('Es_Multiple')),
+            FILTRO_ALERTAS: lambda: self._tiene_alerta(r),
+            FILTRO_PENDIENTES: lambda: not is_val,
+            FILTRO_VALIDADAS: lambda: is_val,
+            FILTRO_NUEVAS: lambda: self._es_nueva(r),
+            FILTRO_EQUIPO: lambda: bool(self._marca_equipo(r)),
+            FILTRO_DUDAS: lambda: (self._marca_equipo(r) or {}).get("estado") == equipo.DUDA,
+        }.get(q_filter, lambda: True)()
+
+    def _chip(self, r: dict) -> tuple:
+        """Desglose: (color de la barra, tag de la fila). La fila no se pinta; el estado va en la barra y el texto."""
+        rid, nivel = r['Row_ID'], self._veredicto(r)['nivel']
+        apagada = (rid in self.discarded_row_ids or self._fuera_de_lote(r)
+                   or nivel in (reglas.NO_SE_MANDA, reglas.SIGUIENTE, reglas.DESCARTADA))
+        if rid in self.validated_row_ids and not apagada:
+            color = COL["success"]
+        else:
+            color = {reglas.CORREGIR: COL["danger"], reglas.REVISAR: COL["warning"],
+                     reglas.AUTORIZACION: COL["warning"], reglas.SIN_COMPROBAR: COL["warning"],
+                     reglas.LISTA: VEREDICTO_ESTILO[reglas.LISTA][1], reglas.ENVIADA: COL["primary"]}.get(nivel, COL["faint"])
+        return color, "apagada" if apagada else "fila"
 
     def _refresh_views(self):
         self._search_job = None
@@ -2962,6 +3524,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.lbl_kpi_info.configure(text=str(len(informativas)))
         self.lbl_kpi_validados.configure(text=f"{val_count} / {len(active_rows)}")
         self.kpi_progress.set(val_count / len(active_rows) if active_rows else 0)
+        if self._es_usuario():
+            self._pintar_hero(active_rows, val_count)
         self.lbl_count.configure(text=f"{len(visible_rows)} de {len(self.all_rows)} renovaciones" if self.all_rows else "")
 
         # 2. Pestaña Desglose
@@ -2981,10 +3545,17 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                                                      else lote)
             self._celdas_completas[(rid, "cierre")] = resumen_cierre(r.get('Cierre_iTop'))
             self._celdas_completas[(rid, "sql")] = r.get('SQL_Detalle', '')
+            texto_eq = self._texto_equipo(r)
+            if texto_eq:
+                self._celdas_completas[(rid, "equipo")] = texto_eq
+            color, tag = self._chip(r)
+            if tag == "fila" and i % 2:
+                tag = "fila_alt"
             self.tree_desglose.insert(
-                "", "end", iid=rid,
+                "", "end", iid=rid, image=self._barra(color),
                 values=(
                     estado,
+                    texto_eq,
                     r['Numero_Ticket'],
                     f"{r['Indice_En_Ticket']} de {r['Total_En_Ticket']}",
                     r['Numero_Cliente'],
@@ -3001,7 +3572,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     r['Motivo'],
                     self._fecha_llegada_str(r)
                 ),
-                tags=(self._row_tag(r, i),)
+                tags=(tag,)
             )
         keep = [rid for rid in prev_sel if self.tree_desglose.exists(rid)]
         if keep:
@@ -3072,19 +3643,29 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             ag['rezagadas'] += int(r.get('Lote_Estado') == LOTE_REZAGADA)
             ag['validados'] += int(r['Row_ID'] in self.validated_row_ids)
 
+        publicados = {str(a.get('gafete')): a for a in self._equipo['analistas']}
         for i, ((gaf, nom), ag) in enumerate(sorted(agentes.items(), key=lambda x: x[1]['renovaciones'], reverse=True)):
             pendientes = ag['renovaciones'] - ag['validados']
+            pub = publicados.get(str(gaf))
+            if pub:
+                av = pub.get('avance') or {}
+                marco = f"{av.get('validadas', 0)} de {av.get('total', 0)}" + (
+                    f" · {av['dudas']} duda(s)" if av.get('dudas') else "")
+                senal = "sin señal" if pub.get('sin_senal') else str(pub.get('actualizado', ''))[11:16]
+            else:
+                marco, senal = ("—", "no publica") if self._carpeta_equipo() and not self._es_usuario() else ("", "")
             self.tree_agentes.insert(
                 "", "end",
                 values=(
                     gaf, nom, len(ag['tickets']), ag['renovaciones'], len(ag['multi']), ag['alertas'],
-                    ag['rezagadas'], f"{ag['validados']} / {ag['renovaciones']}", pendientes
+                    ag['rezagadas'], f"{ag['validados']} / {ag['renovaciones']}", pendientes, marco, senal
                 ),
                 tags=("validado" if pendientes == 0 else ("normal_alt" if i % 2 else "normal"),)
             )
         self._reapply_sort(self.tree_agentes)
 
-        # Contadores en las pestañas
+        # Contadores en las pestañas y en los filtros rápidos
+        self.cmb_quick_filter.contar(self._conteo_filtros)
         self.tabs.set_label("desglose", f"Desglose  {len(visible_rows)}")
         self.tabs.set_label("tickets", f"Por ticket  {len(tickets_grouped)}")
         self.tabs.set_label("agentes", f"Por compañero  {len(agentes)}")
@@ -3169,6 +3750,28 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if r.get('Imagen_Info') and not r.get('Dato_Imagen'):
             box.insert("end", f"{ICONOS[reglas.INFO]}  Imagen: {r['Imagen_Info']}.\n", ("muted", "check"))
 
+        # Lo que dice cada fuente, lado a lado
+        box.insert("end", "COMPARACIÓN\n", "seccion")
+        box.insert("end", "\tIncidente\tBase de datos\tTicket único\n", ("tabla", "tabla_enc"))
+        for fila in reglas.comparacion(r, en_lote=not self._fuera_de_lote(r)):
+            box.insert("end", f"{ICONOS[fila['estado']]} {fila['dato']}\t", ("tabla", estilo[fila['estado']]))
+            box.insert("end", f"{fila['incidente']}\t{fila['base']}\t{fila['ticket']}\n", ("tabla", "titulo"))
+
+        # Lo que dijo el equipo (validador) o la duda que dejaste (usuario)
+        texto_eq = self._texto_equipo(r)
+        if texto_eq:
+            box.insert("end", "EQUIPO\n", "seccion")
+            m = self._marca_equipo(r)
+            if m and m.get("estado") == equipo.VALIDADA:
+                box.insert("end", f"{ICONOS[reglas.OK]}  La validó {m.get('nombre') or ''} ({m.get('gafete')}) "
+                                  f"a las {str(m.get('hora'))[11:16]}.\n", ("ok", "check"))
+            elif m:
+                box.insert("end", f"{ICONOS[reglas.AVISO]}  Duda de {m.get('nombre') or ''} ({m.get('gafete')}): "
+                                  f"{m.get('nota')}\n", ("warn", "check"))
+            else:
+                box.insert("end", f"{ICONOS[reglas.AVISO]}  Le dejaste esta duda al validador: "
+                                  f"{texto_eq[len('? Duda: '):]}\n", ("warn", "check"))
+
         box.insert("end", "DATOS\n", "seccion")
         llegada = self._fecha_llegada_str(r)
         box.insert("end", "Cliente  ", "muted")
@@ -3209,6 +3812,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if r.get('Historial_Asignaciones'):
             box.insert("end", "HISTORIAL DE ASIGNACIÓN\n", "seccion")
             box.insert("end", f"{plain_text(r['Historial_Asignaciones'])}\n", "muted")
+        historial = self.estado.historial(self._key_by_rid.get(r['Row_ID'], ''))
+        if historial:
+            box.insert("end", "BITÁCORA\n", "seccion")
+            for hora, accion, detalle in reversed(historial[-8:]):
+                box.insert("end", f"{str(hora)[8:10]}/{str(hora)[5:7]} {str(hora)[11:16]}  ", "muted")
+                box.insert("end", accion, "titulo")
+                box.insert("end", f" — {detalle}\n" if detalle else "\n", "muted")
         box.configure(state="disabled")
 
         # Correo original con los números extraídos resaltados
@@ -3242,11 +3852,22 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             return
         to_on = [rid for rid in sel if rid not in self.validated_row_ids]
         to_off = [rid for rid in sel if rid in self.validated_row_ids]
+        copia = self._estado_de(sel)
         self.validated_row_ids.update(to_on)
         self.validated_row_ids.difference_update(to_off)
         self.estado.set('validados', self._keys_for(to_on), True)
         self.estado.set('validados', self._keys_for(to_off), False)
+        self.estado.registrar(self._keys_for(to_on), "Validada", guardar=False)
+        self.estado.registrar(self._keys_for(to_off), "Quitó la validación")
         self._refresh_views()
+        self._publicar_equipo()
+        if len(sel) > 1 or to_off:
+            self._con_deshacer(f"Validaste {len(to_on)}" if to_on and not to_off else
+                               f"Quitaste la validación a {len(to_off)}" if to_off and not to_on else
+                               f"Cambiaste {len(sel)} validaciones", lambda: self._restaurar_estado(sel, copia))
+        else:  # Una a una no se avisa (sería ruido), pero Ctrl+Z la deshace
+            self._deshacer.append(("Validaste 1", lambda: self._restaurar_estado(sel, copia)))
+            del self._deshacer[:-20]
         if len(sel) == 1 and to_on and self.config_data.get('avanzar_al_validar', True):
             if self._siguiente_pendiente(desde=sel[0]):
                 return
@@ -3276,32 +3897,82 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         return False
 
     def _validate_all_visible(self):
+        """Valida lo visible, con vista previa: lo que hay que revisar o no va en el lote se queda fuera."""
         _, visible_rows = self._get_active_and_filtered_rows()
         if not visible_rows:
             return
-        rids = [r['Row_ID'] for r in visible_rows]
-        all_already = all(rid in self.validated_row_ids for rid in rids)
-        if all_already:
+        en_lote = [r for r in visible_rows if not self._fuera_de_lote(r) and r['Row_ID'] not in self.discarded_row_ids]
+        pendientes = [r for r in en_lote if r['Row_ID'] not in self.validated_row_ids]
+        if en_lote and not pendientes:
+            rids = [r['Row_ID'] for r in en_lote]
+            if not messagebox.askyesno("Quitar validación", f"Las {len(rids)} visibles ya están validadas.\n\n"
+                                                            "¿Quitarles la validación?"):
+                return
+            copia = self._estado_de(rids)
             self.validated_row_ids.difference_update(rids)
-        else:
-            self.validated_row_ids.update(rids)
-        self.estado.set('validados', self._keys_for(rids), not all_already)
+            self.estado.set('validados', self._keys_for(rids), False)
+            self.estado.registrar(self._keys_for(rids), "Quitó la validación", "en bloque")
+            self._refresh_views()
+            self._publicar_equipo()
+            self._con_deshacer(f"Quitaste la validación a {len(rids)}", lambda: self._restaurar_estado(rids, copia))
+            return
+        aceptar = [r for r in pendientes if not self._tiene_alerta(r)]
+        revisar = [r for r in pendientes if self._tiene_alerta(r)]
+        fuera = len(visible_rows) - len(en_lote)
+        texto = f"Se validarán {len(aceptar)} renovación(es) visibles."
+        if revisar:
+            texto += (f"\n\nSe dejan fuera {len(revisar)} que tienen algo que revisar (valídalas una por una): "
+                      + ", ".join(r['Numero_Ticket'] for r in revisar[:8]) + ("…" if len(revisar) > 8 else ""))
+        if fuera:
+            texto += f"\n\n{fuera} no van en el ticket único de hoy y no se tocan."
+        if not aceptar:
+            messagebox.showinfo("Validar visibles", texto)
+            return
+        if not messagebox.askyesno("Validar visibles", texto + "\n\n¿Continuar?"):
+            return
+        rids = [r['Row_ID'] for r in aceptar]
+        copia = self._estado_de(rids)
+        self.validated_row_ids.update(rids)
+        self.estado.set('validados', self._keys_for(rids), True)
+        self.estado.registrar(self._keys_for(rids), "Validada", "en bloque")
         self._refresh_views()
+        self._publicar_equipo()
+        self._con_deshacer(f"Validaste {len(rids)}", lambda: self._restaurar_estado(rids, copia))
+
+    def _pedir_motivo(self, titulo: str, n: int):
+        """El motivo para la bitácora ('' si no se pide; None si se canceló)."""
+        if not self.config_data.get("pedir_motivo", True):
+            return ""
+        dlg = ctk.CTkInputDialog(title=titulo, text=f"{titulo} {n} renovación(es).\n\n¿Por qué? (queda en la bitácora)")
+        motivo = dlg.get_input()
+        return None if motivo is None else motivo.strip()
 
     def _discard_selected_rows(self):
         sel = self.tree_desglose.selection()
         if not sel:
             messagebox.showinfo("Selecciona una fila", "Selecciona una o más filas del desglose para descartarlas.")
             return
+        motivo = self._pedir_motivo("Descartar", len(sel))
+        if motivo is None:
+            return
+        copia = self._estado_de(sel)
         self.discarded_row_ids.update(sel)
         self.estado.set('descartados', self._keys_for(sel), True)
+        self.estado.registrar(self._keys_for(sel), "Descartada", motivo)
         self._refresh_views()
+        self._publicar_equipo()
+        self._con_deshacer(f"Descartaste {len(sel)}", lambda: self._restaurar_estado(sel, copia))
 
     def _restore_selected_rows(self):
         sel = self.tree_desglose.selection()
         if sel:
+            motivo = self._pedir_motivo("Restaurar", len(sel))
+            if motivo is None:
+                return
+            copia = self._estado_de(sel)
             self.discarded_row_ids.difference_update(sel)
             self.estado.set('descartados', self._keys_for(sel), False)
+            self.estado.registrar(self._keys_for(sel), "Restaurada", motivo)
             # Lo que quedó fuera del lote se puede meter a mano, salvo lo que ya se emitió (eso ya no se cancela)
             por_id = {r['Row_ID']: r for r in self.all_rows}
             incluir = [
@@ -3311,14 +3982,20 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             ]
             self.forced_included_row_ids.update(incluir)
             self.estado.set('incluidos', self._keys_for(incluir), True)
+            self._con_deshacer(f"Restauraste {len(sel)}", lambda: self._restaurar_estado(sel, copia))
         else:
             if not self.discarded_row_ids:
                 return
             if not messagebox.askyesno("Restaurar", "¿Restaurar TODAS las filas descartadas?"):
                 return
-            self.estado.set('descartados', self._keys_for(self.discarded_row_ids), False)
+            todas = list(self.discarded_row_ids)
+            copia = self._estado_de(todas)
+            self.estado.set('descartados', self._keys_for(todas), False)
+            self.estado.registrar(self._keys_for(todas), "Restaurada", "todas las descartadas")
             self.discarded_row_ids.clear()
+            self._con_deshacer(f"Restauraste {len(todas)}", lambda: self._restaurar_estado(todas, copia))
         self._refresh_views()
+        self._publicar_equipo()
 
     def _popup_menu(self, event, tree, menu):
         if tree.identify_region(event.x, event.y) == "heading":
@@ -3414,11 +4091,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
     def _aplicar_vista(self):
         """Muestra u oculta indicadores, panel de detalle y configuración lateral según «Vista»."""
         vista = self.config_data.get("vista", {})
+        usuario = self._es_usuario()
+        self.kpi_bar.grid_remove()
+        self.hero.grid_remove()
         if vista.get("indicadores", True):
-            self.kpi_bar.grid()
+            (self.hero if usuario else self.kpi_bar).grid()
             self.paned.grid_configure(pady=0)
         else:
-            self.kpi_bar.grid_remove()
             self.paned.grid_configure(pady=(14, 0))
         if vista.get("configuracion", True):
             self.sidebar_wrap.grid()
