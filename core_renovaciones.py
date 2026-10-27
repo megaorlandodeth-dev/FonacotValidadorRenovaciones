@@ -909,8 +909,16 @@ class RenovacionTicketParser:
             r'\bid\s+(\d{6,8})\s+cr[ée]dito\s+\d{4,7}\b'
         ]
         for pat in cliente_patterns:
-            for m in re.finditer(pat, full_context, re.I):
+            patron, pos = re.compile(pat, re.I), 0
+            while True:
+                m = patron.search(full_context, pos)
+                if not m:
+                    break
+                pos = m.end()
                 if m.groupdict().get('nom') and any(cls._NO_NOMBRE.match(w.strip('.:#')) for w in m.group('nom').split()):
+                    # «…CRÉDITO DEL CLIENTE\nCLIENTE 7988789»: la etiqueta repetida no es un nombre, pero la segunda
+                    # sí trae el número: se vuelve a buscar desde ahí (si no, la primera se la «comía»)
+                    pos = m.start() + 1
                     continue
                 c_num = (m.groupdict().get('num') or m.group(1)).strip()
                 # Excluir NSS (11 dígitos) y números de solicitud (empiezan con 507 o 508 de 9 dígitos)
