@@ -5,6 +5,7 @@ v3.2: lo que no salió en su día pero ya se resolvió en iTop no cuenta como «
 y la contraseña del perfil validador (solo se guarda su huella).
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -203,6 +204,93 @@ class TestClaveValidador(unittest.TestCase):
             f.write("{no es json")
         self.assertFalse(clave_validador.existe(self.archivo))
         self.assertFalse(clave_validador.verificar("secreta1", self.archivo))
+
+
+
+class TestCalendarioSinFecha(unittest.TestCase):
+    """Si el calendario no tiene la siguiente emisión no se puede dar por buena: avisa."""
+
+    def setUp(self):
+        import calendario_cedulas as cal
+        self.cal = cal
+        self._original = cal.emisiones
+        cal.emisiones = lambda: {(2026, 9): date(2026, 9, 18), (2026, 10): date(2026, 10, 20)}
+
+    def tearDown(self):
+        self.cal.emisiones = self._original
+
+    def test_cubierto_por_el_calendario(self):
+        self.assertEqual(self.cal.emision_sin_fecha(date(2026, 10, 10), date(2026, 10, 27)), "")
+        self.assertEqual(self.cal.emision_sin_fecha(date(2026, 10, 10), date(2026, 11, 9)), "")
+
+    def test_falta_la_siguiente_emision(self):
+        self.assertEqual(self.cal.emision_sin_fecha(date(2026, 10, 10), date(2026, 11, 15)), "noviembre 2026")
+
+    def test_sin_fechas_no_avisa(self):
+        self.assertEqual(self.cal.emision_sin_fecha(None, date(2026, 11, 15)), "")
+        self.assertEqual(self.cal.emision_sin_fecha(date(2026, 11, 20), date(2026, 11, 15)), "")
+
+    def test_la_regla_avisa_sin_calendario(self):
+        nivel, texto = reglas._check_calendario(renovacion(Sin_Calendario="noviembre 2026"))
+        self.assertEqual(nivel, reglas.AVISO)
+        self.assertIn("emisión de noviembre 2026", texto)
+        self.assertIn("no se sabe si ya se emitió", texto)
+
+    def test_ya_emitida_pesa_mas(self):
+        r = renovacion(Sin_Calendario="noviembre 2026", Bloqueo_Tipo="emision", Bloqueo_Emision="emisión de octubre")
+        self.assertEqual(reglas._check_calendario(r)[0], reglas.MAL)
+
+
+class TestGuardadoSeguro(unittest.TestCase):
+    def setUp(self):
+        self.carpeta = tempfile.mkdtemp()
+        self.ruta = os.path.join(self.carpeta, "datos.json")
+
+    def test_guarda_y_no_deja_temporal(self):
+        from core_renovaciones import guardar_json
+        guardar_json(self.ruta, {"a": 1, "ñ": "sí"}, ensure_ascii=False)
+        guardar_json(self.ruta, {"a": 2})
+        with open(self.ruta, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"a": 2})
+        self.assertEqual(os.listdir(self.carpeta), ["datos.json"])
+
+    def test_si_falla_no_estropea_el_anterior(self):
+        from core_renovaciones import guardar_json
+        guardar_json(self.ruta, {"a": 1})
+        with self.assertRaises(TypeError):
+            guardar_json(self.ruta, {"a": object()})
+        with open(self.ruta, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"a": 1})
+
+
+class TestRegistro(unittest.TestCase):
+    def test_registra_el_error_con_su_detalle(self):
+        import logging
+        import registro
+        ruta = os.path.join(tempfile.mkdtemp(), registro.ARCHIVO)
+        original, registro.ruta, registro._log = registro.ruta, (lambda: ruta), None
+        logging.getLogger("validador").handlers.clear()
+        try:
+            try:
+                int("x")
+            except ValueError:
+                registro.error("Leyendo el correo I-123")
+        finally:
+            for h in list(registro.log().handlers):
+                h.close()
+                registro.log().removeHandler(h)
+            registro.ruta, registro._log = original, None
+        with open(ruta, encoding="utf-8") as f:
+            texto = f.read()
+        self.assertIn("Leyendo el correo I-123", texto)
+        self.assertIn("ValueError", texto)
+
+
+class TestArchivoDeLaClave(unittest.TestCase):
+    def test_va_junto_a_la_app(self):
+        from core_renovaciones import get_app_dir
+        self.assertEqual(os.path.dirname(clave_validador.ARCHIVO), get_app_dir())
+        self.assertEqual(clave_validador.OPCION_CREAR, "--crear-clave-validador")
 
 
 if __name__ == "__main__":
