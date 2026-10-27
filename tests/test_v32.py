@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core_renovaciones import RenovacionTicketParser as Parser  # noqa: E402
 import reglas_lote as reglas  # noqa: E402
+import sql_renovaciones as sql  # noqa: E402
 from test_v30 import cerrada, renovacion  # noqa: E402
 
 
@@ -333,6 +334,62 @@ class TestTextosDelRecuadro(unittest.TestCase):
         r = renovacion(Informativa=True, Informativa_Tipo=reglas.INFO_CERRADA)
         v = reglas.veredicto(r, en_lote=False)
         self.assertEqual((v['titulo'], v['accion']), ("No se manda: resuelta en iTop", "Nada que hacer."))
+
+
+CORREO_MESA = ("Buenas tardes\nEquipo de 111, favor de asignar los siguientes registros de renovación al grupo de la "
+               "Mesa de Crédito para revisión y concentración, a fin de dar seguimiento a la cancelación en CREDERE.\n"
+               "Cuenta\nOperación\n(Origen)\nRenovado\nSucursal\nFecha\n"
+               "7397674\n5044\n34408\n104\n26/10/2026\n5918451\n50314\n50390\n104\n22/10/2026\n")
+
+
+class TestMesaDeCredito(unittest.TestCase):
+    """La Mesa de Crédito manda renovaciones de otros días que sí se cancelan (si no les tocó la emisión ni el cierre)."""
+
+    def leer(self, texto):
+        return Parser.parse_and_disaggregate_email("CANCELACION DE RENOVACION", "", texto, datetime(2026, 10, 27, 16),
+                                                   "I-362849", "2609", "N")
+
+    def test_se_reconoce_el_correo(self):
+        rows = self.leer(CORREO_MESA)
+        self.assertEqual([(r['Numero_Cliente'], r['Credito_Renovado_Hijo']) for r in rows],
+                         [("7397674", "34408"), ("5918451", "50390")])
+        self.assertTrue(all(r['Mesa_Credito'] for r in rows))
+        self.assertEqual(rows[1]['Fecha_Operacion'], "22/10/2026")
+        self.assertFalse(self.leer("Cliente 4919283 crédito 71470")[0]['Mesa_Credito'])
+
+    def test_de_otro_dia_si_se_envia(self):
+        from test_sql_y_ocr import Conexion, fila
+        r = fila("I-2", "1184282", "84846")  # dada de alta en 2025: sin la Mesa, «no procede»
+        r['Mesa_Credito'] = True
+        sql.validar_contra_base(Conexion(), "TOPAZ.CR_RENOVACIONES", [r])
+        self.assertEqual(r['SQL_Estado'], sql.SQL_MESA_CREDITO)
+        self.assertIn("la manda la Mesa de Crédito", r['SQL_Detalle'])
+        self.assertNotIn(r['SQL_Estado'], sql.SQL_PROBLEMAS)
+        self.assertEqual(reglas._checks_base(r, True)[0][0], reglas.OK)
+
+    def test_sin_base_la_emision_se_cuenta_desde_la_fecha_del_correo(self):
+        import calendario_cedulas as cal
+        r = {'Fecha_Llegada_DT': datetime(2026, 10, 27, 16), 'Fecha_Operacion': "22/10/2026",
+             'Dia_Lote': date(2026, 10, 27), 'Lote_Estado': reglas.LOTE_HOY}
+        cal.marcar_bloqueos([r], date(2026, 10, 27))
+        self.assertEqual(r['Bloqueo_Tipo'], 'emision')  # la emisión de noviembre (25/10) pasó después del 22/10
+        self.assertIn("se dio de alta el 22/10/2026 (según el correo)", r['Bloqueo_Emision'])
+        r['Fecha_Operacion'] = "26/10/2026"
+        cal.marcar_bloqueos([r], date(2026, 10, 27))
+        self.assertEqual(r['Bloqueo_Tipo'], '')
+        self.assertIn("el alta (26/10)", reglas._check_calendario(r)[1])
+
+
+class TestNoSeMandanDelDia(unittest.TestCase):
+    """«No se mandan» del lote: solo las de su ticket único o de después; las de días anteriores, aparte."""
+
+    def test_solo_las_del_dia(self):
+        filas = [dict(Row_ID=i, Informativa=True, Informativa_Tipo=reglas.INFO_CERRADA, Dia_Lote=d)
+                 for i, d in (("ayer", date(2026, 10, 26)), ("hoy", date(2026, 10, 27)), ("despues", date(2026, 10, 28)),
+                              ("sin_dia", None))]
+        g = reglas.grupos_del_dia(filas, desde=date(2026, 10, 27))
+        self.assertEqual([r['Row_ID'] for r in g['no_se_mandan']], ["hoy", "despues", "sin_dia"])
+        self.assertEqual(len(reglas.grupos_del_dia(filas)['no_se_mandan']), 4)  # revisión: todas
 
 
 if __name__ == "__main__":
