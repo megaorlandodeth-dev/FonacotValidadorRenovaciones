@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 v3.2: lo que no salió en su día pero ya se resolvió en iTop no cuenta como «NO enviada» (salvo cierre por error)
-y la contraseña del perfil validador (solo se guarda su huella).
+y lo demás de la auditoría de la v3.2.
 """
 
 import json
@@ -14,7 +14,6 @@ from datetime import date, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import clave_validador  # noqa: E402
 from core_renovaciones import RenovacionTicketParser as Parser  # noqa: E402
 import reglas_lote as reglas  # noqa: E402
 from test_v30 import cerrada, renovacion  # noqa: E402
@@ -176,37 +175,6 @@ class TestUnaSolaDecision(unittest.TestCase):
         self.assertIn("le tocaba el 26/10/2026", str(reglas.comparacion(r, en_lote=True)))
 
 
-class TestClaveValidador(unittest.TestCase):
-    def setUp(self):
-        self.dir = tempfile.TemporaryDirectory()
-        self.archivo = os.path.join(self.dir.name, "validador_clave.json")
-
-    def tearDown(self):
-        self.dir.cleanup()
-
-    def test_crear_y_verificar(self):
-        self.assertFalse(clave_validador.existe(self.archivo))
-        self.assertEqual(clave_validador.crear("secreta1", self.archivo), "")
-        self.assertTrue(clave_validador.existe(self.archivo))
-        self.assertTrue(clave_validador.verificar("secreta1", self.archivo))
-        self.assertFalse(clave_validador.verificar("secreta2", self.archivo))
-        self.assertFalse(clave_validador.verificar("", self.archivo))
-        with open(self.archivo, encoding="utf-8") as f:
-            self.assertNotIn("secreta1", f.read())  # solo la huella
-
-    def test_minimo_de_caracteres(self):
-        self.assertTrue(clave_validador.crear("abc", self.archivo))
-        self.assertFalse(clave_validador.existe(self.archivo))
-
-    def test_sin_archivo_o_danado(self):
-        self.assertFalse(clave_validador.verificar("secreta1", self.archivo))
-        with open(self.archivo, "w", encoding="utf-8") as f:
-            f.write("{no es json")
-        self.assertFalse(clave_validador.existe(self.archivo))
-        self.assertFalse(clave_validador.verificar("secreta1", self.archivo))
-
-
-
 class TestCalendarioSinFecha(unittest.TestCase):
     """Si el calendario no tiene la siguiente emisión no se puede dar por buena: avisa."""
 
@@ -284,13 +252,6 @@ class TestRegistro(unittest.TestCase):
             texto = f.read()
         self.assertIn("Leyendo el correo I-123", texto)
         self.assertIn("ValueError", texto)
-
-
-class TestArchivoDeLaClave(unittest.TestCase):
-    def test_va_junto_a_la_app(self):
-        from core_renovaciones import get_app_dir
-        self.assertEqual(os.path.dirname(clave_validador.ARCHIVO), get_app_dir())
-        self.assertEqual(clave_validador.OPCION_CREAR, "--crear-clave-validador")
 
 
 class TestPlurales(unittest.TestCase):
