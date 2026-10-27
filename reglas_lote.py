@@ -263,6 +263,9 @@ def _check_calendario(r: dict) -> tuple:
         return MAL, f"Calendario: ya se emitió: {corto}. No se puede cancelar."
     if r.get("SQL_Cedula"):
         return MAL, "Calendario: ya está en la cédula (CR_CEDULAS_DETALLE): ya se emitió. No se puede cancelar."
+    if r.get("Sin_Calendario"):
+        return AVISO, (f"Calendario: no tiene la fecha de la emisión de {r['Sin_Calendario']}: no se sabe si ya se "
+                       f"emitió. Revisa el calendario de FONACOT.")
     if r.get("Bloqueo_Tipo") == "cierre":
         return AVISO, f"Calendario: pasó el cierre de mes: {corto}. Solo con autorización."
     desde = f"el alta ({_f(r['SQL_Fecha_Alta'], '%d/%m')})" if r.get("SQL_Fecha_Alta") else "que llegó"

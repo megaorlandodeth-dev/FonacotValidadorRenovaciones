@@ -108,10 +108,10 @@ def actualizar_calendario(forzar: bool = False, timeout: int = 8) -> bool:
     if not nuevas:
         return False
     try:
-        with open(_archivo(), "w", encoding="utf-8") as f:
-            json.dump({"actualizado": datetime.now().isoformat(timespec="seconds"), "fuente": URL_CALENDARIO,
-                       "emisiones": {f"{a}-{m:02d}": g.isoformat() for (a, m), g in sorted(_emisiones.items())}},
-                      f, indent=2, ensure_ascii=False)
+        from core_renovaciones import guardar_json
+        guardar_json(_archivo(), {"actualizado": datetime.now().isoformat(timespec="seconds"), "fuente": URL_CALENDARIO,
+                                  "emisiones": {f"{a}-{m:02d}": g.isoformat() for (a, m), g in sorted(_emisiones.items())}},
+                     indent=2, ensure_ascii=False)
     except Exception:
         pass
     return bool(nuevas)
@@ -121,6 +121,22 @@ def emisiones() -> dict:
     if not _cargado:
         cargar()
     return dict(_emisiones)
+
+
+def emision_sin_fecha(alta: date, envio: date) -> str:
+    """
+    «noviembre 2027» si entre el alta y el ticket único en que sale ya podría haber pasado una generación de emisión
+    que el calendario no tiene (la página de FONACOT no se ha actualizado o no hubo internet); '' si está cubierto.
+    Sin esa fecha no se puede saber si ya se emitió: no se debe dar por buena.
+    """
+    if not alta or not envio or alta >= envio:
+        return ""
+    conocidas = emisiones()
+    (anio, mes), ultima = max(conocidas.items(), key=lambda x: x[1])
+    if envio <= ultima + timedelta(days=20):  # entre una generación y otra pasa un mes
+        return ""
+    anio, mes = (anio + 1, 1) if mes == 12 else (anio, mes + 1)
+    return f"{_MESES[mes - 1]} {anio}"
 
 
 def ultimo_dia_del_mes(d: date) -> date:
@@ -227,6 +243,7 @@ def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
         envio = dia_de_envio(r, lote_actual)
         emision = emision_que_bloquea(alta, envio)
         corte = emision or corte_que_bloquea(alta, envio)
+        r['Sin_Calendario'] = '' if emision else emision_sin_fecha(alta, envio)
         if not corte:
             continue
         sale = f" y sale en el ticket único del {envio:%d/%m/%Y}" if envio != llegada else ""
@@ -246,4 +263,5 @@ def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
                                     "Después del cierre de mes solo se cancela con autorización.")
         n += 1
     return {'bloqueadas': n, 'emitidas': sum(1 for r in rows if r.get('Bloqueo_Tipo') == 'emision'),
-            'cierre': sum(1 for r in rows if r.get('Bloqueo_Tipo') == 'cierre')}
+            'cierre': sum(1 for r in rows if r.get('Bloqueo_Tipo') == 'cierre'),
+            'sin_calendario': sorted({r['Sin_Calendario'] for r in rows if r.get('Sin_Calendario')})}

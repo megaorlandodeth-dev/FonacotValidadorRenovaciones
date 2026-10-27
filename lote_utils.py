@@ -15,7 +15,7 @@ import json
 from datetime import datetime, timedelta
 from html import escape
 
-from core_renovaciones import first_digits, LOTE_REZAGADA
+from core_renovaciones import first_digits, guardar_json, LOTE_REZAGADA
 
 
 _EMOJI_RE = re.compile('[\U0001F000-\U0001FAFF☀-➿⬀-⯿⌚-⏿️‍]')
@@ -94,8 +94,7 @@ class EstadoValidaciones:
 
     def save(self):
         try:
-            with open(self.path, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=1, ensure_ascii=False)
+            guardar_json(self.path, self.data, indent=1, ensure_ascii=False)
         except Exception:
             pass
 

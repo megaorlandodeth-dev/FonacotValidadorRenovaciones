@@ -14,7 +14,12 @@ import json
 import os
 import secrets
 
-ARCHIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validador_clave.json")
+from core_renovaciones import get_app_dir, guardar_json
+
+# Junto al .exe (o al script), no dentro de la carpeta interna del ejecutable
+ARCHIVO = os.path.join(get_app_dir(), "validador_clave.json")
+# Si falta el archivo, solo se puede crear la contraseña abriendo la app con esta opción (quien la instala)
+OPCION_CREAR = "--crear-clave-validador"
 ITERACIONES = 200_000
 MINIMO = 6
 _CREDENCIAL = "FonacotValidadorRenovaciones/perfil_validador"
@@ -45,8 +50,7 @@ def crear(clave: str, archivo: str = None) -> str:
     datos = {"version": 1, "algoritmo": "pbkdf2_sha256", "iteraciones": ITERACIONES, "sal": sal.hex(),
              "huella": _huella(clave, sal, ITERACIONES)}
     try:
-        with open(archivo or ARCHIVO, "w", encoding="utf-8") as f:
-            json.dump(datos, f, indent=1)
+        guardar_json(archivo or ARCHIVO, datos, indent=1)
     except OSError as e:
         return f"No se pudo guardar la contraseña: {e.strerror or e}."
     return ""

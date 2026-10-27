@@ -28,6 +28,8 @@ wheels/
 # Local configurations and cache
 *.json
 !package.json
+# La huella de la contraseña del validador viaja con la app (no trae la contraseña)
+!validador_clave.json
 *.log
 .vscode/
 .idea/

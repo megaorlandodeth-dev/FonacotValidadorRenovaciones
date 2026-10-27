@@ -39,6 +39,7 @@ from calendario_cedulas import actualizar_calendario, marcar_bloqueos, cortes_al
 from core_renovaciones import (
     build_itop_url,
     build_itop_search_url,
+    guardar_json,
     parse_hora_corte,
     previous_business_day,
     parse_dias_inhabiles,
@@ -67,6 +68,7 @@ from lote_utils import (
 )
 import equipo_compartido as equipo
 import clave_validador
+import registro
 
 
 APP_VERSION = "3.2"
@@ -501,6 +503,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         _aplicar_paleta(_tema_guardado() == "oscuro")
         _aplicar_tema()
         super().__init__()
+        self.report_callback_exception = self._error_en_boton
 
         self.title("Validador de Renovaciones · FONACOT")
         self._fit_to_screen()
@@ -669,8 +672,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 "auto_refresh_min": self.cmb_auto_min.get().strip() or "10",
                 "carpeta_compartida": self.ent_carpeta.get().strip(),
             })
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config_data, f, indent=2, ensure_ascii=False)
+            guardar_json(CONFIG_FILE, self.config_data, indent=2, ensure_ascii=False)
         except Exception:
             pass
         self._guardar_password_sql()
@@ -1326,7 +1328,17 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         return res["valor"]
 
     def _autorizar_validador(self) -> bool:
-        """Pide la contraseña del validador (o la crea la primera vez). True si se puede entrar."""
+        """
+        Pide la contraseña del validador. True si se puede entrar. Si falta validador_clave.json no deja crear otra
+        (cualquiera entraría como validador): solo se crea abriendo la app con --crear-clave-validador.
+        """
+        if not clave_validador.existe() and clave_validador.OPCION_CREAR not in sys.argv:
+            messagebox.showwarning(
+                "Perfil Validador",
+                f"Falta el archivo {os.path.basename(clave_validador.ARCHIVO)} con la contraseña del validador en:\n"
+                f"{os.path.dirname(clave_validador.ARCHIVO)}\n\nPídeselo a quien instaló la app y cópialo ahí. Si tú "
+                f"la instalas, abre la app con la opción {clave_validador.OPCION_CREAR} para crear la contraseña.")
+            return False
         if not clave_validador.existe():
             res = self._dialogo_clave(
                 "Contraseña del validador",
@@ -3021,18 +3033,25 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 **corte_opts
             )
             lote_info = self.engine.lote_info
-            validaciones = {'ocr': dict(self.engine.ocr_info), 'sql': None}
+            validaciones = {'ocr': dict(self.engine.ocr_info), 'sql': None,
+                            'errores_lectura': list(getattr(self.engine, 'errores_lectura', []))}
             if sql_cfg and rows:
                 progress_cb(f"🗄️ Validando {len(rows)} renovaciones en la base de datos...", 0.98)
                 validaciones['sql'] = self._validar_sql(rows, lote_info, sql_cfg)
-            # Calendario de emisión: lo generado antes de la emisión o del cierre de mes ya no se puede cancelar
-            actualizar_calendario()
-            validaciones['emision'] = marcar_bloqueos(rows, (lote_info or {}).get('lote_actual'))
-            # Lo emitido, lo resuelto en iTop y lo que no procede ya no va en el lote (solo informativo)
-            validaciones['reglas'] = aplicar_reglas(rows)
-            reglas.recontar_envios(lote_info, rows)  # lo ya resuelto en iTop no cuenta como «NO enviada»
+            try:
+                # Calendario de emisión: lo generado antes de la emisión o del cierre de mes ya no se puede cancelar
+                actualizar_calendario()
+                validaciones['emision'] = marcar_bloqueos(rows, (lote_info or {}).get('lote_actual'))
+                # Lo emitido, lo resuelto en iTop y lo que no procede ya no va en el lote (solo informativo)
+                validaciones['reglas'] = aplicar_reglas(rows)
+                reglas.recontar_envios(lote_info, rows)  # lo ya resuelto en iTop no cuenta como «NO enviada»
+            except Exception as e:
+                # Las renovaciones se muestran igual, con un aviso rojo: sin reglas no se sabe qué ya no se manda
+                registro.error("Fallaron las reglas del lote")
+                validaciones['reglas_error'] = str(e) or type(e).__name__
             self.after(0, lambda: self._on_extraction_done(rows, None, lote_info, auto, validaciones))
         except Exception as e:
+            registro.error("Falló la extracción")
             err = str(e)
             self.after(0, lambda: self._on_extraction_done([], err, None, auto))
 
@@ -3329,6 +3348,18 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         def ids(rows):
             return [r['Row_ID'] for r in rows]
 
+        if self.validaciones.get('reglas_error'):
+            rojo = True
+            avisos.append((f"No se aplicaron las reglas del lote (calendario, iTop, cierre por error): "
+                           f"{self.validaciones['reglas_error']}. No envíes sin revisar cada una; el detalle está en "
+                           f"{registro.ARCHIVO}.", None, True))
+        if self.validaciones.get('errores_lectura'):
+            rojo = True
+            tickets = self.validaciones['errores_lectura']
+            avisos.append((f"No se pudo leer el correo de {len(tickets)} incidente(s): {', '.join(tickets[:8])}"
+                           + ("…" if len(tickets) > 8 else "") + f". No están en la tabla: revísalos en iTop "
+                           f"(detalle en {registro.ARCHIVO}).", None, True))
+
         def cuenta(r):
             """En la revisión, lo del periodo; en el lote del día, solo lo que va en el lote (no lo ya enviado)."""
             if r.get('Row_ID') in self.discarded_row_ids:
@@ -3366,6 +3397,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                     f"{tipos[reglas.INFO_NO_PROCEDE]} no proceden" if tipos.get(reglas.INFO_NO_PROCEDE) else ""
                 ) if t]
                 avisos.append((f"No se mandan: {' · '.join(partes)}.", ids(informativas)))
+            sin_cal = [r for r in pendientes if r.get('Sin_Calendario')]
+            if sin_cal:
+                meses = ", ".join(sorted({r['Sin_Calendario'] for r in sin_cal}))
+                avisos.append((f"El calendario no tiene la fecha de la emisión de {meses}: no se sabe si "
+                               f"{len(sin_cal)} renovación(es) ya se emitieron. Revisa el calendario de FONACOT "
+                               f"antes de enviar.", ids(sin_cal)))
             autorizacion = [r for r in pendientes if r.get('Requiere_Autorizacion')]
             if autorizacion:
                 avisos.append((f"{len(autorizacion)} renovación(es) pasaron el cierre de mes: solo se mandan con "
@@ -3774,6 +3811,14 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                      reglas.AUTORIZACION: COL["warning"], reglas.SIN_COMPROBAR: COL["warning"],
                      reglas.LISTA: VEREDICTO_ESTILO[reglas.LISTA][1], reglas.ENVIADA: COL["primary"]}.get(nivel, COL["faint"])
         return color, "apagada" if apagada else "fila"
+
+    def _error_en_boton(self, tipo, valor, rastro):
+        """Un error al dar clic o con una tecla: queda en validador.log y se avisa abajo (la app sigue funcionando)."""
+        registro.log().error("Error en la interfaz", exc_info=(tipo, valor, rastro))
+        try:
+            self.lbl_status.configure(text=f"Algo falló ({tipo.__name__}: {valor}). El detalle quedó en {registro.ARCHIVO}.")
+        except Exception:
+            pass
 
     def _refrescar_tras_accion(self):
         """Después de validar, descartar, restaurar o deshacer: la tabla y también los avisos (al buscar, solo la tabla)."""
@@ -4269,13 +4314,6 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
     def _restore_selected_rows(self):
         sel = self.tree_desglose.selection()
         if sel:
-            motivo = self._pedir_motivo("Restaurar", len(sel))
-            if motivo is None:
-                return
-            copia = self._estado_de(sel)
-            self.discarded_row_ids.difference_update(sel)
-            self.estado.set('descartados', self._keys_for(sel), False)
-            self.estado.registrar(self._keys_for(sel), "Restaurada", motivo)
             # Lo que quedó fuera del lote se puede meter a mano, salvo lo que ya se emitió (eso ya no se cancela)
             por_id = {r['Row_ID']: r for r in self.all_rows}
             incluir = [
@@ -4283,6 +4321,17 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 if rid in por_id and not va_en_lote(por_id[rid])
                 and por_id[rid].get('Informativa_Tipo') != reglas.INFO_EMISION
             ]
+            sel = [rid for rid in sel if rid in self.discarded_row_ids or rid in incluir]
+            if not sel:
+                self._toast("Nada que restaurar: lo seleccionado no está descartado y ya va en el lote o ya se emitió.")
+                return
+            motivo = self._pedir_motivo("Restaurar", len(sel))
+            if motivo is None:
+                return
+            copia = self._estado_de(sel)
+            self.discarded_row_ids.difference_update(sel)
+            self.estado.set('descartados', self._keys_for(sel), False)
+            self.estado.registrar(self._keys_for(sel), "Restaurada", motivo)
             self.forced_included_row_ids.update(incluir)
             self.estado.set('incluidos', self._keys_for(incluir), True)
             self._con_deshacer(f"Restauraste {len(sel)}", lambda: self._restaurar_estado(sel, copia))

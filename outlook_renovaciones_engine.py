@@ -26,6 +26,8 @@ import pandas as pd
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+import registro
+from core_renovaciones import guardar_json
 from core_renovaciones import (
     get_app_dir,
     normalize_text,
@@ -88,6 +90,7 @@ class FonacotRenovacionesEngine:
         self.tickets_summary = []
         self.lote_info = None
         self.ocr_info = {'completadas': 0, 'sin_leer': [], 'error': ''}
+        self.errores_lectura = []  # incidentes cuyo correo no se pudo leer (quedan en validador.log)
 
     def load_settings(self) -> dict:
         default_settings = {
@@ -110,8 +113,7 @@ class FonacotRenovacionesEngine:
 
     def save_settings(self):
         try:
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, indent=2, ensure_ascii=False)
+            guardar_json(self.settings_file, self.settings, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -404,6 +406,7 @@ class FonacotRenovacionesEngine:
         end_dt = datetime(fecha_fin.year, fecha_fin.month, fecha_fin.day, 23, 59, 59)
         extended_end_dt = end_dt + timedelta(hours=12)
         self.ocr_info = {'completadas': 0, 'sin_leer': [], 'error': ''}
+        self.errores_lectura = []  # incidentes cuyo correo no se pudo leer (quedan en validador.log)
         self._correos_por_ticket = {}  # todos los correos de cada incidente (las imágenes pueden venir en otro)
 
         effective_general_mode = modo_concentrador_general or not gafetes_filter
@@ -644,16 +647,22 @@ class FonacotRenovacionesEngine:
                 except Exception:
                     pass
 
-            disagg_rows = RenovacionTicketParser.parse_and_disaggregate_email(
-                subject=cand['Asunto'],
-                html_body=html_body,
-                plain_body=plain_body,
-                received_dt=cand['Fecha_DT'],
-                ticket_num=cand['Numero_Ticket'],
-                gafete=cand['Gafete'],
-                nombre_asignado=cand['Nombre_Asignado'],
-                carpeta_origen=cand['Carpeta_Origen']
-            )
+            try:
+                disagg_rows = RenovacionTicketParser.parse_and_disaggregate_email(
+                    subject=cand['Asunto'],
+                    html_body=html_body,
+                    plain_body=plain_body,
+                    received_dt=cand['Fecha_DT'],
+                    ticket_num=cand['Numero_Ticket'],
+                    gafete=cand['Gafete'],
+                    nombre_asignado=cand['Nombre_Asignado'],
+                    carpeta_origen=cand['Carpeta_Origen']
+                )
+            except Exception:
+                # Un correo que no se puede leer no detiene la extracción, pero no se pierde: se avisa en rojo
+                registro.error(f"No se pudo leer el correo de {cand['Numero_Ticket']}")
+                self.errores_lectura.append(cand['Numero_Ticket'])
+                continue
 
             if not disagg_rows:
                 continue
