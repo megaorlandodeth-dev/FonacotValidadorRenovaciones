@@ -7,8 +7,10 @@ Reglas del lote (después de clasificar_lotes, la base de datos y el calendario 
 - Ya pasó la generación de la emisión (o ya está en CR_CEDULAS_DETALLE): ya se emitió, no se puede cancelar. Sale del
   lote y queda solo como informativa.
 - Pasó el cierre de mes: sigue en el lote, pero solo se cancela con autorización.
+- La renovación ya está bloqueada en la base (TZ_LOCK distinto de 0): ya se canceló, no se manda.
 - El incidente ya se resolvió en iTop: no se manda, salvo que se haya cerrado por error (se cerró diciendo que es de
-  otro día, la base dice que es del mismo día, no se mandó y la renovación no está bloqueada: TZ_LOCK = 0).
+  otro día, la base dice que es del mismo día, no se mandó y la renovación no está bloqueada: TZ_LOCK = 0). Si se
+  resolvió por otro motivo pero la renovación sigue sin bloquear y sí procede cancelarla, se avisa para revisarla.
 - La base dice «No procede, la renovación es de otro día»: no se manda.
 
 Desglose del ticket: un veredicto (Lista, Revisar, Corregir, No se manda, Ya enviada…), qué hacer, y las
@@ -34,6 +36,7 @@ LOTE_EXCLUIDOS = (LOTE_ENVIADA, LOTE_SIGUIENTE, LOTE_CERRADA_SIN_ENVIO, LOTE_SIN
 LOTE_POR_ENVIAR = (LOTE_HOY, LOTE_REZAGADA)
 
 INFO_EMISION, INFO_CERRADA, INFO_NO_PROCEDE = "emision", "cerrada", "no_procede"
+INFO_CANCELADA = "cancelada"  # ya está bloqueada en la base (TZ_LOCK distinto de 0)
 
 # Veredictos
 LISTA, REVISAR, CORREGIR, AUTORIZACION = "lista", "revisar", "corregir", "autorizacion"
@@ -88,6 +91,19 @@ def _emitida(r: dict) -> bool:
     return r.get("Bloqueo_Tipo") == "emision" or bool(r.get("SQL_Cedula"))
 
 
+def ya_cancelada(r: dict) -> bool:
+    """La renovación ya está bloqueada en la base (TZ_LOCK distinto de 0): ya se canceló."""
+    return r.get("SQL_Tz_Lock") not in (None, 0)
+
+
+def _base_dice(r: dict) -> str:
+    alta = r.get("SQL_Fecha_Alta")
+    return (f"la base dice que la renovación {r.get('Credito_Renovado_Hijo')} se dio de alta el {_f(alta)}"
+            + (" (el mismo día que llegó el incidente)" if r.get("SQL_Estado") == SQL_OK
+               else " y la manda la Mesa de Crédito: sí va" if r.get("SQL_Estado") == SQL_MESA_CREDITO
+               else " y la generó la APP con plazo menor: sí va"))
+
+
 def cerrado_por_error(r: dict) -> tuple:
     """
     (texto, seguro) si el incidente se cerró sin mandar la renovación diciendo que es de otro día y la base dice lo
@@ -105,11 +121,7 @@ def cerrado_por_error(r: dict) -> tuple:
     lock = r.get("SQL_Tz_Lock")
     if lock not in (None, 0):
         return "", False  # La renovación ya está bloqueada: el cierre estuvo bien
-    alta = r.get("SQL_Fecha_Alta")
-    base = (f"la base dice que la renovación {r.get('Credito_Renovado_Hijo')} se dio de alta el {_f(alta)}"
-            + (" (el mismo día que llegó el incidente)" if r.get("SQL_Estado") == SQL_OK
-               else " y la manda la Mesa de Crédito: sí va" if r.get("SQL_Estado") == SQL_MESA_CREDITO
-               else " y la generó la APP con plazo menor: sí va"))
+    base = _base_dice(r)
     if lock == 0:
         return (f"CERRADO POR ERROR: el incidente {_cierre_txt(r)}, pero {base}, no se mandó en el ticket único y no "
                 f"está bloqueada (TZ_LOCK = 0). Va en el lote."), True
@@ -117,21 +129,39 @@ def cerrado_por_error(r: dict) -> tuple:
             f"No se pudo leer TZ_LOCK para confirmar si ya está bloqueada: revísalo."), False
 
 
+def cerrado_sin_cancelar(r: dict) -> str:
+    """
+    El incidente se resolvió en iTop por otro motivo (no «es de otro día»), pero la renovación sigue sin bloquear en la
+    base (TZ_LOCK = 0) y sí procede cancelarla (la base la confirma y no se ha emitido): '' si no aplica. No va sola en
+    el lote: se avisa para que alguien confirme si se debía cancelar.
+    """
+    if (not r.get("Cerrado_iTop") or r.get("Lote_Estado") not in LOTE_POR_ENVIAR + (LOTE_CERRADA_SIN_ENVIO,)
+            or _emitida(r) or r.get("SQL_Estado") not in SQL_SE_ENVIA or r.get("SQL_Tz_Lock") != 0):
+        return ""
+    return (f"RESUELTO SIN CANCELAR: el incidente {_cierre_txt(r)}, pero {_base_dice(r)} y la renovación todavía no "
+            f"está bloqueada en la base (TZ_LOCK = 0). Confirma con quien lo cerró si se debía cancelar; si sí, "
+            f"«Restaurar» la manda hoy.")
+
+
 def aplicar_reglas(rows: list) -> dict:
     """
     Decide qué ya no se manda, en este orden (lo primero que aplica gana; lo demás ya no cuenta):
     1. Ya se emitió (calendario contra el día en que saldría o CR_CEDULAS_DETALLE): no se puede cancelar. Aunque el
        incidente se haya cerrado por error o no haya salido en su día, ya no hay nada que hacer.
+    1b. Ya está bloqueada en la base (TZ_LOCK distinto de 0): ya se canceló, no se manda otra vez.
     2. El incidente se resolvió en iTop: no se manda, salvo que se haya cerrado por error ('Cerrado_Por_Error': va hoy)
-       o que lo parezca y falte TZ_LOCK ('Posible_Cierre_Error': se revisa antes, no va sola).
+       o que lo parezca y falte TZ_LOCK ('Posible_Cierre_Error': se revisa antes, no va sola). Si se resolvió por otro
+       motivo pero la renovación sigue sin bloquear y sí procede, también se revisa ('Posible_Cierre_Error' con
+       'Cierre_Sin_Cancelar').
     3. La base dice «No procede»: no se manda.
     4. Pasó el cierre de mes ('Requiere_Autorizacion'): sigue en el lote, solo con autorización.
     """
-    conteo = {INFO_EMISION: 0, INFO_CERRADA: 0, INFO_NO_PROCEDE: 0, "cerrado_por_error": 0, "posible_cierre_error": 0,
-              "autorizacion": 0}
+    conteo = {INFO_EMISION: 0, INFO_CANCELADA: 0, INFO_CERRADA: 0, INFO_NO_PROCEDE: 0, "cerrado_por_error": 0,
+              "posible_cierre_error": 0, "cierre_sin_cancelar": 0, "autorizacion": 0}
     for r in rows:
         r["Informativa"], r["Informativa_Tipo"] = "", ""
         r["Cerrado_Por_Error"], r["Posible_Cierre_Error"], r["Requiere_Autorizacion"] = "", "", ""
+        r["Cierre_Sin_Cancelar"] = False
         r["No_Enviada_Emitida"] = False
         estado = r.get("Lote_Estado")
         if estado not in LOTE_POR_ENVIAR + (LOTE_CERRADA_SIN_ENVIO,):
@@ -148,20 +178,35 @@ def aplicar_reglas(rows: list) -> dict:
                     r["Lote_Resumen"] = f"No salió el {_f(r['Dia_Lote'], '%d/%m')}  ·  ya se emitió"
             conteo[INFO_EMISION] += 1
             continue
+        if ya_cancelada(r):
+            r["Informativa_Tipo"] = INFO_CANCELADA
+            r["Informativa"] = (f"YA ESTÁ CANCELADA: la renovación {r.get('Credito_Renovado_Hijo')} ya está bloqueada en "
+                                f"la base (TZ_LOCK = {r['SQL_Tz_Lock']}, distinto de 0): no se manda otra vez")
+            if r.get("No_Enviada") or r.get("Cerrada_Sin_Envio"):
+                r["No_Enviada"], r["Cerrada_Sin_Envio"] = False, False
+                if r.get("Dia_Lote"):
+                    r["Lote_Resumen"] = f"No salió el {_f(r['Dia_Lote'], '%d/%m')}  ·  ya está cancelada"
+            conteo[INFO_CANCELADA] += 1
+            continue
         texto, seguro = cerrado_por_error(r)
+        sin_cancelar = "" if texto else cerrado_sin_cancelar(r)
         if seguro:
             r["Cerrado_Por_Error"] = texto
             conteo["cerrado_por_error"] += 1
         elif texto:
             r["Posible_Cierre_Error"] = texto
             conteo["posible_cierre_error"] += 1
+        elif sin_cancelar:
+            r["Posible_Cierre_Error"], r["Cierre_Sin_Cancelar"] = sin_cancelar, True
+            conteo["cierre_sin_cancelar"] += 1
         if estado == LOTE_CERRADA_SIN_ENVIO:
             if r["Cerrado_Por_Error"]:
                 r["No_Enviada"], r["Cerrada_Sin_Envio"] = True, False
                 r["Lote_Resumen"] = f"NO SALIÓ ({_f(r.get('Dia_Lote'), '%d/%m')})  ·  cerrado por error  ·  va hoy"
             elif r["Posible_Cierre_Error"]:
                 r["No_Enviada"], r["Cerrada_Sin_Envio"] = False, False
-                r["Lote_Resumen"] = "¿Cerrado por error?  ·  falta TZ_LOCK"
+                r["Lote_Resumen"] = ("¿Resuelto sin cancelar?  ·  no está bloqueada" if r["Cierre_Sin_Cancelar"]
+                                     else "¿Cerrado por error?  ·  falta TZ_LOCK")
                 continue
             else:
                 # No salió en su día pero el incidente ya se resolvió (y no por error): no es un faltante, no se manda
@@ -189,7 +234,8 @@ def aplicar_reglas(rows: list) -> dict:
                 r["No_Enviada"] = False
                 r["Lote_Resumen"] = (f"No salió el {_f(r.get('Dia_Lote'), '%d/%m')}  ·  "
                                      + ("resuelto en iTop" if r["Informativa_Tipo"] == INFO_CERRADA else "no procede"))
-    conteo["informativas"] = conteo[INFO_EMISION] + conteo[INFO_CERRADA] + conteo[INFO_NO_PROCEDE]
+    conteo["informativas"] = (conteo[INFO_EMISION] + conteo[INFO_CANCELADA] + conteo[INFO_CERRADA]
+                              + conteo[INFO_NO_PROCEDE])
     return conteo
 
 
@@ -241,7 +287,8 @@ def grupos_del_dia(filas: list, descartadas=(), incluidas=(), solo_periodo: bool
              and (not solo_periodo or r.get("En_Periodo", True))]
 
     def fuera(r):
-        return not va_en_lote(r) and r.get("Row_ID") not in incluidas
+        # Lo ya cancelado en la base no vuelve al lote aunque se haya metido a mano
+        return (not va_en_lote(r) and r.get("Row_ID") not in incluidas) or r.get("Informativa_Tipo") == INFO_CANCELADA
 
     no_se_mandan = [r for r in vivas if r.get("Informativa") and fuera(r) and es_del_dia(r, desde)]
     por_tipo = {}
@@ -257,7 +304,9 @@ def grupos_del_dia(filas: list, descartadas=(), incluidas=(), solo_periodo: bool
 
 def texto_no_se_mandan(por_tipo: dict) -> str:
     """«1 ya se emitió · 2 resueltas en iTop» ('' si no hay)."""
-    textos = ((INFO_EMISION, "# ya se [emitió|emitieron]"), (INFO_CERRADA, "# [resuelta|resueltas] en iTop"),
+    textos = ((INFO_EMISION, "# ya se [emitió|emitieron]"),
+              (INFO_CANCELADA, "# ya [está cancelada|están canceladas] en la base"),
+              (INFO_CERRADA, "# [resuelta|resueltas] en iTop"),
               (INFO_NO_PROCEDE, "# no [procede|proceden]"))
     return " · ".join(pl(por_tipo[t], txt) for t, txt in textos if por_tipo.get(t))
 
@@ -316,6 +365,11 @@ def _checks_base(r: dict, sql_activo: bool) -> list:
         checks.append((MAL, f"Base de datos: {detalle}"))
     elif estado != SQL_SIN_DATOS:
         checks.append((INFO, f"Base de datos: {detalle}"))
+    if ya_cancelada(r):
+        ya_salio = r.get("Lote_Estado") in (LOTE_ENVIADA, LOTE_EN_CONCENTRADO)
+        checks.insert(0, (INFO if ya_salio else MAL,  # primero: es lo que decide que no se manda
+                       f"Base de datos: la renovación ya está bloqueada (TZ_LOCK = {r['SQL_Tz_Lock']}, distinto de 0): "
+                       f"ya se canceló" + ("." if ya_salio else "; no se manda otra vez.")))
     for texto in r.get("SQL_Clientes_Sin_Renov") or []:
         checks.append((AVISO, f"Base de datos: {texto}."))
     return checks
@@ -370,6 +424,8 @@ def _checks_itop(r: dict) -> list:
     if r.get("Cerrado_Por_Error"):
         checks.append((AVISO, f"iTop: se cerró por error ({_cierre_corto(r)}): dice que es de otro día, pero la base "
                               f"dice que no y no está bloqueada (TZ_LOCK = 0)."))
+    elif r.get("Cierre_Sin_Cancelar"):
+        checks.append((AVISO, f"iTop: resuelto ({_cierre_corto(r)}), pero la renovación sigue sin cancelar."))
     elif r.get("Posible_Cierre_Error"):
         checks.append((AVISO, f"iTop: POSIBLE CIERRE POR ERROR ({_cierre_corto(r)}): dice que es de otro día y la base "
                               f"dice que no; falta TZ_LOCK para confirmarlo."))
@@ -446,7 +502,8 @@ def veredicto(r: dict, en_lote: bool = None, validada: bool = False, descartada:
         return dict(nivel=nivel, corto=corto, titulo=titulo, accion=accion, checks=ordenadas, principales=n)
 
     if descartada:
-        aun_asi = {INFO_EMISION: "ya se emitió", INFO_CERRADA: "el incidente ya se resolvió",
+        aun_asi = {INFO_EMISION: "ya se emitió", INFO_CANCELADA: "ya está cancelada en la base",
+                   INFO_CERRADA: "el incidente ya se resolvió",
                    INFO_NO_PROCEDE: "no procede"}.get(r.get("Informativa_Tipo"))
         return v(DESCARTADA, "Descartada", "Descartada",
                  f"La descartaste. De todos modos no se manda: {aun_asi}." if aun_asi
@@ -460,12 +517,20 @@ def veredicto(r: dict, en_lote: bool = None, validada: bool = False, descartada:
             INFO_EMISION: ("No se manda: ya se emitió",
                            "Nada que hacer: ya no se puede cancelar. Si el incidente sigue abierto, respóndelo.",
                            "Calendario"),
+            INFO_CANCELADA: ("No se manda: ya está cancelada",
+                             "Nada que hacer: la renovación ya está bloqueada en la base (ya se canceló). Si el "
+                             "incidente sigue abierto, respóndelo.", "Base de datos"),
             INFO_CERRADA: ("No se manda: resuelta en iTop", "Nada que hacer.", "iTop"),
             INFO_NO_PROCEDE: ("No se manda: no procede",
                               f"Si el incidente sigue abierto, respóndelo con: «{LEYENDA_NO_PROCEDE}».",
                               "Base de datos"),
         }.get(tipo, ("No se manda", "Nada que hacer.", None))
         return v(NO_SE_MANDA, "No se manda", titulo, accion, decide, va=False)
+    if r.get("Cierre_Sin_Cancelar") and not en_lote:
+        return v(REVISAR, "¿Resuelto sin cancelar?", "Se resolvió en iTop, pero no está cancelada",
+                 f"La renovación sigue sin bloquear en la base y sí procede cancelarla. Confirma con "
+                 f"{(r.get('Cierre_iTop') or {}).get('cerro') or 'quien lo cerró'} si se debía cancelar; si sí, "
+                 f"«Restaurar» la manda hoy.", "iTop", va=False)
     if r.get("Posible_Cierre_Error") and not en_lote:
         return v(REVISAR, "¿Cerrada por error?", "¿Se cerró por error?",
                  "No se pudo leer TZ_LOCK: confirma en la base si la renovación está bloqueada. Si no lo está "

@@ -610,10 +610,8 @@ class RenovacionTicketParser:
             for r_idx, row in enumerate(tbl[:-1]):
                 if len(row) < 2:
                     continue
-                row_norm = [normalize_text(c) for c in row]
-                cli_idx = next((i for i, h in enumerate(row_norm) if h in ('cliente', 'no. cliente', 'numero de cliente', 'trabajador', 'cuenta', 'id cliente')), None)
-                cred_idx = next((i for i, h in enumerate(row_norm) if h in ('credito', 'no. credito', 'numero de credito', 'renovacion', 'no. renovacion', 'renovado')), None)
-                padre_idx = next((i for i, h in enumerate(row_norm) if 'origen' in h or 'anterior' in h or 'original' in h or 'padre' in h), None)
+                row_norm = [normalize_text(c).strip(' :#.') for c in row]
+                cli_idx, cred_idx, padre_idx = cls._columnas_cliente_credito(row_norm)
 
                 if cli_idx is not None and cred_idx is not None and cli_idx != cred_idx:
                     for data_row in tbl[r_idx + 1:]:
@@ -652,6 +650,42 @@ class RenovacionTicketParser:
                 })
 
         return records
+
+    _COL_PADRE = re.compile(r'origen|anterior|original|padre')
+
+    @classmethod
+    def _columnas_cliente_credito(cls, encabezados: list) -> tuple:
+        """
+        (cliente, crédito a cancelar, crédito padre): índices de las columnas o None. Encabezados ya normalizados
+        («no. de cliente», «numero de credito», «renovacion»…). El crédito a cancelar es, en este orden, la columna «a
+        cancelar», la de la renovación o la del crédito; si hay columna de renovación y otra solo «crédito», esa es la
+        del padre («Crédito | Renovación | Cliente»: el crédito es el que se renovó).
+        """
+        otra_cosa = r'nombre|monto|importe|saldo|tipo|fecha|folio|solicitud|plazo|producto|estatus|estado|sucursal|motivo'
+
+        # Un encabezado no trae números: «Cliente: 4919283» es una celda con dato, no el nombre de la columna
+        def es_cli(h):
+            return (bool(re.search(r'client|trabajador|cuenta|credere', h)) and len(h) <= 30
+                    and not re.search(rf'credito|renov|{otra_cosa}|\d', h))
+
+        def es_credito(h):
+            return (bool(re.search(r'\bcredito|\brenov|pagare', h)) and len(h) <= 30
+                    and not cls._COL_PADRE.search(h) and not re.search(rf'{otra_cosa}|\d', h))
+
+        cli = next((i for i, h in enumerate(encabezados) if es_cli(h)), None)
+        creditos = [i for i, h in enumerate(encabezados) if es_credito(h) and i != cli]
+        cancelar = [i for i in creditos if 'cancel' in encabezados[i]]
+        # «Crédito Renovado | Crédito Nuevo» o «… | Renovación Nueva»: el nuevo (hijo) es el que se cancela
+        nuevo = [i for i in creditos if re.search(r'nuev|hijo', encabezados[i])]
+        renov = [i for i in creditos if 'renov' in encabezados[i]]
+        cred = (cancelar or nuevo or renov or creditos or [None])[0]
+        padre = next((i for i, h in enumerate(encabezados) if cls._COL_PADRE.search(h)), None)
+        if padre is None and cred is not None and not cancelar:
+            if nuevo:
+                padre = next((i for i in creditos if i != cred and i not in nuevo), None)
+            elif renov:
+                padre = next((i for i in creditos if i != cred and 'renov' not in encabezados[i]), None)
+        return cli, cred, padre
 
     # Palabras que no son parte de un nombre: si aparecen, el número es de otra cosa (crédito, folio, teléfono…)
     _NO_NOMBRE = re.compile(
@@ -759,12 +793,13 @@ class RenovacionTicketParser:
         r'\b(analista|ejecutiv[oa]s?|capacidad|folio|depto|departamento|[áa]rea|gerencia|gerente|jef[ea]|'
         r'coordinaci[óo]n|direcci[óo]n|subdirecci[óo]n|monto|importe|saldo|l[íi]mite)\b', re.I)
 
-    @staticmethod
-    def _tabla_en_texto(texto: str) -> list:
+    @classmethod
+    def _tabla_en_texto(cls, texto: str) -> list:
         """
-        [(cliente, crédito)] de una tabla escrita como texto, con el encabezado en un renglón y una fila por renglón
-        (separada por espacios o tabuladores): «CLIENTE CREDITO / 4919283 71470 / 5864479 56572»; o aplanada, con una
-        celda por renglón: «Cliente / Crédito / 4919283 / 71470 / 5864479 / 56572».
+        [(cliente, crédito, padre)] de una tabla escrita como texto, con el encabezado en un renglón y una fila por
+        renglón (separada por espacios o tabuladores): «CLIENTE CREDITO / 4919283 71470 / 5864479 56572»; o aplanada,
+        con una celda por renglón: «Cliente / Crédito / 4919283 / 71470 / 5864479 / 56572». Con «CREDITO RENOVACION
+        CLIENTE» el crédito es el padre y la renovación la que se cancela.
         """
         def es_cli(h):
             return bool(re.search(r'client|trabajador|cuenta', normalize_text(h)))
@@ -805,6 +840,12 @@ class RenovacionTicketParser:
                 aplanada, i = True, j - 1
             ci = next(k for k, h in enumerate(enc) if es_cli(h))
             ri = next(k for k, h in enumerate(enc) if es_cred(h) and k != ci)
+            norm = [normalize_text(h) for h in enc]
+            renov = [k for k, h in enumerate(norm) if 'renov' in h and es_cred(enc[k]) and k != ci]
+            pi = None
+            if renov and 'renov' not in norm[ri] and 'cancel' not in norm[ri]:
+                # «CREDITO RENOVACION CLIENTE»: se cancela la renovación; el crédito es el que se renovó (padre)
+                ri, pi = renov[0], ri
             datos = []
             j = i + 1
             while j < len(lineas) and re.search(r'\d', lineas[j]) and not re.search(r'[A-Za-zÁÉÍÓÚáéíóúñÑ]{4,}', lineas[j]):
@@ -814,16 +855,44 @@ class RenovacionTicketParser:
                      else [celdas(d) for d in datos])
             for fila in filas:
                 fila = [c.strip() for c in fila]
+                padre, mas = '', []
                 if len(fila) == len(enc):
                     cli, cred = fila[ci], fila[ri]
-                else:  # columnas que no cuadran: el primer número de cliente y el primer crédito después de él
+                    if pi is not None and re.fullmatch(r'\d{3,7}', fila[pi]):
+                        padre = fila[pi]
+                else:  # columnas que no cuadran: el primer número de cliente y el crédito junto a él
                     nums = re.findall(r'\b\d{3,10}\b', ' '.join(fila))
                     cli = next((n for n in nums if 6 <= len(n) <= 10), '')
-                    cred = next((n for n in nums[nums.index(cli) + 1:] if 3 <= len(n) <= 7), '') if cli else ''
+                    k = nums.index(cli) if cli else 0
+                    antes_cli = [n for n in nums[:k] if 3 <= len(n) <= 7]
+                    if ri < ci:
+                        # El crédito va antes que el cliente («CREDITO CLIENTE / 71470 4919283 2609»): los números de
+                        # antes del cliente, no el gafete o la sucursal que vienen después
+                        antes = [n for n in nums[:k] if 3 <= len(n) <= 7]
+                        cols = sorted(x for x in (ri, pi) if x is not None and x < ci)[-len(antes):] if antes else []
+                        valores = dict(zip(cols, antes[-len(cols):])) if cols else {}
+                        cred, padre = valores.get(ri, ''), valores.get(pi, '')
+                    elif antes_cli:
+                        # Escribieron el crédito antes que el cliente aunque el encabezado diga lo contrario: el que
+                        # está junto al cliente, no el gafete o la sucursal de después
+                        cred = antes_cli[-1]
+                    elif len(enc) == 2 and cli:
+                        # Solo «Cliente Créditos»: los demás números del renglón son más créditos del cliente
+                        creds = [n for n in nums[k + 1:] if 3 <= len(n) <= 7]
+                        cred, mas = (creds[0], creds[1:]) if creds else ('', [])
+                    else:
+                        cred = next((n for n in nums[k + 1:] if 3 <= len(n) <= 7), '') if cli else ''
                 if re.fullmatch(r'\d{6,10}', cli) and re.fullmatch(r'\d{3,7}', cred):
-                    pares.append((cli, cred))
+                    pares.append((cli, cred, padre))
+                    pares.extend((cli, c, '') for c in mas)
             i = j
         return pares
+
+    # «se renovó con / renovado con / en el 71470»: después del número solo puede venir el fin del dato (no «con 5000
+    # pesos», «con 12 meses de plazo», «con 1200 de descuento») y no un año («se renovó en el 2025»)
+    _RENOVO_CON = (r'(?:se\s+renov[óo]|renovad[oa])\s+(?:al|con\s+el|con|en\s+el)(?:\s+cr[ée]dito)?\s+'
+                   r'(?!(?:19|20)\d\d\b)(\d{4,7})\b(?![^\S\n]*[\$\d])'
+                   r'(?=[^\S\n]*(?:$|[,\.;:\)\]\n]|del\b|de\s+(?:la|el|los|las|fecha|cliente|trabajador)\b|y\b|e\b|para\b|por\b|que\b|client|favor|cancel|a\s+nombre))')
 
     @classmethod
     def extract_disaggregated_renewals(cls, resumen: str, descripcion: str, inner_tables: list) -> list:
@@ -854,13 +923,14 @@ class RenovacionTicketParser:
         full_context = cls._normalizar_listas(unir_numeros_separados(
             f"{resumen_exp}\n{expand_abbreviated_labels(clean_desc or '')}"))
 
-        # Tabla escrita como texto («CLIENTE CREDITO» y abajo un renglón por fila): todas sus filas, no solo la primera
+        # Tabla escrita como texto («CLIENTE CREDITO» y abajo un renglón por fila): todas sus filas, no solo la primera.
+        # Con una sola fila se sigue leyendo el resto del correo (abajo), con esa fila como dato ya leído
         filas_tabla = cls._tabla_en_texto(full_context)
         if len(filas_tabla) > 1:
-            return [{'cliente': cli, 'credito_renovado': cred, 'credito_padre': '', 'sucursal': '', 'fecha_op': '',
+            return [{'cliente': cli, 'credito_renovado': cred, 'credito_padre': padre, 'sucursal': '', 'fecha_op': '',
                      'origen_extraccion': 'Tabla Sucursal (Texto)',
-                     'clientes_ticket': list(dict.fromkeys(c for c, _ in filas_tabla))}
-                    for cli, cred in filas_tabla]
+                     'clientes_ticket': list(dict.fromkeys(c for c, _, _ in filas_tabla))}
+                    for cli, cred, padre in filas_tabla]
 
         # Sin etiquetas: «NOMBRE DEL TRABAJADOR / número de cliente / créditos», uno o varios trabajadores
         bloques = cls._bloques_por_nombre(full_context)
@@ -881,14 +951,23 @@ class RenovacionTicketParser:
         clientes_found = []
         creditos_renovados_found = []
         creditos_padre_found = []
+        if filas_tabla:
+            # Tabla de una fila: «CREDITO CLIENTE / 71470 4919283» (si no, «CLIENTE\n71470» tomaba el crédito como
+            # cliente). Lo demás del correo («también la renovación 71471») se sigue leyendo
+            cli_t, cred_t, padre_t = filas_tabla[0]
+            clientes_found.append(cli_t)
+            creditos_renovados_found.append(cred_t)
+            if padre_t:
+                creditos_padre_found.append(padre_t)
 
         # 2.A: Extraer explícitamente Créditos Padre (Origen / Anterior / Original / Antes de renovar)
         padre_patterns = [
             r'(?:cr[ée]dito\s+(?:anterior|original|de\s+origen|origen|padre)|antes\s+de\s+renovar|operaci[óo]n\s*\(\s*origen\s*\))\s*[:\.\-\(]*\s*([\d,\s yY\-]+)',
             r'cancelar\s+la\s+renovaci[óo]n\s+del\s+cr[ée]dito\s+(\d{3,7})\s+con\s+no\.?\s+de\s+pagar[ée]',
             r'\b(\d{4,7})\s+\d{2,3}\s+se\s+renov[óo]\s+al\s+\d{4,7}\b',
-            # «el crédito 65000 se renovó al / con el (crédito) / en el 71470», «la renovación 71470 del crédito 65000»
-            r'cr[ée]dito\s+(\d{3,7})\s+se\s+renov[óo]\s+(?:al|con\s+el(?:\s+cr[ée]dito)?|en\s+el)\b',
+            # «el crédito 65000 se renovó al / con el (crédito) / en el 71470», «crédito 65000 renovado con 71470»,
+            # «la renovación 71470 del crédito 65000»
+            r'cr[ée]dito\s+(\d{3,7})\s+' + cls._RENOVO_CON.replace('(\\d{4,7})', '\\d{4,7}', 1),
             r'renovaci[óo]n\s+\d{3,7}\s+del\s+cr[ée]dito\s+(\d{3,7})',
             # «65000 -> 71470»: a la izquierda el padre (si a la izquierda hay un cliente de 7 u 8 dígitos, no aplica)
             r'(?<!\d)(\d{3,6})[^\S\n]*(?:->|→|=>)[^\S\n]*\d{3,6}(?!\d)',
@@ -912,6 +991,15 @@ class RenovacionTicketParser:
                 creditos_padre_found.append(p_num)
             if r_num not in creditos_renovados_found:
                 creditos_renovados_found.append(r_num)
+
+        # Encabezado «CRÉDITO RENOVACIÓN» y abajo los dos números por renglón («65000 71470»): el primero es el padre
+        for m_cr in re.finditer(r'^[^\S\n]*cr[ée]dito(?:[^\S\n]+(?:origen|anterior|padre))?[^\S\n]+renovaci[óo]n[^\S\n]*:?'
+                                r'[^\S\n]*\n((?:[^\S\n]*\d{3,7}[^\S\n]+\d{3,7}[^\S\n]*(?:\n|$))+)', full_context, re.I | re.M):
+            for p_num, r_num in re.findall(r'(\d{3,7})[^\S\n]+(\d{3,7})', m_cr.group(1)):
+                if p_num not in creditos_padre_found:
+                    creditos_padre_found.append(p_num)
+                if r_num not in creditos_renovados_found:
+                    creditos_renovados_found.append(r_num)
 
         # 2.B: Extraer Números de Cliente (Trabajador / Trabajadora / Credere / Fonacot / T-)
         cliente_patterns = [
@@ -941,7 +1029,8 @@ class RenovacionTicketParser:
                 # Excluir NSS (11 dígitos) y números de solicitud (empiezan con 507 o 508 de 9 dígitos)
                 if len(c_num) == 9 and c_num.startswith(('507', '508')):
                     continue
-                if cls._is_valid_number_token(c_num, 5, 10) and c_num not in clientes_found and c_num not in creditos_padre_found:
+                if (cls._is_valid_number_token(c_num, 5, 10) and c_num not in clientes_found
+                        and c_num not in creditos_padre_found and c_num not in creditos_renovados_found):
                     clientes_found.append(c_num)
 
         # Sin etiqueta: el número del trabajador junto a su nombre ("LUIS RENE MENDEZ ZUÑIGA 6650919")
@@ -956,6 +1045,8 @@ class RenovacionTicketParser:
             re.I
         ):
             c_num, r_num = m_inline_tbl.group(1), m_inline_tbl.group(2)
+            if c_num in creditos_renovados_found or r_num in clientes_found:
+                continue  # la tabla ya se leyó con el crédito antes que el cliente («71470 4919283»)
             if c_num not in clientes_found:
                 clientes_found.append(c_num)
             if r_num not in creditos_renovados_found and r_num not in creditos_padre_found:
@@ -976,7 +1067,8 @@ class RenovacionTicketParser:
             # La etiqueta puede traer una aclaración entre paréntesis, solo letras: «CREDITO (REN): 57815»
             r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:[^\S\n]*\([A-Za-zÁÉÍÓÚáéíóúÑñ\.\s]{1,25}\))?(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|;|/|y|Y|e|E|\-|\+)\s*[C\-\d]+)+)',
             r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:[^\S\n]*\([A-Za-zÁÉÍÓÚáéíóúÑñ\.\s]{1,25}\))?(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?[C\-\(]?[^\S\n]*(\d{3,7})\b',
-            r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b',
+            # «se renovó al 71470», «se renovó con el (crédito) 71470», «renovado con 71470»
+            r'\b' + cls._RENOVO_CON,
             # «65000 -> 71470» (el padre ya se tomó) y «Cliente 4919283 -> 71470»
             r'\d{3,8}[^\S\n]*(?:->|→|=>)[^\S\n]*(\d{3,6})(?!\d)',
         ]
@@ -1047,6 +1139,25 @@ class RenovacionTicketParser:
                     clientes_found.append(n)
                 elif len(n) <= 5 and n not in clientes_found and n not in creditos_padre_found and n not in creditos_renovados_found:
                     creditos_renovados_found.append(n)
+
+        # «Crédito 65000 / Renovación 71470» («No. de crédito … No. de renovación …», en cualquier orden): el crédito es
+        # el que se renovó (padre) y se cancela la renovación. Solo con un número en cada etiqueta (si no, son varios)
+        if len(clientes_found) <= 1 and len(creditos_renovados_found) == 2:
+            etiqueta = r'(?:[^\S\n]*(?:n[úu]mero|num\.?|no\.?|n°))?[^\S\n]*[:#\.\-]?[^\S\n]*'
+            otro = r'(?![^\S\n]*(?:,|/|y\b|e\b)[^\S\n]*\d)'
+            de_credito = set(re.findall(rf'\bcr[ée]dito{etiqueta}(\d{{3,7}})\b{otro}', full_context, re.I))
+            de_renov = set(re.findall(rf'\brenovaci[óo]n{etiqueta}(\d{{3,7}})\b{otro}', full_context, re.I))
+            # «cancelar el crédito 71470 y la renovación 71471», «ambos», «también»: se cancelan los dos
+            juntos = re.search(r'\b(?:ambos|ambas|tambi[ée]n|los\s+dos|las\s+dos)\b', full_context, re.I) or any(
+                re.search(rf'(?<!\d){a}(?!\d)[^\S\n]*(?:,[^\S\n]*)?(?:y|e)\b[^\n]{{0,25}}?(?<!\d){b}(?!\d)', full_context, re.I)
+                for a, b in ((next(iter(de_credito), 'x'), next(iter(de_renov), 'x')),
+                             (next(iter(de_renov), 'x'), next(iter(de_credito), 'x'))))
+            if (not juntos and len(de_credito) == 1 and len(de_renov) == 1 and de_credito != de_renov
+                    and de_credito | de_renov == set(creditos_renovados_found)):
+                padre = de_credito.pop()
+                creditos_renovados_found.remove(padre)
+                if padre not in creditos_padre_found:
+                    creditos_padre_found.append(padre)
 
         # Filtrar de creditos_renovados cualquier número que sea en realidad el Gafete del analista de sucursal
         gafete_sucursal_matches = re.findall(

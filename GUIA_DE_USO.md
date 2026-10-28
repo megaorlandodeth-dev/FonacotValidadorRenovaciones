@@ -101,10 +101,10 @@ Cada renovación muestra estas comprobaciones con su evidencia (✔ bien, ⚠ re
 | Comprobación | ✔ | ⚠ | ✖ |
 |---|---|---|---|
 | **Correo** | trae cliente y crédito | crédito padre cambiado, leído de una imagen o PDF, dos clientes, otro número de 7 dígitos sin leer | falta el cliente o el crédito |
-| **Base de datos** | la renovación existe y es de ese día | otra fecha, sugerencia, crédito padre | no existe, no es de ese cliente, no procede |
+| **Base de datos** | la renovación existe y es de ese día | otra fecha, sugerencia, crédito padre | no existe, no es de ese cliente, no procede, ya está cancelada (`TZ_LOCK` distinto de 0) |
 | **Calendario** | no ha pasado emisión ni cierre | pasó el cierre de mes (autorización), falta la fecha de la siguiente emisión | ya se emitió o ya está en la cédula |
 | **Ticket único** | va en el de hoy | no salió en su día (va hoy), posible duplicado | salió con datos equivocados |
-| **iTop / asignación** | — | cerrado por error, posible cierre por error, reasignación, duplicado en otro incidente | — |
+| **iTop / asignación** | — | cerrado por error, posible cierre por error, resuelto sin cancelar, reasignación, duplicado en otro incidente | — |
 
 ### 3.3 El veredicto
 
@@ -112,8 +112,10 @@ Cada renovación tiene **una sola decisión**. Gana la primera que aplica, en es
 
 1. **Descartada** (la descartó el validador).
 2. **Corregir · salió con datos equivocados** en un ticket único.
-3. **No se manda**: ya se emitió, se resolvió en iTop o la base dice que no procede.
-4. **¿Se cerró por error?** (no se pudo leer `TZ_LOCK`): Revisar.
+3. **No se manda**: ya se emitió, ya está cancelada en la base (`TZ_LOCK` distinto de 0), se resolvió en iTop o la
+   base dice que no procede.
+4. **¿Se cerró por error?** (no se pudo leer `TZ_LOCK`) o **¿Resuelto sin cancelar?** (se resolvió en iTop, pero la
+   renovación sigue sin bloquear y sí procede): Revisar. Si se debe cancelar, *Restaurar* la manda hoy.
 5. **Enviada** / **Siguiente** (va en el siguiente ticket único) / **Sin comprobar** (no se encontró el ticket único
    de su día).
 6. Si va en el ticket único de hoy:
@@ -155,7 +157,7 @@ Notas:
 - No usar un ejecutable de un solo archivo: tarda más en abrir y los antivirus lo marcan más.
 - Al descomprimir, la carpeta donde quede no debe ser muy profunda: la ruta más larga dentro del paquete mide unos
   110 caracteres y Windows tiene un límite de 260.
-- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.3*). Se cambia en `APP_VERSION` de
+- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.4*). Se cambia en `APP_VERSION` de
   `validador_renovaciones_app.py`.
 
 ---
@@ -219,6 +221,9 @@ autoprueba.
 | *SIN CRÉDITO* / *SIN CLIENTE* | Ver el correo original o el adjunto y usar **Corregir dato** (E). |
 | *DPI-1050* al conectar a la base | El Oracle Client del equipo es 12.2: la app ya usa oracledb 3.4, compatible. Si persiste, poner la carpeta del Oracle Client en `sql_cliente_oracle`. |
 | Captura de *Consulta de Crédito*: lee el crédito pero sale *SIN CLIENTE* | Pasaba antes de la 3.3.3 (el OCR se saltaba el renglón del cliente). Con la 3.3.3 se lee; si aun así falta, la columna *Base de datos* dice de qué cliente es la renovación: usar **Corregir dato** (E). |
+| Correo con «Crédito / Renovación / Cliente» (el crédito primero): sale el crédito como cliente o se manda el crédito en vez de la renovación | Pasaba antes de la 3.3.4. Con la 3.3.4 se cancela la renovación y el crédito queda como padre. |
+| Se mandó una renovación que ya estaba cancelada | Desde la 3.3.4, con la base activa, la que ya está bloqueada (`TZ_LOCK` distinto de 0) sale del lote: *No se manda: ya está cancelada*. |
+| Al cambiar de Validador a Usuario (o al revés) seguía haciendo lo del otro perfil | Pasaba antes de la 3.3.4. Al cambiar de perfil se limpia la tabla: F5 para buscar con el perfil nuevo. |
 | *ORA-12154* en modo clásico | Pasaba antes de la 3.3.3 con algunos Oracle Client instalados: descargar la versión más reciente. |
 | *DPY-4000* / *getaddrinfo failed* | Revisar *Nombre del host* (`scanfonacot.fonacot.gob.mx`), *Puerto* y *Nombre del servicio*, y la VPN. |
 | *no tiene la fecha de la emisión de …* | La página de FONACOT no ha publicado esa emisión o no hubo internet; se vuelve a intentar en la siguiente búsqueda. |

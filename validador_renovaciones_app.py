@@ -75,7 +75,7 @@ import equipo_compartido as equipo
 import registro
 
 
-APP_VERSION = "3.3.3"
+APP_VERSION = "3.3.4"
 # Trabajo en equipo por carpeta compartida (lo que marcan los analistas le llega al validador): apagado por ahora
 EQUIPO_ACTIVO = False
 
@@ -1294,6 +1294,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         (así el usuario no hereda el gafete que el validador tenía puesto).
         """
         previo = self.config_data.get("perfil")
+        if self.is_extracting and perfil != previo:
+            # Lo que se está buscando es del perfil anterior: al terminar se mostraría con el perfil nuevo
+            messagebox.showinfo("Cambiar de perfil", "Espera a que termine la búsqueda para cambiar de perfil.")
+            return False
         if previo == PERFIL_USUARIO and self.ent_agente.get().strip():
             self.config_data["gafete_usuario"] = self.ent_agente.get().strip()
         if perfil == PERFIL_USUARIO:
@@ -1307,14 +1311,26 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         else:
             self.config_data["gafete_usuario"] = gafete
         self.config_data["perfil"] = perfil
+        if perfil == PERFIL_VALIDADOR and previo == PERFIL_USUARIO:
+            # El usuario busca siempre «Por compañero» (su gafete): el validador regresa al modo que tenía (si no,
+            # _save_config guardaba «Por compañero» como su modo y ya no volvía a «Por ticket único»)
+            self.var_modo.set(self.config_data.get("modo_operacion", "CONCENTRADO"))
         if gafete or perfil == PERFIL_VALIDADOR:
             self._poner_gafete(gafete)
-        if perfil == PERFIL_USUARIO and previo != PERFIL_USUARIO and (self.all_rows or self.lote_info):
-            # El lote del validador (o una revisión) no es del usuario: se limpia hasta que extraiga el suyo
+        if perfil != previo:
+            # La actualización automática repetía la última búsqueda del otro perfil (al usuario le hacía la revisión
+            # semanal del validador): cada perfil empieza con la suya
+            self._ultima_busqueda = None
+            self._prev_scan_signature = None
+        if perfil != previo and previo in PERFILES and (self.all_rows or self.lote_info):
+            # El lote del validador (o una revisión) no es del usuario, ni el del usuario es todo el lote del validador:
+            # se limpia hasta que se extraiga el suyo
             self.all_rows, self.lote_info = [], None
             self.validaciones = {}
             self._limpiar_detalle()
-            self.lbl_status.configure(text="Presiona «Extraer y validar» (F5) para ver tus renovaciones.")
+            self.lbl_status.configure(text="Presiona «Extraer y validar» (F5) para ver tus renovaciones."
+                                      if perfil == PERFIL_USUARIO else
+                                      "Presiona «Extraer y validar» (F5) para ver el lote completo.")
         self._save_config()
         self._aplicar_perfil()
         return True
@@ -2917,6 +2933,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             account = ""
 
         self._aplicar_inhabiles()
+        if auto and self._ultima_busqueda and self._es_usuario() and self._ultima_busqueda[0]:
+            self._ultima_busqueda = None  # El usuario no hace la revisión semanal (era del validador)
         if auto and self._ultima_busqueda:
             # La actualización automática repite lo último que se buscó, no lo que se está preparando en el panel
             revision, d_start, d_end, era_hoy = self._ultima_busqueda
@@ -3322,10 +3340,18 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 avisos.append((f"{pl(len(mal_cerradas), '# [incidente se cerró por error y no se mandó|incidentes se cerraron por error y no se mandaron]')}: "
                                + ", ".join(sorted({r['Numero_Ticket'] for r in mal_cerradas})[:6])
                                + pl(len(mal_cerradas), ". [Va hoy; avisa a quien lo cerró|Van hoy; avisa a quien los cerró]."), ids(mal_cerradas), True))
-            posibles = grupos['posibles_cierre']
+            posibles = [r for r in grupos['posibles_cierre'] if not r.get('Cierre_Sin_Cancelar')]
             if posibles:
                 avisos.append((f"{pl(len(posibles), '# [incidente quizá se cerró|incidentes quizá se cerraron]')} por error (falta TZ_LOCK): "
                                f"{pl(len(posibles), '[confírmalo|confírmalos]')} antes de enviar el lote.", ids(posibles)))
+            sin_cancelar = [r for r in grupos['posibles_cierre'] if r.get('Cierre_Sin_Cancelar')]
+            if sin_cancelar:
+                rojo = True
+                avisos.append((f"{pl(len(sin_cancelar), '# [incidente se resolvió|incidentes se resolvieron]')} en iTop, pero "
+                               f"{pl(len(sin_cancelar), '[la renovación no está cancelada|las renovaciones no están canceladas]')} "
+                               f"en la base y sí procede: "
+                               + ", ".join(sorted({r['Numero_Ticket'] for r in sin_cancelar})[:6])
+                               + ". Confirma con quien lo cerró; «Restaurar» la manda hoy.", ids(sin_cancelar), True))
             informativas = grupos['no_se_mandan']
             if informativas:
                 avisos.append((f"No se mandan: {reglas.texto_no_se_mandan(grupos['por_tipo'])}.", ids(informativas)))
@@ -3761,7 +3787,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         return self.lote_info.get('lote_actual')
 
     def _fuera_de_lote(self, r: dict) -> bool:
-        """Fuera del ticket único de hoy: ya enviada, del siguiente, informativa (emitida, resuelta, no procede)…"""
+        """
+        Fuera del ticket único de hoy: ya enviada, del siguiente, informativa (emitida, resuelta, no procede)… Lo que
+        ya está cancelado en la base queda fuera aunque se haya metido a mano antes.
+        """
+        if r.get('Informativa_Tipo') == reglas.INFO_CANCELADA:
+            return True
         return not va_en_lote(r) and r['Row_ID'] not in self.forced_included_row_ids
 
     def _veredicto(self, r: dict) -> dict:
@@ -4394,16 +4425,18 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
     def _restore_selected_rows(self):
         sel = self.tree_desglose.selection()
         if sel:
-            # Lo que quedó fuera del lote se puede meter a mano, salvo lo que ya se emitió (eso ya no se cancela)
+            # Lo que quedó fuera del lote se puede meter a mano, salvo lo que ya se emitió o ya está cancelado en la
+            # base (eso ya no se cancela)
             por_id = {r['Row_ID']: r for r in self.all_rows}
             incluir = [
                 rid for rid in sel
                 if rid in por_id and not va_en_lote(por_id[rid])
-                and por_id[rid].get('Informativa_Tipo') != reglas.INFO_EMISION
+                and por_id[rid].get('Informativa_Tipo') not in (reglas.INFO_EMISION, reglas.INFO_CANCELADA)
             ]
             sel = [rid for rid in sel if rid in self.discarded_row_ids or rid in incluir]
             if not sel:
-                self._toast("Nada que restaurar: lo seleccionado no está descartado y ya va en el lote o ya se emitió.")
+                self._toast("Nada que restaurar: lo seleccionado no está descartado y ya va en el lote, ya se emitió o "
+                            "ya está cancelado en la base.")
                 return
             motivo = self._pedir_motivo("Restaurar", len(sel))
             if motivo is None:

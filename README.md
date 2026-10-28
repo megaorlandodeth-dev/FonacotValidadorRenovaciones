@@ -1,4 +1,4 @@
-# FONACOT · Validador de Renovaciones — v3.3.3
+# FONACOT · Validador de Renovaciones — v3.3.4
 
 Aplicación de escritorio para Windows que arma y valida el **lote diario de cancelaciones y reversas de renovaciones**
 que llegan como incidentes de iTop a Outlook, y prepara el **ticket único** del día.
@@ -45,6 +45,17 @@ Se elige al abrir la app y se cambia con el botón de perfil (arriba a la derech
 
 - **Ejecutable para equipos sin Python:** se reparte `ValidadorRenovaciones.zip`; el analista lo descomprime y abre
   `ValidadorRenovaciones.exe`. No hay que instalar Python ni librerías.
+- **3.3.4 · Crédito antes que el cliente:** las tablas «Crédito | Renovación | Cliente» (o «No. de crédito | No. de
+  renovación | No. de cliente») tomaban el crédito como cliente o como la renovación a cancelar. Ahora se cancela la
+  renovación y el crédito queda como padre; igual con «Crédito: … / Renovación: …» y «el crédito … se renovó con el …».
+- **3.3.4 · Ya cancelada en la base:** si la renovación ya está bloqueada (`TZ_LOCK` distinto de 0) no se manda otra
+  vez: sale del lote como *No se manda: ya está cancelada* (no se puede volver a meter a mano).
+- **3.3.4 · Resuelto en iTop sin cancelar:** si el incidente se resolvió por cualquier motivo pero la renovación sigue
+  sin bloquear (`TZ_LOCK` = 0) y sí procede (la base la confirma y no se ha emitido), se avisa en rojo:
+  *¿Resuelto sin cancelar?*. No va sola: si se debía cancelar, *Restaurar* la manda hoy.
+- **3.3.4 · Cambio de perfil:** al regresar de Usuario a Validador volvía en *Por compañero* y la actualización
+  automática repetía la búsqueda del otro perfil (al usuario le hacía la revisión semanal). Cada perfil vuelve a su
+  modo y a su búsqueda.
 - **3.3.3 · Cliente en las capturas de «Consulta de Crédito»:** el OCR de Windows se saltaba el renglón del
   cliente (número, botón «?» y nombre) y salía *SIN CLIENTE* aunque el crédito sí se leía (I-363027). Si la
   etiqueta se lee y su número no, ahora se lee sola la caja de la derecha.

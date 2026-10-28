@@ -747,12 +747,14 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
                     texto += "." + pista.group(0).rstrip(".") + "."
         resultados[i] = (estado, texto, alta, (detalle.get((c, cr)) or {}).get('cedula', False))
 
-    # TZ_LOCK de las renovaciones que existen (distinto de 0 = ya bloqueada): sirve para saber si un incidente cerrado
-    # sin enviar se cerró por error
+    # TZ_LOCK de las renovaciones que existen (distinto de 0 = ya bloqueada, ya se canceló): no se vuelve a mandar, y
+    # sirve para saber si un incidente cerrado sin enviar se cerró por error. También el de las renovaciones de los
+    # créditos padre (el incidente traía el padre y se cambia por su renovación)
     tz_lock, error_tz_lock = {}, ''
-    if con_alta:
+    clientes_lock = [c for c, _ in con_alta] + [h[1] for hs in por_padre.values() for h in hs]
+    if clientes_lock:
         try:
-            tz_lock = consultar_tz_lock(conn, tabla, [c for c, _ in con_alta])
+            tz_lock = consultar_tz_lock(conn, tabla, clientes_lock)
         except Exception as e:
             error_tz_lock = _mensaje(e)
 
@@ -768,6 +770,7 @@ def validar_contra_base(conn, tabla: str, rows: list, filas_enviadas: list = ())
         r['SQL_Renovacion_Hija'] = hijas[0][2] if hijas else ''
         if hijas:
             estado = corregir_padre(r, hijas)
+            r['SQL_Tz_Lock'] = tz_lock.get((_dato(r.get('Numero_Cliente')), _dato(r.get('Credito_Renovado_Hijo'))))
         conteos[estado] = conteos.get(estado, 0) + 1
     for f, (estado, texto, alta, cedula) in zip(filas_enviadas, resultados[len(rows):]):
         f['sql_estado'], f['sql_detalle'] = estado, texto
