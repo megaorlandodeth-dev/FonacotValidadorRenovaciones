@@ -97,8 +97,12 @@ class TestCerradoPorError(unittest.TestCase):
         self.assertTrue(reglas.va_en_lote(r))
         self.assertEqual(conteo['cerrado_por_error'], 1)
         ver = reglas.veredicto(r)
-        self.assertEqual(ver['nivel'], reglas.CORREGIR)
-        self.assertIn("se cerró por error", ver['accion'])
+        # No hay dato que corregir: va hoy (atrasada) y se avisa a quien la cerró
+        self.assertEqual(ver['nivel'], reglas.REVISAR)
+        self.assertIn("mándala hoy", ver['accion'])
+        self.assertIn("avisa a Juan que se cerró por error", ver['accion'])
+        self.assertFalse([t for e, t in ver['checks'] if e == reglas.MAL])
+        self.assertEqual(reglas.veredicto(r, validada=True)['nivel'], reglas.LISTA)
 
     def test_bloqueada_el_cierre_estuvo_bien(self):
         r = cerrada(SQL_Tz_Lock=7)

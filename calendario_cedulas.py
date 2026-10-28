@@ -108,10 +108,10 @@ def actualizar_calendario(forzar: bool = False, timeout: int = 8) -> bool:
     if not nuevas:
         return False
     try:
-        with open(_archivo(), "w", encoding="utf-8") as f:
-            json.dump({"actualizado": datetime.now().isoformat(timespec="seconds"), "fuente": URL_CALENDARIO,
-                       "emisiones": {f"{a}-{m:02d}": g.isoformat() for (a, m), g in sorted(_emisiones.items())}},
-                      f, indent=2, ensure_ascii=False)
+        from core_renovaciones import guardar_json
+        guardar_json(_archivo(), {"actualizado": datetime.now().isoformat(timespec="seconds"), "fuente": URL_CALENDARIO,
+                                  "emisiones": {f"{a}-{m:02d}": g.isoformat() for (a, m), g in sorted(_emisiones.items())}},
+                     indent=2, ensure_ascii=False)
     except Exception:
         pass
     return bool(nuevas)
@@ -121,6 +121,22 @@ def emisiones() -> dict:
     if not _cargado:
         cargar()
     return dict(_emisiones)
+
+
+def emision_sin_fecha(alta: date, envio: date) -> str:
+    """
+    «noviembre 2027» si entre el alta y el ticket único en que sale ya podría haber pasado una generación de emisión
+    que el calendario no tiene (la página de FONACOT no se ha actualizado o no hubo internet); '' si está cubierto.
+    Sin esa fecha no se puede saber si ya se emitió: no se debe dar por buena.
+    """
+    if not alta or not envio or alta >= envio:
+        return ""
+    conocidas = emisiones()
+    (anio, mes), ultima = max(conocidas.items(), key=lambda x: x[1])
+    if envio <= ultima + timedelta(days=20):  # entre una generación y otra pasa un mes
+        return ""
+    anio, mes = (anio + 1, 1) if mes == 12 else (anio, mes + 1)
+    return f"{_MESES[mes - 1]} {anio}"
 
 
 def ultimo_dia_del_mes(d: date) -> date:
@@ -184,13 +200,14 @@ def corte_que_bloquea(alta: date, envio: date):
 
 def dia_de_envio(r: dict, lote_actual: date = None):
     """
-    Día del ticket único en que sale (o salió) la renovación: el del ticket único en que vino; si va en el lote que se
-    está armando, el de ese lote; si no, el día en que debía ir ('Dia_Lote') o, sin eso, el día en que llegó.
+    Día del ticket único en que sale (o salió) la renovación: el del ticket único en que vino; si va (o iría, si se
+    cerró por error) en el lote que se está armando, el de ese lote; si no, el día en que debía ir ('Dia_Lote') o, sin
+    eso, el día en que llegó.
     """
-    from core_renovaciones import LOTE_HOY, LOTE_REZAGADA
+    from core_renovaciones import LOTE_CERRADA_SIN_ENVIO, LOTE_HOY, LOTE_REZAGADA
     if r.get('Enviado_Fecha'):
         return r['Enviado_Fecha']
-    if lote_actual and r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA):
+    if lote_actual and r.get('Lote_Estado') in (LOTE_HOY, LOTE_REZAGADA, LOTE_CERRADA_SIN_ENVIO):
         return lote_actual
     if r.get('Dia_Lote'):
         return r['Dia_Lote']
@@ -207,30 +224,47 @@ def emision_que_bloquea(alta: date, envio: date):
     return gens[0] if gens else None
 
 
+def fecha_del_correo(r: dict):
+    """La «Fecha» de la tabla de CREDERE (correo de la Mesa de Crédito): cuándo se hizo la renovación. None si no trae."""
+    m = re.search(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', str(r.get('Fecha_Operacion') or ''))
+    try:
+        return date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
+    except ValueError:
+        return None
+
+
 def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
     """
     Pone 'Bloqueo_Emision' (texto) y 'Bloqueo_Tipo' en las renovaciones dadas de alta antes de una emisión o de un
     cierre de mes que pasó antes del ticket único en que salen:
     - 'emision': ya se emitió; no se puede cancelar (solo informativa).
     - 'cierre': pasó el cierre de mes; solo se cancela con autorización.
-    La fecha de alta es la de la base ('SQL_Fecha_Alta'); sin ella se usa la llegada del incidente (la renovación se dio
-    de alta ese día o antes, así que si con la llegada ya pasó un corte, con el alta real también).
+    La fecha de alta es la de la base ('SQL_Fecha_Alta'); sin ella, la «Fecha» que trae el correo (Mesa de Crédito) si
+    es anterior a la llegada, o la llegada del incidente (la renovación se dio de alta ese día o antes, así que si con
+    la llegada ya pasó un corte, con el alta real también). Sin base, la del correo queda en 'Fecha_Alta_Correo'.
     `lote_actual`: día del lote que se está armando.
     """
     n = 0
     for r in rows:
-        r['Bloqueo_Emision'], r['Bloqueo_Tipo'] = '', ''
+        r['Bloqueo_Emision'], r['Bloqueo_Tipo'], r['Bloqueo_Corto'] = '', '', ''
         llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
         llegada = llegada.date() if isinstance(llegada, datetime) else llegada
-        alta = r.get('SQL_Fecha_Alta') or llegada
+        del_correo = fecha_del_correo(r)
+        r['Fecha_Alta_Correo'] = del_correo if not r.get('SQL_Fecha_Alta') and del_correo and del_correo < llegada else None
+        alta = r.get('SQL_Fecha_Alta') or r['Fecha_Alta_Correo'] or llegada
         envio = dia_de_envio(r, lote_actual)
         emision = emision_que_bloquea(alta, envio)
         corte = emision or corte_que_bloquea(alta, envio)
+        r['Sin_Calendario'] = '' if emision else emision_sin_fecha(alta, envio)
         if not corte:
             continue
         sale = f" y sale en el ticket único del {envio:%d/%m/%Y}" if envio != llegada else ""
-        origen = (f"se dio de alta el {alta:%d/%m/%Y} y el incidente llegó el {llegada:%d/%m/%Y}"
-                  if r.get('SQL_Fecha_Alta') else f"el incidente llegó el {llegada:%d/%m/%Y}")
+        con_alta = r.get('SQL_Fecha_Alta') or r['Fecha_Alta_Correo']
+        origen = (f"se dio de alta el {alta:%d/%m/%Y}" + (" (según el correo)" if r['Fecha_Alta_Correo'] else "")
+                  + f" y el incidente llegó el {llegada:%d/%m/%Y}" if con_alta else f"el incidente llegó el {llegada:%d/%m/%Y}")
+        desde = (f"se dio de alta el {alta:%d/%m}" if con_alta else f"llegó el {llegada:%d/%m}")
+        r['Bloqueo_Corto'] = (f"{desde} y {corte[1]} pasó antes del ticket único del {envio:%d/%m}"
+                              .replace(f" ({corte[0]:%d/%m/%Y})", f" del {corte[0]:%d/%m}").replace("de el ", "del "))
         if emision:
             r['Bloqueo_Tipo'] = 'emision'
             r['Bloqueo_Emision'] = (f"YA NO SE PUEDE CANCELAR: {origen}{sale}, "
@@ -242,4 +276,5 @@ def marcar_bloqueos(rows: list, lote_actual: date = None) -> dict:
                                     "Después del cierre de mes solo se cancela con autorización.")
         n += 1
     return {'bloqueadas': n, 'emitidas': sum(1 for r in rows if r.get('Bloqueo_Tipo') == 'emision'),
-            'cierre': sum(1 for r in rows if r.get('Bloqueo_Tipo') == 'cierre')}
+            'cierre': sum(1 for r in rows if r.get('Bloqueo_Tipo') == 'cierre'),
+            'sin_calendario': sorted({r['Sin_Calendario'] for r in rows if r.get('Sin_Calendario')})}

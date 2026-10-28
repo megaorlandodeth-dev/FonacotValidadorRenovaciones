@@ -15,10 +15,18 @@ import json
 from datetime import datetime, timedelta
 from html import escape
 
-from core_renovaciones import first_digits, LOTE_REZAGADA
+from core_renovaciones import first_digits, guardar_json, LOTE_REZAGADA
 
 
 _EMOJI_RE = re.compile('[\U0001F000-\U0001FAFF☀-➿⬀-⯿⌚-⏿️‍]')
+
+
+def pl(n: int, texto: str) -> str:
+    """
+    Concordancia con el número: «# [renovación|renovaciones] ya se [emitió|emitieron]» -> «1 renovación ya se emitió» o
+    «3 renovaciones ya se emitieron». # es el número; de cada [uno|varios] queda el que toca.
+    """
+    return re.sub(r"\[([^|\]]*)\|([^\]]*)\]", lambda m: m.group(1) if n == 1 else m.group(2), texto).replace("#", str(n))
 
 
 def plain_text(value) -> str:
@@ -29,29 +37,102 @@ def plain_text(value) -> str:
 
 
 def lote_corto(etiqueta: str) -> str:
-    """'Rezagada 22/10 14:53 (el ticket está en el concentrado pero NO este…)' -> 'Rezagada 22/10 14:53 · otros datos en el concentrado'."""
+    """'Rezagada 22/10 14:53 (el incidente viene en el ticket único pero NO este…)' -> '… · otros datos en el ticket único'."""
     m = re.match(r'(.*?)\s*\((.*)\)$', etiqueta or '', re.S)
     if not m:
         return etiqueta or ''
     base, motivo = m.groups()
-    if motivo.startswith("el ticket está en el concentrado"):
-        motivo = "otros datos en el concentrado"
-    elif motivo == "no está en el concentrado":
-        motivo = "no se envió"
+    if motivo.startswith("el incidente viene en el ticket único pero NO"):
+        motivo = "otros datos en el ticket único"
+    elif motivo == "no viene en el ticket único":
+        motivo = "no salió"
     return f"{base}  ·  {motivo}"
 
 
 def row_key(row: dict) -> str:
-    """Llave estable de una renovación (no depende del orden ni del gafete): Ticket|Cliente|Crédito."""
-    cli = first_digits(row.get('Numero_Cliente')) or 'SC'
-    cred = first_digits(row.get('Credito_Renovado_Hijo')) or 'SR'
+    """
+    Llave estable de una renovación (no depende del orden ni del gafete): Ticket|Cliente|Crédito. Si se corrigió a mano,
+    con lo que traía el correo (así no se pierde lo ya marcado ni la corrección en la siguiente actualización).
+    """
+    antes = row.get('Correccion_Manual') or {}
+    cli = first_digits(antes.get('cliente', row.get('Numero_Cliente'))) or 'SC'
+    cred = first_digits(antes.get('credito', row.get('Credito_Renovado_Hijo'))) or 'SR'
     return f"{row.get('Numero_Ticket', '')}|{cli}|{cred}|{row.get('Indice_En_Ticket', '') if cred == 'SR' else ''}"
 
 
-class EstadoValidaciones:
-    """Persistencia simple en JSON: {categoria: {llave: fecha_iso}}. Purga lo que tenga más de `dias_retencion` días."""
+def _sin_dato(valor) -> bool:
+    return not first_digits(valor) or str(valor).upper().startswith('SIN')
 
-    CATEGORIAS = ('validados', 'descartados', 'incluidos')
+
+def aplicar_correccion(row: dict, cliente: str, credito: str, hora: str = '') -> bool:
+    """
+    El analista corrigió el cliente o el crédito a cancelar (por ejemplo, con la renovación de ese día que dice la
+    base): lo que traía el correo queda en 'Correccion_Manual'. False si ya estaba corregida o no cambia nada.
+    """
+    if row.get('Correccion_Manual'):
+        return False
+    cli_antes, cred_antes = row.get('Numero_Cliente', ''), row.get('Credito_Renovado_Hijo', '')
+    cliente, credito = (cliente or cli_antes), (credito or cred_antes)
+    if (first_digits(cliente), first_digits(credito)) == (first_digits(cli_antes), first_digits(cred_antes)):
+        return False
+    row['Correccion_Manual'] = {'cliente': cli_antes, 'credito': cred_antes, 'hora': hora,
+                                'nivel': row.get('Nivel_Alerta'), 'alerta': row.get('Alerta_Renovacion')}
+    row['Numero_Cliente'], row['Credito_Renovado_Hijo'] = cliente, credito
+    row['Datos_Incompletos'] = _sin_dato(cliente) or _sin_dato(credito)
+    if not row['Datos_Incompletos'] and row.get('Nivel_Alerta') == 'incompleto':
+        row['Nivel_Alerta'] = 'multiple' if row.get('Es_Multiple') else 'normal'
+        row['Alerta_Renovacion'] = "✏️ Dato corregido a mano"
+    return True
+
+
+def quitar_correccion(row: dict) -> bool:
+    """Regresa lo que traía el correo. False si no estaba corregida."""
+    antes = row.pop('Correccion_Manual', None)
+    if not antes:
+        return False
+    row['Numero_Cliente'], row['Credito_Renovado_Hijo'] = antes['cliente'], antes['credito']
+    row['Datos_Incompletos'] = _sin_dato(antes['cliente']) or _sin_dato(antes['credito'])
+    if antes.get('nivel'):
+        row['Nivel_Alerta'], row['Alerta_Renovacion'] = antes['nivel'], antes.get('alerta', '')
+    return True
+
+
+def aplicar_correcciones(rows: list, correcciones: dict) -> list:
+    """Vuelve a poner lo corregido a mano ({llave: {'cliente', 'credito', 'hora'}}) en las renovaciones recién leídas.
+    Regresa las que se corrigieron ahora (las que ya lo estaban no cuentan)."""
+    hechas = []
+    for r in rows:
+        cor = correcciones.get(row_key(r)) if not r.get('Correccion_Manual') else None
+        if cor and aplicar_correccion(r, cor.get('cliente', ''), cor.get('credito', ''), cor.get('hora', '')):
+            hechas.append(r)
+    return hechas
+
+
+def llaves_fila(row: dict) -> list:
+    """La llave de la renovación y, si el crédito padre se cambió por su renovación, la llave con el padre (así se
+    reconoce en otro equipo que no validó en la base)."""
+    llaves = [row_key(row)]
+    if row.get('Credito_Padre_Enviado'):
+        llaves.append(row_key(dict(row, Credito_Renovado_Hijo=row['Credito_Padre_Enviado'])))
+    return llaves
+
+
+def _fecha_de(valor) -> str:
+    """Fecha ISO de un registro guardado: texto, {'hora': …} o lista de eventos [[hora, …], …]."""
+    if isinstance(valor, dict):
+        return str(valor.get('hora', ''))
+    if isinstance(valor, list):
+        return str(valor[-1][0]) if valor and valor[-1] else ''
+    return str(valor)
+
+
+class EstadoValidaciones:
+    """
+    Persistencia simple en JSON: {categoria: {llave: fecha_iso}}, más 'dudas' ({llave: {'hora', 'nota'}}) y la
+    'bitacora' ({llave: [[hora, acción, detalle], …]}). Purga lo que tenga más de `dias_retencion` días.
+    """
+
+    CATEGORIAS = ('validados', 'descartados', 'incluidos', 'dudas', 'bitacora', 'correcciones')
 
     def __init__(self, path: str, dias_retencion: int = 30):
         self.path = path
@@ -73,15 +154,14 @@ class EstadoValidaciones:
 
     def save(self):
         try:
-            with open(self.path, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=1, ensure_ascii=False)
+            guardar_json(self.path, self.data, indent=1, ensure_ascii=False)
         except Exception:
             pass
 
     def _purge(self):
         limite = (datetime.now() - timedelta(days=self.dias_retencion)).isoformat()
         for c in self.CATEGORIAS:
-            self.data[c] = {k: v for k, v in self.data[c].items() if str(v) >= limite}
+            self.data[c] = {k: v for k, v in self.data[c].items() if _fecha_de(v) >= limite}
 
     def has(self, categoria: str, key: str) -> bool:
         return key in self.data[categoria]
@@ -93,6 +173,38 @@ class EstadoValidaciones:
                 self.data[categoria][k] = now
             else:
                 self.data[categoria].pop(k, None)
+        self.save()
+
+    def registrar(self, keys, accion: str, detalle: str = '', guardar: bool = True):
+        """Agrega a la bitácora de cada renovación: quién hizo qué y cuándo (se queda en este equipo)."""
+        now = datetime.now().isoformat(timespec='seconds')
+        for k in keys:
+            self.data['bitacora'].setdefault(k, []).append([now, accion, detalle])
+            del self.data['bitacora'][k][:-30]  # las últimas 30 por renovación
+        if guardar:
+            self.save()
+
+    def historial(self, key: str) -> list:
+        return [tuple(e) for e in self.data['bitacora'].get(key, []) if len(e) == 3]
+
+    def poner_duda(self, key: str, nota: str):
+        """Duda para el validador (nota vacía = se quita)."""
+        if nota:
+            self.data['dudas'][key] = {'hora': datetime.now().isoformat(timespec='seconds'), 'nota': nota}
+        else:
+            self.data['dudas'].pop(key, None)
+        self.save()
+
+    def duda(self, key: str) -> str:
+        return (self.data['dudas'].get(key) or {}).get('nota', '')
+
+    def corregir(self, key: str, cliente: str = '', credito: str = ''):
+        """Guarda lo corregido a mano de esa renovación (sin cliente ni crédito = se quita la corrección)."""
+        if cliente or credito:
+            self.data['correcciones'][key] = {'hora': datetime.now().isoformat(timespec='seconds'),
+                                              'cliente': cliente, 'credito': credito}
+        else:
+            self.data['correcciones'].pop(key, None)
         self.save()
 
 
@@ -162,7 +274,7 @@ def build_lote_html(rows: list, validados: set, titulo: str = "") -> str:
     rezagadas = sum(1 for r in rows if r.get('Lote_Estado') == LOTE_REZAGADA)
     resumen = f"Total de renovaciones a cancelar: {len(rows)}"
     if rezagadas:
-        resumen += f" (incluye {rezagadas} rezagada(s) del día anterior)"
+        resumen += f" (incluye {pl(rezagadas, '# [rezagada|rezagadas]')} del día anterior)"
     partes.append(f'<p style="font-family:Segoe UI,Arial;font-size:10pt">{escape(resumen)}</p>')
     return "\n".join(partes)
 

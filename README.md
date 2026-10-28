@@ -100,6 +100,70 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
    - **El rojo gana:** una renovación que no se envió o salió mal se ve en rojo aunque la hayas validado antes.
    - La marca *última considerada* solo la deja el lote de hoy al copiarlo o crear el correo (no el Excel, ni una revisión, ni un lote pasado).
 
+**Novedades v3.2:**
+   - **Cada aviso se puede abrir:** los avisos rojos y ámbar van uno por renglón; clic en uno (*›*) y el desglose muestra solo esas renovaciones (vista *Las del aviso*), con el detalle de la primera abajo. Si el panel de detalle estaba oculto, se abre.
+   - **Lo resuelto en iTop no es «NO enviada»:** si una renovación no salió en su día pero el incidente ya se resolvió (y no se cerró por error), ya no cuenta como *NO enviada* ni en el resumen ni en *Por día*: se ve como *no se manda* y aparte, en ámbar. Solo cuenta lo que sigue abierto o se cerró por error. Los avisos de *Valídalas*, *APP con plazo menor* y *CR_CEDULAS* ya solo cuentan las que todavía van.
+   - **El usuario vuelve a elegir el periodo** (*Periodo de recepción*): el día que elige se respeta al extraer (antes volvía siempre al de hoy).
+   - **Cada perfil guarda su gafete:** al pasar de Validador a Usuario ya no se queda el gafete del compañero que el validador estaba revisando (antes no se podía cambiar porque en modo *Concentrado* el campo está deshabilitado). La primera vez se pide el gafete del usuario.
+   - **Sin contraseña por ahora:** cualquiera puede entrar como Usuario o como Validador desde el botón de perfil (el control real son los permisos de Outlook, iTop y Oracle).
+   - **Modo oscuro más legible:** los textos de color (rojo de los avisos, violeta del cierre en iTop, índigo, naranja) se aclaran hasta leerse bien sobre el fondo oscuro, y los números resaltados del correo ya no quedan en verde olivo con texto naranja.
+   - **«No se mandan» solo trae las del lote:** las de su ticket único o de después. Las de días anteriores (por ejemplo, *No salió el 23/10 · ya se emitió*) se ven aparte en *No se mandan (todas)* (en *Otras vistas*; el usuario también la tiene). El indicador y el aviso cuentan solo las del lote.
+   - **Correos de la Mesa de Crédito** (*…asignar los siguientes registros de renovación al grupo de la Mesa de Crédito para revisión y concentración, a fin de dar seguimiento a la cancelación en CREDERE*): sus renovaciones de otros días **sí se mandan**; ya no salen como *No procede, la renovación es de otro día*. Solo las detiene la emisión o el cierre de mes. En la columna *Base de datos*: *✔ Mesa de Crédito*. Sin la base, la emisión se cuenta desde la *Fecha* que trae la tabla del correo.
+   - **Correos con asunto sin relación y los datos en el adjunto** (asunto *APOYO*, *…si se puede cancelar la renomvacion ya que no le liberó el capital…* y el estado de cuenta en PDF):
+     - «Renovación» mal escrita (*RENOMVACION*, *RENOBACION*, *RENOVASION*…) y motivos como *no le liberó el capital / el monto / lo que requería* ya cuentan como cancelación de renovación.
+     - **Se leen los PDF adjuntos** (con el lector de PDF y el OCR que ya trae Windows, sin instalar nada): sus primeras 2 páginas se leen igual que una captura.
+     - **Estado de cuenta:** se toma el *Cliente* y, como renovación, el crédito con la *FECHA AUTORIZADO* más reciente (hasta un mes antes del correo), no el primero de la tabla. El desglose dice *…leído del estado de cuenta «EDO CTA.pdf (pág. 1)» (autorizado el 26/10/2026)* y queda en ámbar para compararlo con el PDF. Si no hay ningún crédito autorizado cerca del correo, lo dice.
+     - Si el correo solo pide cancelar (*favor de cancelar, anexo estado de cuenta*) sin decir qué, se revisa el adjunto y entra solo si de ahí sale el cliente o la renovación.
+     - **Fotos tomadas de lado:** si una imagen casi no se lee, se prueba girada. De una foto al monitor a veces solo sale el cliente: con la base activa, la renovación de ese día queda a un clic en *Corregir dato*.
+   - **Corregir dato** (botón *Corregir dato* del desglose, tecla **E** o clic derecho → *Corregir cliente o crédito…*): si el correo trae mal el cliente o el crédito a cancelar (por ejemplo, *El cliente 5980215 no tiene la renovación 6756… ¿Será 48033?*), se escribe el bueno o se elige con un clic una de las renovaciones que dice la base (*Usar 48033 · cliente 5980215 · alta 27/10/2026*, las del mismo día primero). Desde ahí la tabla, *Copiar*, *Copiar lote*, el Excel y el ticket único llevan el número corregido; el desglose dice *Correo: traía el crédito 6756; se corrigió a mano…* y la comparación sigue mostrando lo del correo. Se guarda en las marcas del día y se vuelve a poner en cada actualización; con la base activa se actualiza sola para confirmarlo. *Volver a lo del correo* quita la corrección. También sirve para completar el dato que falta (*SIN CLIENTE*).
+   - **«¿Será 48033?»** ya no termina con otro punto.
+   - **Trabajo en equipo apagado por ahora** (`EQUIPO_ACTIVO = False` en la app): sin columna *Equipo*, sin *Pasar duda* ni *Validar lo del equipo*. El código sigue ahí para activarlo después.
+   - **Una sola decisión por renovación, sin textos que se contradigan.** Gana lo primero que aplica: *descartada → salió con datos equivocados → ya se emitió → resuelta en iTop → no procede → ¿se cerró por error? (falta TZ_LOCK) → ya enviada / siguiente → corregir → autorización (cierre de mes; se suma a lo que siga) → no salió en su día (va hoy) → revisar → lista*. En el desglose va primero la comprobación que decide y lo que hay que atender; lo demás queda plegado en *▸ Otras comprobaciones (n)*. Si no se manda, lo que no decide queda como dato (•), sin ✖ ni ⚠.
+     - **Ya se emitió gana:** si no salió en su día (o el incidente se cerró por error) pero ya pasó la emisión, solo dice *No se manda: ya se emitió*; ya no sale *CERRADO POR ERROR* ni cuenta como *NO enviada* (en la tabla: *No salió el 23/10 · ya se emitió*; en el Excel: *No salió en su día - ya se emitió*).
+     - **Lo que va hoy se mide contra hoy:** lo que no salió en su día o se cerró por error se revisa contra el calendario del lote de hoy, y en la comparación dice *hoy (le tocaba el 26/10)*.
+     - **No salió en su día / cerrado por error ya no son ✖:** son ⚠ con veredicto *Atrasada · va hoy* (y *avisa a quien lo cerró*); al validarla queda *Lista*.
+     - **Salió con datos equivocados** es *Corregir* (antes decía *Nada que hacer*). **¿Se cerró por error?** (sin TZ_LOCK) es *Revisar* y cuenta en *Revisar*.
+     - Textos más cortos: el motivo del cierre ya no se repite en las comprobaciones (está en *Cierre en iTop*).
+   - **Avisos:** cada renglón con su color (rojo solo lo que cambia el lote de hoy); *No se mandan: 2 ya se emitieron · 1 resueltas en iTop* en un renglón; el de *cerrados por error* ya no cuenta lo emitido ni lo descartado; *quizá se cerraron por error* aparte; empiezan cerrados en cada sesión y se recalculan al validar, descartar, restaurar o deshacer.
+   - **Validar (Espacio)** ya no marca lo que no se manda (*No se manda: no hay nada que validar*); *Siguiente pendiente* dice cuántas faltan en todo el lote.
+   - **Desglose:** el encabezado (folio, cliente, crédito) ya no se corta, y el correo original toma solo el alto que necesita para dejar ver las comprobaciones.
+   - **Créditos en el renglón de abajo** (*renovaciones de crédito ⏎ 45375, 45377*) solo si no se encontró ningún crédito, y nunca de renglones como *Analista de Crédito ⏎ 2609* o *capacidad de crédito ⏎ 15000*.
+   - **Lectura de correos más segura:**
+     - **Tablas pegadas como texto** (*Cliente / Crédito* en columnas o una debajo de otra) se leen fila por fila; las columnas *crédito origen / anterior / padre* no se toman como la renovación.
+     - **Listas:** viñetas y numeración (*- 45375*, *1) 45377*) y un crédito por renglón; *Créditos a cancelar 45375 y 45377*, *Renovaciones a cancelar: …*, separados por *;*, */* o *e*; flechas *41234 → 45375* (padre → renovación).
+     - **Números escritos con espacios o puntos** (*Cliente: 4 919 283*, *crédito 71.470*) se juntan; *tr*/*cta* solo se toman como cliente con 7 dígitos y *R-123456* después de *caso*, *folio*, *ticket*… no se toma como renovación. Los números de la lista de ignorados sí cuentan si van con su etiqueta (*Crédito: 12345*).
+     - **No son créditos:** números después de *analista*, *ejecutivo*, *folio*, *depto.*, *gerencia*, *monto*, *saldo*, *límite*… en el mismo renglón; tampoco la firma (*Atte.*, *Saludos*…) ni el *Centro de trabajo / Empresa*.
+     - **Varios clientes:** cada crédito va con el cliente de su mismo renglón (si hay uno) o el más cercano de arriba.
+     - **Correos en HTML:** se lee la *Descripción* del incidente con sus renglones (las negritas y colores ya no parten los números); si el texto plano trae más datos completos, se usa ese.
+   - **Calendario sin la siguiente emisión:** si la página de FONACOT todavía no publica la emisión que le tocaría (o no hubo internet), la renovación sale en ámbar: *no tiene la fecha de la emisión de noviembre 2026: no se sabe si ya se emitió*, con aviso arriba.
+   - **Errores registrados en `validador.log`** (junto a la app, máx. 1 MB × 3): si un correo no se puede leer, se salta, se avisa en rojo (*No se pudo leer: I-123…*) y lo demás sigue; si fallan las reglas o un botón, se avisa y queda el detalle en el registro.
+   - **Guardado seguro:** la configuración, las marcas del día y el calendario se guardan a un temporal y luego se reemplazan, para que un apagón no deje el archivo a medias.
+   - **Restaurar** sobre algo que no está descartado y ya va en el lote (o ya se emitió) ya no pide motivo: dice *Nada que restaurar*.
+   - **Red de seguridad al leer correos:** si el correo trae un número de 7 dígitos (como los de cliente) que no se leyó como cliente ni como crédito, la comprobación del correo avisa: *también trae el número 6210399, que no se leyó como cliente: revisa que no falte una renovación*. No cuenta teléfonos, folios, nómina ni el centro de trabajo.
+   - **Mismas palabras en toda la app:** *Ticket único* (ya no *concentrado*; el modo se llama *Por ticket único*), *No salió* (antes *NO SE ENVIÓ* / *NO ENVIADA*, también en el Excel), *Resuelta en iTop*, *No se manda*. Los conteos concuerdan con el número (*1 ya se emitió*, *2 ya se emitieron*) en lugar de *(s)/(es)*.
+   - **Recuadro de veredicto:** el título dice qué es y por qué (*No se manda: ya se emitió*) y la segunda línea, qué hacer (*Nada que hacer…*), sin repetirse.
+   - **Tabla más angosta:** por omisión se ocultan *Parte*, *Gafete*, *Agente*, *Alerta* y *Llegada* (están en el desglose y se muestran en *Vista ▾*); *Lote / envío* y *Cierre en iTop* se ven sin mover la tabla, y la última columna toma el espacio que sobra. Si un ticket trae varias renovaciones, va junto al folio: *I-362753 (2/3)*. Se aplica una vez a la configuración guardada.
+   - **Cada número una vez:** los indicadores son la fuente; los filtros solo cuentan lo que no tiene indicador (*Rezagadas*, *Múltiples*, *Nuevas*); el subtítulo solo dice lo que no está en otro lado y si hay algo (rezagadas, siguiente ticket único, hora del envío), y la barra de abajo dice cuándo se actualizó.
+   - **Distribución:** *Vista ▾* pasa junto al buscador; *Más detalle ▾* va pegado al subtítulo; la *COMPARACIÓN* del desglose ajusta sus columnas al ancho (si todo coincide, un solo renglón; si no se manda, sin la columna del ticket único); con el detalle abajo, al abrir un aviso con pocas filas la tabla toma solo su alto; la ventana cabe en 1366×768 al 125 % y por debajo de 1200 de ancho el panel izquierdo se oculta solo (Ctrl+B lo muestra).
+   - **Las del aviso:** el contador dice *2 del aviso · 4 en el lote* y *✕ Ver todas* regresa a todas. Al pasar de Validador a Usuario se vacía el lote del validador (para no copiar renovaciones de otros) hasta que se extraiga el propio.
+   - **Avisos e indicadores salen de la misma cuenta** (`reglas_lote.grupos_del_dia`), con pruebas: ya no pueden decir números distintos de cerradas por error, por confirmar o *No se mandan*.
+
+**Novedades v3.1:**
+   - **Trabajo en equipo (carpeta compartida):** cada analista y el validador ponen la misma carpeta en *Configuración → Trabajo en equipo* (una carpeta de red `\\servidor\...`, o de OneDrive/SharePoint sincronizada) y pulsan *Probar*. No hace falta servidor ni base de datos nueva.
+     - **Analista:** cada vez que valida (o deja una duda) la app escribe su archivo `marcas_<gafete>.json` en la carpeta: qué renovaciones validó, a qué hora, sus dudas y su avance. Cada quien escribe solo el suyo (se escribe a un temporal y se reemplaza, nadie lee un archivo a medias).
+     - **Validador:** cada 15 segundos lee los archivos del día y le aparece en la columna **Equipo** quién validó qué (*✓ Nancy 11:32*) o la duda (*? Nancy: …*), con un aviso *Equipo: Nancy (2609) validó 3 y dejó 1 duda* y el botón *Ver*. Vistas *Marcadas por el equipo* y *Dudas del equipo*; en *Por compañero*, *Marcó el analista* (*3 de 4*) y *Última señal* (*sin señal* si no publica hace 30 min).
+     - **Validar lo del equipo:** valida de una vez lo que ya marcaron, con vista previa; lo que tiene algo que revisar se queda fuera para que lo revises tú. Se reconoce la renovación aunque el analista no tenga la base de datos (trae el crédito padre y el validador ya lo cambió por la renovación).
+     - **Pasar duda al validador:** tecla **D** o clic derecho (analista).
+   - **Bandeja del analista:** *Te faltan X de Y* con barra de avance y *Siguiente pendiente*; al terminar, *✔ Listo* con el botón grande *Copiar mis renovaciones*. El panel izquierdo empieza plegado y las filas son más grandes.
+   - **Comparación en el desglose:** *Incidente | Base de datos | Ticket único* para el cliente, el crédito y la fecha, con ✔/⚠/✖ por renglón.
+   - **Deshacer:** validar, descartar, restaurar y validar en bloque se deshacen con **Ctrl+Z** o el botón *Deshacer* del aviso.
+   - **Bitácora por renovación** en el desglose (validada, descartada, restaurada, duda…). Al descartar o restaurar se pide el motivo (`pedir_motivo`).
+   - **Validar visibles con vista previa:** dice cuántas se validan y deja fuera las que hay que revisar y las que no van en el ticket único.
+   - **Barra de color** al inicio de cada fila (verde validada, ámbar revisar, rojo corregir, gris no se manda) en vez de pintar toda la fila; los filtros rápidos dicen cuántas hay (*Revisar 3*).
+   - **Teclado:** **J/K** bajan y suben, **?** muestra los atajos y **Ctrl+K** abre la paleta de comandos (escribe lo que quieres hacer).
+   - **Recordatorio de emisión sin ventana:** al extraer sale como aviso abajo a la derecha (*Ver calendario*), sin tapar el desglose.
+   - **Modo oscuro** y **letra grande** en *Configuración → Apariencia* (el modo oscuro se aplica al volver a abrir).
+
 **Novedades v3.0:**
    - **Dos perfiles: Usuario y Validador.** La primera vez se elige el perfil (se cambia con el botón de perfil, arriba a la derecha).
      - **Usuario (analista):** solo ve *Mis renovaciones de hoy* por su gafete: sin revisión semanal, periodo, correo del ticket único ni descartes. Su botón es **Copiar mis renovaciones**, que copia solo la tabla con el formato del ticket único (sin saludo) para pasársela a quien manda el ticket único.
@@ -176,6 +240,7 @@ Evitar que cualquier solicitud de cancelación de renovación autorizada en el d
 - `lote_utils.py`: Persistencia de validaciones, tabla del lote (texto/HTML) y portapapeles con formato.
 - `reglas_lote.py`: Qué va en el lote y qué solo es informativo (emisión, resuelto, no procede, cerrado por error) y el veredicto con las comprobaciones del desglose.
 - `sql_renovaciones.py` / `calendario_cedulas.py`: Validación en la base (Oracle) y calendario de emisión y cierres de mes.
+- `equipo_compartido.py`: Trabajo en equipo por carpeta compartida (apagado en la v3.2).
 - `tests/`: Pruebas automáticas del parser, del corte/rezagadas y de las utilidades del lote (no requieren Outlook).
 - `Ejecutar_Validador_Renovaciones.bat`: Script de inicio rápido.
 
@@ -204,6 +269,10 @@ Se guarda en `%USERPROFILE%\.fonacot_validador_renovaciones_config.json`. Ademá
 - `perfil`: `"usuario"` o `"validador"`. Vacío = se pregunta al abrir.
 - `perfil_fijo`: `true` para que no se pueda cambiar de perfil desde la app (lo fija quien instala). El usuario sí puede cambiar su gafete.
 - `avanzar_al_validar`: al validar una renovación se pasa sola a la siguiente pendiente (`true` por omisión).
+- `gafete_usuario` / `agente_validador`: el gafete del perfil Usuario y el compañero que el validador tenía puesto (cada perfil, el suyo).
+- `carpeta_compartida`: carpeta del equipo para *Trabajo en equipo* (apagado en la v3.2).
+- `tema`: `"claro"` u `"oscuro"`. `letra_grande`: filas y letra más grandes en las tablas (el perfil de usuario ya las usa).
+- `pedir_motivo`: al descartar o restaurar se pide el motivo para la bitácora (`true` por omisión).
 - `itop_url_template`: para otro servidor de iTop, p. ej. `https://servidor/pages/UI.php?operation=details&class={clase}&id={id}` (admite `{id}`, `{ref}`, `{clase}`). Vacío = servidor de FONACOT.
 - `ultimo_lote`: marca de la última renovación considerada (se actualiza al copiar el lote o crear el correo de hoy).
 - `dias_inhabiles` / `feriados_oficiales`: días inhábiles capturados en pantalla y si se suman los feriados oficiales.

@@ -7,6 +7,7 @@ como "Cancelación de crédito", "Apoyo", "Eventual", "Análisis | cancelación 
 y desglosa 1 Ticket -> N Filas de Renovación individuales (Cliente + Crédito Renovado/Hijo + Crédito Origen/Padre).
 """
 
+import json
 import os
 import re
 import sys
@@ -50,8 +51,15 @@ def _expand_abbr_match(m: re.Match) -> str:
         # Folios tipo R-012345 (UserRequest de iTop) u otros con ceros a la izquierda: no son clientes ni créditos
         return m.group(0)
     n = len(num)
+    if lbl in ('tr', 'cta'):
+        # «tr. 202610» (fecha), «cta 12345678» (cuenta bancaria): solo con el largo de un número de cliente
+        return f"Cliente: {num}" if n == MIN_DIGITOS_CLIENTE_AMBIGUO else m.group(0)
     if lbl in _ABBR_CLIENTE:
         return f"Cliente: {num}" if 5 <= n <= 8 else m.group(0)
+    if lbl == 'r' and n == 6 and '-' in m.group(0) and re.search(
+            r'\b(caso|folio|ticket|reporte|incidente|solicitud|relacionad[oa]|ver|del|con)\W*$',
+            m.string[max(0, m.start() - 25):m.start()], re.I):
+        return m.group(0)  # «relacionado con R-123456»: folio de iTop (UserRequest), no un crédito
     if lbl in _ABBR_CREDITO:
         return f"Credito: {num}" if n <= 7 else m.group(0)
     if lbl in _ABBR_PADRE:
@@ -69,6 +77,28 @@ def expand_abbreviated_labels(text: str) -> str:
     if not text:
         return ""
     return _ABBR_RE.sub(_expand_abbr_match, text)
+
+
+def unir_numeros_separados(text: str) -> str:
+    """
+    «Cliente: 4 919 283», «4919-283», «4,919,283» -> «Cliente: 4919283» (si quedan 7 u 8 dígitos) y «crédito 71.470» ->
+    «crédito 71470» (si quedan 5 o 6). Solo justo después de la etiqueta y sin «, » (coma y espacio), para no juntar
+    listas como «45375,45377» o «45375, 45377».
+    """
+    if not text:
+        return ""
+
+    def cliente(m):
+        num = re.sub(r'\D', '', m.group(2))
+        return m.group(1) + num if 7 <= len(num) <= 8 else m.group(0)
+
+    def credito(m):
+        num = m.group(2) + m.group(3)
+        return m.group(1) + num if 5 <= len(num) <= 6 else m.group(0)
+
+    text = re.sub(r'(\bclient[ea][^\S\n]*[:#\.]?[^\S\n]*)(\d{1,4}(?:(?:[ \.\-]|,(?! ))\d{3}){1,2})(?![\d,\.\-]?\d)',
+                  cliente, text, flags=re.I)
+    return re.sub(r'(\bcr[ée]dito[^\S\n]*[:#\.]?[^\S\n]*)(\d{2,3})[\.,](\d{3})(?![\d,\.]?\d)', credito, text, flags=re.I)
 
 
 def strip_letter_prefixes(text: str) -> str:
@@ -128,6 +158,19 @@ def build_itop_search_url(ticket: str) -> str:
     return f"{ITOP_BASE_URL}?operation=full_text&text={quote(str(ticket).strip().upper())}"
 
 
+def guardar_json(ruta: str, datos, **opciones):
+    """
+    Guarda JSON sin dejar el archivo a medias si se corta la luz o se cierra la app mientras escribe: primero a un
+    temporal y luego lo reemplaza de un jalón. Lanza OSError si no se puede.
+    """
+    temporal = f"{ruta}.tmp"
+    with open(temporal, "w", encoding="utf-8") as f:
+        json.dump(datos, f, **opciones)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporal, ruta)
+
+
 def get_app_dir() -> str:
     """Devuelve la carpeta base donde corre el ejecutable o el script."""
     if getattr(sys, 'frozen', False):
@@ -146,6 +189,17 @@ def normalize_text(text: str) -> str:
     )
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
+
+
+def es_mesa_credito(resumen: str, descripcion: str) -> bool:
+    """
+    Correo de la Mesa de Crédito («…asignar los siguientes registros de renovación al grupo de la Mesa de Crédito para
+    revisión y concentración, a fin de dar seguimiento a la cancelación en CREDERE»): manda renovaciones de otros días
+    que sí se cancelan, siempre que no les haya tocado la emisión ni el cierre de mes.
+    """
+    texto = normalize_text(f"{resumen} {descripcion}")
+    return (('mesa de credito' in texto and ('credere' in texto or 'concentracion' in texto))
+            or 'seguimiento a la cancelacion en credere' in texto)
 
 
 class RenovacionTicketParser:
@@ -219,6 +273,45 @@ class RenovacionTicketParser:
 
         return False, "", "", ""
 
+    _BLOQUES_HTML = {'p', 'div', 'tr', 'li', 'ul', 'ol', 'pre', 'table', 'tbody', 'thead', 'blockquote', 'section',
+                     'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr'}
+
+    @staticmethod
+    def _texto_html(nodo) -> str:
+        """
+        Texto de un bloque HTML como se ve en pantalla: salto de renglón solo en bloques (<br>, <p>, <div>, <tr>, <li>…)
+        y tabulador entre celdas. Las etiquetas en línea (<span>, <b>, <font>) no parten el renglón: «crédito
+        <span>71470</span> y <span>71471</span>» queda en uno solo. Dentro de <pre> se respetan los saltos.
+        """
+        from bs4 import Comment, NavigableString
+        partes = []
+
+        def recorrer(tag, en_pre):
+            for hijo in tag.children:
+                if isinstance(hijo, Comment):
+                    continue
+                if isinstance(hijo, NavigableString):
+                    partes.append(str(hijo) if en_pre else re.sub(r'\s+', ' ', str(hijo)))
+                    continue
+                nombre = (hijo.name or '').lower()
+                if nombre in ('script', 'style'):
+                    continue
+                if nombre == 'br':
+                    partes.append('\n')
+                    continue
+                bloque = nombre in RenovacionTicketParser._BLOQUES_HTML
+                if bloque:
+                    partes.append('\n')
+                recorrer(hijo, en_pre or nombre == 'pre')
+                if nombre in ('td', 'th'):
+                    partes.append('\t')
+                elif bloque:
+                    partes.append('\n')
+
+        recorrer(nodo, getattr(nodo, 'name', '') == 'pre')
+        lineas = (re.sub(r'[^\S\n\t]+', ' ', l).strip(' \t') for l in ''.join(partes).split('\n'))
+        return '\n'.join(re.sub(r' ?\t ?', '\t', l) for l in lineas if l)
+
     @staticmethod
     def parse_itop_base_fields(html_body: str, plain_body: str) -> dict:
         """Extrae los campos de la tabla principal de iTop y conserva las tablas HTML internas de la Descripción."""
@@ -239,6 +332,7 @@ class RenovacionTicketParser:
                 soup = make_soup(html_body)
                 for tag in soup(['script', 'style']):
                     tag.decompose()
+                desc_td = None
 
                 for tr in soup.find_all('tr'):
                     tds = tr.find_all('td', recursive=False)
@@ -265,12 +359,15 @@ class RenovacionTicketParser:
                             result['estado'] = val_txt.strip()
                         elif 'categoria' in key_txt:
                             result['categoria'] = val_txt.strip()
+                        elif key_txt == 'descripcion' and desc_td is None:
+                            desc_td = tds[1]
 
-                # Extraer Descripción e inspeccionar tablas anidadas dentro de <pre> o <div class="HTML">
+                # Extraer Descripción e inspeccionar sus tablas: toda la celda de «Descripción» (lxml saca la tabla de un
+                # <pre>, así que no basta con buscar dentro del <pre>) o, sin esa celda, el último <pre>
                 pre_tags = soup.find_all('pre')
-                if pre_tags:
-                    desc_container = pre_tags[-1]
-                    result['descripcion_texto'] = desc_container.get_text("\n", strip=True)
+                desc_container = desc_td if desc_td is not None else (pre_tags[-1] if pre_tags else None)
+                if desc_container is not None:
+                    result['descripcion_texto'] = RenovacionTicketParser._texto_html(desc_container)
                     for tbl in desc_container.find_all('table'):
                         rows_data = []
                         for r in tbl.find_all('tr'):
@@ -281,7 +378,7 @@ class RenovacionTicketParser:
                         if rows_data:
                             result['inner_tables'].append(rows_data)
                 else:
-                    full_txt = soup.get_text("\n", strip=True)
+                    full_txt = RenovacionTicketParser._texto_html(soup)
                     if 'Descripción' in full_txt:
                         result['descripcion_texto'] = full_txt.split('Descripción', 1)[-1].strip()
                     else:
@@ -343,13 +440,14 @@ class RenovacionTicketParser:
         has_renewal_word = bool(re.search(
             r'\b(renov\w*|reno|ren)\b|credito\s+padre|credito\s+hijo|credito\s+original|credito\s+anterior|antes\s+de\s+renovar|operacion\s*\(\s*origen\s*\)',
             combined
-        ))
+        )) or bool(cls._RENOVACION_MAL_ESCRITA.search(combined))
         has_cancel_word = bool(re.search(
             r'\b(canc\w*|reversa\w*|sin\s+efecto|baja)\b',
             combined
         ))
         has_capacity_reason = bool(re.search(
-            r'(no\s+libero\s+(disponible|capacidad|credito)|no\s+dio\s+disponible|no\s+da\s+disponible|bajo\s+(su\s+|la\s+|el\s+)?(capacidad|nivel)|topado\s+por\s+buro|capacidad\s+(de\s+cuota\s+|de\s+credito\s+)?agotada|plazo\s+menor\s+en\s+la\s+app)',
+            r'(no\s+(le\s+)?(libero|dio|dieron|otorgo|deposito|alcanzo)\s+(el\s+|la\s+|lo\s+)?(capital|monto|dinero|cantidad|importe|que\s+(el\s+|ella\s+)?(requeria|necesitaba|pedia|esperaba|solicito))|'
+            r'no\s+libero\s+(disponible|capacidad|credito)|no\s+dio\s+disponible|no\s+da\s+disponible|bajo\s+(su\s+|la\s+|el\s+)?(capacidad|nivel)|topado\s+por\s+buro|capacidad\s+(de\s+cuota\s+|de\s+credito\s+)?agotada|plazo\s+menor\s+en\s+la\s+app)',
             combined
         ))
 
@@ -363,6 +461,20 @@ class RenovacionTicketParser:
             return True, subtipo, motivo
 
         return False, "", ""
+
+    # «RENOMVACION», «RENOBACION», «RENOVASION», «RENVACION»: ren + hasta 3 letras + v/b + …ción/sión
+    _RENOVACION_MAL_ESCRITA = re.compile(r'\bre+n+[a-z]{0,3}[vb][a-z]{0,2}(?:ci|si|s)[a-z]*\b')
+
+    @classmethod
+    def pide_cancelacion(cls, resumen: str, descripcion: str) -> bool:
+        """
+        El correo pide cancelar o reversar algo aunque no diga «renovación» ni traiga números (asunto «APOYO» y el
+        estado de cuenta en PDF o una captura adjunta): vale la pena revisar sus adjuntos.
+        """
+        combined = normalize_text(f"{resumen} {descripcion}")
+        if re.search(r'dice.{0,40}debe\s+decir|correccion\s+de\s+(domicilio|nombre|datos)|reimpresion', combined):
+            return False
+        return bool(re.search(r'\b(cancel\w*|canc|reversa\w*|revertir|sin\s+efecto)\b', combined))
 
     @staticmethod
     def _extract_motivo(raw_desc: str, norm_combined: str) -> str:
@@ -379,6 +491,8 @@ class RenovacionTicketParser:
             if mot and not mot.lower().startswith('intermitencia / error de cuenta / cambio'):
                 return mot[:85]
 
+        if re.search(r'no\s+(le\s+)?(libero|dio|dieron|otorgo|deposito|alcanzo)\s+(el\s+|lo\s+)?(capital|monto|dinero|que)', norm_combined):
+            return "No le liberó el capital que requería"
         if 'buro' in norm_combined or '10%' in norm_combined or '15%' in norm_combined or 'disponible' in norm_combined or 'capacidad' in norm_combined:
             return "Sin disponible / Topado por Buró / Bajó capacidad"
         if 'app' in norm_combined or 'plazo menor' in norm_combined:
@@ -426,14 +540,34 @@ class RenovacionTicketParser:
         return cleaned
 
     @classmethod
-    def _is_valid_number_token(cls, num_str: str, min_len: int = 3, max_len: int = 10) -> bool:
+    def _is_valid_number_token(cls, num_str: str, min_len: int = 3, max_len: int = 10, etiquetado: bool = False) -> bool:
+        """`etiquetado`: viene justo después de una etiqueta de crédito («crédito 452»): no se descarta aunque coincida
+        con un número de la plantilla (452 de Insurgentes Sur, 2026…)."""
         if not num_str or not num_str.isdigit():
             return False
         if not (min_len <= len(num_str) <= max_len):
             return False
-        if num_str in cls.IGNORED_NUMBERS:
+        if num_str in cls.IGNORED_NUMBERS and not etiquetado:
             return False
         return True
+
+    @staticmethod
+    def _normalizar_listas(texto: str) -> str:
+        """
+        Listas de créditos escritas de otra forma, para que las lean los patrones de siempre:
+        - viñetas y numeración al inicio del renglón («- 71470», «• 71470», «1. 71470», «2) 71471») se quitan;
+        - créditos en columna (un número de 3 a 6 dígitos por renglón) se juntan en un renglón: «71470, 71471, 71472».
+        """
+        texto = re.sub(r'(?m)^[^\S\n]*(?:[-•*·▪●◦]|\d{1,2}[.)])[^\S\n]+(?=\d{3,6}\b)', '', texto)
+        lineas, salida = texto.split('\n'), []
+        for linea in lineas:
+            solo = re.fullmatch(r'[^\S\n]*(\d{3,6})[^\S\n]*[,;]?[^\S\n]*', linea)
+            previa = salida[-1] if salida else ''
+            if solo and re.fullmatch(r'[^\S\n]*\d{3,6}(?:,[^\S\n]*\d{3,6})*[^\S\n]*[,;]?[^\S\n]*', previa):
+                salida[-1] = previa.strip().rstrip(',;') + ', ' + solo.group(1)
+            else:
+                salida.append(linea)
+        return '\n'.join(salida)
 
     @classmethod
     def _extract_crede_table_records(cls, inner_tables: list, plain_desc: str) -> list:
@@ -535,6 +669,11 @@ class RenovacionTicketParser:
         encontrados = []
         anterior = ''
         for linea in normalizar_correo(texto).splitlines():
+            if re.match(r'\s*(atte\b|atentamente|saludos|cordialmente|quedo\s+a\s+sus\s+[oó]rdenes)', linea, re.I):
+                break  # Lo que sigue es la firma: «Maria Fernanda Ruiz 123456» no es un trabajador
+            if re.match(r'\s*(centro\s+de\s+trabajo|empresa|patr[oó]n|raz[oó]n\s+social)\b', linea, re.I):
+                anterior = linea
+                continue
             # «PEREZ DIAZ CARLOS ERNESTO» y en el renglón de abajo solo «3326312»
             if re.fullmatch(r'\s*\d{6,8}\s*', linea) and cls._es_renglon_de_nombre(anterior):
                 encontrados.append(linea.strip())
@@ -614,6 +753,78 @@ class RenovacionTicketParser:
             return []
         return [(b['cliente'], b['creditos']) for b in bloques]
 
+    # Antes de «crédito» en el mismo renglón: la etiqueta no es del crédito a cancelar («Analista de Crédito», «folio de
+    # solicitud de crédito», «capacidad de crédito», «Depto. de créditos»)
+    _NO_ES_CREDITO = re.compile(
+        r'\b(analista|ejecutiv[oa]s?|capacidad|folio|depto|departamento|[áa]rea|gerencia|gerente|jef[ea]|'
+        r'coordinaci[óo]n|direcci[óo]n|subdirecci[óo]n|monto|importe|saldo|l[íi]mite)\b', re.I)
+
+    @staticmethod
+    def _tabla_en_texto(texto: str) -> list:
+        """
+        [(cliente, crédito)] de una tabla escrita como texto, con el encabezado en un renglón y una fila por renglón
+        (separada por espacios o tabuladores): «CLIENTE CREDITO / 4919283 71470 / 5864479 56572»; o aplanada, con una
+        celda por renglón: «Cliente / Crédito / 4919283 / 71470 / 5864479 / 56572».
+        """
+        def es_cli(h):
+            return bool(re.search(r'client|trabajador|cuenta', normalize_text(h)))
+
+        def es_cred(h):
+            return bool(re.search(r'credito|renovaci|renovado', normalize_text(h))) and not re.search(
+                r'origen|anterior|original|padre|cancel', normalize_text(h))
+
+        def celdas(linea):
+            partes = re.split(r'\t|[^\S\n]{2,}', linea.strip())
+            return partes if len(partes) > 1 else linea.split()
+
+        lineas = [l for l in texto.split('\n')]
+        pares = []
+        i = 0
+        while i < len(lineas):
+            linea = lineas[i]
+            if re.search(r'\d', linea) or not linea.strip():
+                i += 1
+                continue
+            # Encabezado en un renglón («CLIENTE CREDITO SOLICITUD FECHA GAFETE») o una celda por renglón
+            enc = celdas(linea)
+            aplanada = False
+            if not (any(es_cli(h) for h in enc) and any(es_cred(h) for h in enc)) or len(enc) > 8:
+                # Aplanada: cada renglón es el nombre de UNA columna
+                enc, j = [], i
+                while j < len(lineas) and len(enc) < 8:
+                    h = lineas[j].strip()
+                    if (not h or re.search(r'\d', h) or len(h.split()) > 3 or (es_cli(h) and es_cred(h))
+                            or not (es_cli(h) or es_cred(h) or re.search(
+                                r'solicitud|fecha|gafete|sucursal|folio|origen|anterior|nombre', normalize_text(h)))):
+                        break
+                    enc.append(h)
+                    j += 1
+                if not (any(es_cli(h) for h in enc) and any(es_cred(h) for h in enc)) or len(enc) < 2:
+                    i += 1
+                    continue
+                aplanada, i = True, j - 1
+            ci = next(k for k, h in enumerate(enc) if es_cli(h))
+            ri = next(k for k, h in enumerate(enc) if es_cred(h) and k != ci)
+            datos = []
+            j = i + 1
+            while j < len(lineas) and re.search(r'\d', lineas[j]) and not re.search(r'[A-Za-zÁÉÍÓÚáéíóúñÑ]{4,}', lineas[j]):
+                datos.append(lineas[j])
+                j += 1
+            filas = ([datos[k:k + len(enc)] for k in range(0, len(datos), len(enc))] if aplanada
+                     else [celdas(d) for d in datos])
+            for fila in filas:
+                fila = [c.strip() for c in fila]
+                if len(fila) == len(enc):
+                    cli, cred = fila[ci], fila[ri]
+                else:  # columnas que no cuadran: el primer número de cliente y el primer crédito después de él
+                    nums = re.findall(r'\b\d{3,10}\b', ' '.join(fila))
+                    cli = next((n for n in nums if 6 <= len(n) <= 10), '')
+                    cred = next((n for n in nums[nums.index(cli) + 1:] if 3 <= len(n) <= 7), '') if cli else ''
+                if re.fullmatch(r'\d{6,10}', cli) and re.fullmatch(r'\d{3,7}', cred):
+                    pares.append((cli, cred))
+            i = j
+        return pares
+
     @classmethod
     def extract_disaggregated_renewals(cls, resumen: str, descripcion: str, inner_tables: list) -> list:
         """
@@ -640,7 +851,16 @@ class RenovacionTicketParser:
         clean_desc = cls._clean_user_text_for_extraction(descripcion)
         # Traducir abreviaturas ("C5864479", "Cte. 3386153", "R 91258") a etiquetas completas antes de aplicar los patrones
         resumen_exp = expand_abbreviated_labels(resumen or '')
-        full_context = f"{resumen_exp}\n{expand_abbreviated_labels(clean_desc or '')}"
+        full_context = cls._normalizar_listas(unir_numeros_separados(
+            f"{resumen_exp}\n{expand_abbreviated_labels(clean_desc or '')}"))
+
+        # Tabla escrita como texto («CLIENTE CREDITO» y abajo un renglón por fila): todas sus filas, no solo la primera
+        filas_tabla = cls._tabla_en_texto(full_context)
+        if len(filas_tabla) > 1:
+            return [{'cliente': cli, 'credito_renovado': cred, 'credito_padre': '', 'sucursal': '', 'fecha_op': '',
+                     'origen_extraccion': 'Tabla Sucursal (Texto)',
+                     'clientes_ticket': list(dict.fromkeys(c for c, _ in filas_tabla))}
+                    for cli, cred in filas_tabla]
 
         # Sin etiquetas: «NOMBRE DEL TRABAJADOR / número de cliente / créditos», uno o varios trabajadores
         bloques = cls._bloques_por_nombre(full_context)
@@ -666,7 +886,12 @@ class RenovacionTicketParser:
         padre_patterns = [
             r'(?:cr[ée]dito\s+(?:anterior|original|de\s+origen|origen|padre)|antes\s+de\s+renovar|operaci[óo]n\s*\(\s*origen\s*\))\s*[:\.\-\(]*\s*([\d,\s yY\-]+)',
             r'cancelar\s+la\s+renovaci[óo]n\s+del\s+cr[ée]dito\s+(\d{3,7})\s+con\s+no\.?\s+de\s+pagar[ée]',
-            r'\b(\d{4,7})\s+\d{2,3}\s+se\s+renov[óo]\s+al\s+\d{4,7}\b'
+            r'\b(\d{4,7})\s+\d{2,3}\s+se\s+renov[óo]\s+al\s+\d{4,7}\b',
+            # «el crédito 65000 se renovó al / con el (crédito) / en el 71470», «la renovación 71470 del crédito 65000»
+            r'cr[ée]dito\s+(\d{3,7})\s+se\s+renov[óo]\s+(?:al|con\s+el(?:\s+cr[ée]dito)?|en\s+el)\b',
+            r'renovaci[óo]n\s+\d{3,7}\s+del\s+cr[ée]dito\s+(\d{3,7})',
+            # «65000 -> 71470»: a la izquierda el padre (si a la izquierda hay un cliente de 7 u 8 dígitos, no aplica)
+            r'(?<!\d)(\d{3,6})[^\S\n]*(?:->|→|=>)[^\S\n]*\d{3,6}(?!\d)',
         ]
         for pat in padre_patterns:
             for m in re.finditer(pat, full_context, re.I):
@@ -696,13 +921,21 @@ class RenovacionTicketParser:
             r'(?P<nom>(?:(?-i:[A-ZÁÉÍÓÚÑ]{2,20})[^\S\n]+){0,4})[#:\.]?[^\S\n]*(?P<num>\d{5,10})\b',
             r'\bT\s*[\-\.]\s*(\d{5,10})\b',
             r'/\s*T\s+(\d{5,10})\b',
-            r'[\+\-]\s*(\d{6,10})\s*[\+\-]\s*\d{4,7}\b',
+            r'[\+\-][^\S\n]*(\d{6,10})[^\S\n]*[\+\-][^\S\n]*\d{4,7}\b',
             r'\b(?:cancelaci[óo]n\s+(?:de\s+)?renovaci(?:[óo]n|ones)|cancelaci[óo]n\s+(?:de\s+)?cr[ée]dito)\s*[\+\-:]?\s*(\d{6,10})\b',
             r'\bid\s+(\d{6,8})\s+cr[ée]dito\s+\d{4,7}\b'
         ]
         for pat in cliente_patterns:
-            for m in re.finditer(pat, full_context, re.I):
+            patron, pos = re.compile(pat, re.I), 0
+            while True:
+                m = patron.search(full_context, pos)
+                if not m:
+                    break
+                pos = m.end()
                 if m.groupdict().get('nom') and any(cls._NO_NOMBRE.match(w.strip('.:#')) for w in m.group('nom').split()):
+                    # «…CRÉDITO DEL CLIENTE\nCLIENTE 7988789»: la etiqueta repetida no es un nombre, pero la segunda
+                    # sí trae el número: se vuelve a buscar desde ahí (si no, la primera se la «comía»)
+                    pos = m.start() + 1
                     continue
                 c_num = (m.groupdict().get('num') or m.group(1)).strip()
                 # Excluir NSS (11 dígitos) y números de solicitud (empiezan con 507 o 508 de 9 dígitos)
@@ -735,15 +968,21 @@ class RenovacionTicketParser:
         multi_credit_label_patterns = [
             r'(?:n[úu]mero|num\.?|no\.?)\s+de\s+cr[ée]ditos?\s*(?:[\(/]\s*renovaci(?:[óo]n|ones)\s*\)?)?\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             r'(?:n[úu]mero|num\.?|no\.?)\s+de\s+renovaci(?:[óo]n|ones)(?:\s+nueva)?\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
-            r'(?:n[úu]mero|num\.?|no\.?)\s+de(?:l)?\s+(?:cr[ée]dito|pagar[ée])\s+a\s+cancelar\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
+            # «No. de crédito a cancelar», «Crédito a cancelar: 71470», «Renovación a cancelar 71470», «crédito renovado a cancelar»
+            r'(?:(?:n[úu]mero|num\.?|no\.?)\s+de(?:l)?\s+)?(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|pagar[ée]s?)(?:\s+renovad[oa]s?)?\s+a\s+cancelar\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             r'(?:ya\s+renovado|cr[ée]dito\s+nuevo|cr[ée]dito\s+renovado|cr[ée]dito\s+hijo|pagar[ée])\s*[:\.\-\(]*\s*([C\-\d,\s yY]{3,35})',
-            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|y|Y|\-|\+)\s*[C\-\d]+)+)',
+            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|;|/|y|Y|e|E|\-|\+)\s*[C\-\d]+)+)',
             r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?[C\-]?[^\S\n]*(\d{3,7})\b',
-            r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b'
+            r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b',
+            # «65000 -> 71470» (el padre ya se tomó) y «Cliente 4919283 -> 71470»
+            r'\d{3,8}[^\S\n]*(?:->|→|=>)[^\S\n]*(\d{3,6})(?!\d)',
         ]
 
         for pat in multi_credit_label_patterns:
             for m in re.finditer(pat, full_context, re.I):
+                # «folio de solicitud de crédito: 123456», «capacidad de crédito 15000»: la etiqueta es de otra cosa
+                if cls._NO_ES_CREDITO.search(full_context[full_context.rfind('\n', 0, m.start()) + 1:m.start()]):
+                    continue
                 chunk = m.group(1)
                 # Cortar el chunk si empieza otra etiqueta ("Motivo", "Gafete", "Cliente", "Trabajador", "Fecha", "Sucursal")
                 chunk = re.split(
@@ -752,17 +991,33 @@ class RenovacionTicketParser:
                     flags=re.I
                 )[0]
                 for token in re.findall(r'\b\d{3,7}\b', chunk):
-                    if not cls._is_valid_number_token(token, 3, 7):
+                    if not cls._is_valid_number_token(token, 3, 7, etiquetado=True):
                         continue
                     if token in clientes_found or token in creditos_padre_found:
                         continue
                     if token not in creditos_renovados_found:
                         creditos_renovados_found.append(token)
 
+        # Último recurso, solo si no se encontró ningún crédito: la etiqueta cierra el renglón y abajo solo vienen los
+        # créditos («renovaciones de crédito\n45375, 45377,45380,»). De 3 a 6 dígitos (un número de cliente solo no
+        # cuenta) y no si el renglón es de otra cosa («Analista de Crédito\n2609», «capacidad de crédito\n15000»).
+        if not creditos_renovados_found:
+            for m in re.finditer(
+                    r'^([^\n]*\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)))[^\S\n]*[:#\.]?[^\S\n]*\n[^\S\n]*'
+                    r'((?:\d{3,6}[^\S\n]*(?:,|y|Y|\-)[^\S\n]*)*\d{3,6})[^\S\n]*[,\.]?[^\S\n]*(?=\n|$)',
+                    full_context, re.I | re.M):
+                if cls._NO_ES_CREDITO.search(m.group(1)) or re.search(r'\b(sistema|sucursal|oficina)\b', m.group(1), re.I):
+                    continue
+                for token in re.findall(r'\b\d{3,6}\b', m.group(2)):
+                    if (cls._is_valid_number_token(token, 3, 6) and token not in clientes_found
+                            and token not in creditos_padre_found and token not in creditos_renovados_found):
+                        creditos_renovados_found.append(token)
+
         # Patrón Cliente + Crédito con signos: "+ 7239770+50074", "-8220974-60117", "+ 2431191 + 20757 + 20758",
         # o con asterisco: "Cancelación de crédito 1184282*10430", "1184282 * 10430 * 10431"
         for pat_par in (
-            r'[\+\-]\s*(\d{5,10})\s*[\+\-]\s*(\d{3,7})\b(?:\s*(?:[\+\-,]|y)\s*(\d{3,7})\b)?',
+            # Sin cruzar renglones: «Cliente 4919283\n- 71470\n- 71471» son viñetas, no «-cliente-crédito»
+            r'[\+\-][^\S\n]*(\d{6,10})[^\S\n]*[\+\-][^\S\n]*(\d{3,7})\b(?:[^\S\n]*(?:[\+\-,]|y)[^\S\n]*(\d{3,7})\b)?',
             r'\b(\d{5,10})\s*\*\s*(\d{3,7})\b(?:\s*(?:[\*,]|y)\s*(\d{3,7})\b)?',
         ):
             for m_plus in re.finditer(pat_par, full_context, re.I):
@@ -780,7 +1035,8 @@ class RenovacionTicketParser:
         if not clientes_found or not creditos_renovados_found:
             res_nums = [
                 n for n in re.findall(r'\b\d{4,10}\b', strip_letter_prefixes(re.sub(
-                    r'\b[IR]-\d+|\b(?:agente|gafete|ticket|incidente)\s*[:#]?\s*\d+', ' ', resumen or '', flags=re.I)))
+                    r'\b[IR]-\d+|\b(?:agente|gafete|gaf|empleado|ticket|incidente)\s*[:#\.]?\s*\d+', ' ', resumen or '',
+                    flags=re.I)))
                 if cls._is_valid_number_token(n, 4, 10) and not (len(n) == 9 and n.startswith(('507', '508')))
             ]
             for n in res_nums:
@@ -858,9 +1114,15 @@ class RenovacionTicketParser:
                 for idx, r_cred in enumerate(creditos_renovados_found):
                     m_cpos = re.search(rf'\b{re.escape(r_cred)}\b', full_context)
                     cpos = m_cpos.start() if m_cpos else 0
-                    # Buscar el cliente inmediato anterior (o el primero si el crédito apareció antes en el resumen)
+                    # Si en el renglón del crédito hay un solo cliente, es el suyo («Crédito 56572 del cliente 5864479»);
+                    # si no, el cliente inmediato anterior (o el primero si el crédito apareció antes en el resumen)
+                    ini = full_context.rfind('\n', 0, cpos) + 1
+                    fin = full_context.find('\n', cpos)
+                    renglon = full_context[ini:fin if fin >= 0 else len(full_context)]
+                    del_renglon = [c for c in dict.fromkeys(clientes_found) if re.search(rf'(?<!\d){re.escape(c)}(?!\d)', renglon)]
                     preceding = [c_str for p_pos, c_str in cli_positions if p_pos <= cpos]
-                    assigned_cli = preceding[-1] if preceding else cli_positions[0][1]
+                    assigned_cli = (del_renglon[0] if len(del_renglon) == 1
+                                    else preceding[-1] if preceding else cli_positions[0][1])
                     pad_str = creditos_padre_found[idx] if idx < len(creditos_padre_found) else ""
                     disaggregated.append({
                         'cliente': assigned_cli,
@@ -920,6 +1182,33 @@ class RenovacionTicketParser:
             'origen_extraccion': 'Datos Incompletos'
         }]
 
+    # Antes de un número de 7 dígitos que no es de cliente (teléfono, folio, nómina…)
+    _NO_ES_CLIENTE = re.compile(
+        r'(?:tel[ée]?f?o?n?o?|cel(?:ular)?|ext(?:ensi[óo]n)?|folio|caso|ticket|incidente|n[óo]mina|empleado|gafete|trabajo|empresa|patr[óo]n|social)'
+        r'\b[^\n]{0,20}$', re.I)
+
+    @classmethod
+    def clientes_sin_leer(cls, texto: str, items: list) -> list:
+        """
+        Red de seguridad: números de 7 dígitos (como los de cliente) que trae el correo y no quedaron como cliente ni
+        crédito de ninguna renovación. Si hay, quizá falta una renovación; no cambia lo leído, solo se avisa.
+        """
+        leidos = set()
+        for i in items:
+            leidos.update(first_digits(x) for x in
+                          [i.get('cliente'), i.get('credito_renovado'), i.get('credito_padre')]
+                          + list(i.get('clientes_ticket') or []))
+        texto = unir_numeros_separados(texto or '')
+        faltan = []
+        for m in re.finditer(r'(?<![\d.,/-])\d{7}(?![\d]|[.,/-]\d)', texto):
+            num = m.group(0)
+            if num.lstrip('0') in leidos or num in faltan:
+                continue
+            if cls._NO_ES_CLIENTE.search(texto[max(0, m.start() - 30):m.start()]):
+                continue
+            faltan.append(num)
+        return faltan
+
     @classmethod
     def parse_and_disaggregate_email(
         cls,
@@ -930,12 +1219,14 @@ class RenovacionTicketParser:
         ticket_num: str,
         gafete: str,
         nombre_asignado: str,
-        carpeta_origen: str = "Bandeja de entrada"
+        carpeta_origen: str = "Bandeja de entrada",
+        por_adjunto: bool = False
     ) -> list:
         """
         Analiza un correo de asignación de iTop. Si es de Cancelación/Reversa de Renovación,
         devuelve la lista de filas desglosadas (1 fila por cada renovación individual).
         Si NO es de Cancelación de Renovación, devuelve una lista vacía [].
+        `por_adjunto`: el correo pide cancelar sin decir qué (asunto «APOYO») y su adjunto dirá si es renovación.
         """
         base = cls.parse_itop_base_fields(html_body, plain_body)
         resumen = base['resumen'] or subject
@@ -943,11 +1234,27 @@ class RenovacionTicketParser:
         inner_tables = base['inner_tables']
 
         is_ren_cancel, subtipo, motivo = cls.classify_renewal_ticket(resumen, descripcion, inner_tables)
+        if not is_ren_cancel and por_adjunto and cls.pide_cancelacion(resumen, descripcion):
+            is_ren_cancel, subtipo = True, "Cancelación (según el adjunto)"
+            motivo = cls._extract_motivo(descripcion, normalize_text(f"{resumen} {descripcion}"))
         if not is_ren_cancel:
             return []
 
         items = cls.extract_disaggregated_renewals(resumen, descripcion, inner_tables)
+
+        def completos(lista):
+            return sum(1 for i in lista if i.get('cliente') != 'SIN CLIENTE' and i.get('credito_renovado') != 'SIN CRÉDITO')
+
+        if html_body and plain_body and completos(items) < len(items) and re.search(r'\d{3}', plain_body):
+            # El HTML no trajo el cliente o el crédito: se intenta con el texto plano del mismo correo
+            texto = normalizar_correo(plain_body)
+            texto = texto.split('Descripción', 1)[-1] if 'Descripción' in texto else texto
+            otros = cls.extract_disaggregated_renewals(resumen, texto, [])
+            if completos(otros) > completos(items):
+                items, descripcion = otros, texto
         total_in_ticket = len(items)
+        sin_leer = cls.clientes_sin_leer(f"{resumen}\n{descripcion}", items)
+        mesa = es_mesa_credito(resumen, descripcion)
 
         rows = []
         for idx, item in enumerate(items, 1):
@@ -991,7 +1298,9 @@ class RenovacionTicketParser:
                 'Credito_Renovado_Hijo': cred_ren,
                 'Credito_Origen_Padre': cred_pad or "-",
                 'Clientes_Ticket': list(item.get('clientes_ticket') or []),
+                'Clientes_Sin_Leer': sin_leer,
                 'Subtipo_Renovacion': subtipo,
+                'Mesa_Credito': mesa,
                 'Motivo': motivo,
                 'Sucursal': item.get('sucursal', '') or base['localidad'][:35],
                 'Fecha_Operacion': item.get('fecha_op', ''),
@@ -1024,12 +1333,13 @@ def completar_con_imagenes(rows: list, lecturas: list) -> list:
     for lec in lecturas:
         par = (first_digits(lec.get('cliente') or ''), first_digits(lec.get('credito') or ''))
         if any(par) and par not in [p[:2] for p in pares]:
-            pares.append((par[0], par[1], lec.get('imagen') or 'imagen', bool(lec.get('dudosa'))))
+            fuente = lec.get('fuente') or f"de la imagen «{lec.get('imagen') or 'imagen'}»"
+            pares.append((par[0], par[1], fuente, bool(lec.get('dudosa'))))
     if not pares or not any(r.get('Datos_Incompletos') for r in rows):
         return rows
 
     def llenar(r, par):
-        pc, pr, imagen, dudosa = par
+        pc, pr, fuente, dudosa = par
         leido = []
         if r['Numero_Cliente'] == "SIN CLIENTE" and pc:
             r['Numero_Cliente'] = pc
@@ -1038,7 +1348,7 @@ def completar_con_imagenes(rows: list, lecturas: list) -> list:
             r['Credito_Renovado_Hijo'] = pr
             leido.append(f"Crédito {pr}")
         r['Datos_Incompletos'] = r['Numero_Cliente'] == "SIN CLIENTE" or r['Credito_Renovado_Hijo'] == "SIN CRÉDITO"
-        r['Dato_Imagen'] = f"{' y '.join(leido)} leído de la imagen «{imagen}»" + (" (lectura dudosa)" if dudosa else "")
+        r['Dato_Imagen'] = f"{' y '.join(leido)} leído {fuente}" + (" (lectura dudosa)" if dudosa else "")
         if r['Datos_Incompletos']:
             r['Alerta_Renovacion'] = f"🚨 FALTA DATO · {r['Dato_Imagen']}: revísalo"
             r['Nivel_Alerta'] = "incompleto"
@@ -1730,7 +2040,7 @@ def clasificar_lotes(
                 r['Dias_Retraso'] = (f_env - dia).days
                 poner(r, LOTE_ENVIADA,
                       f"📨 Enviada tarde en {asunto(conc)} del {f_env:%d/%m}; debía ir en el del {dia:%d/%m} "
-                      f"({r['Dias_Retraso']} día(s) después)",
+                      f"({r['Dias_Retraso']} {'día' if r['Dias_Retraso'] == 1 else 'días'} después)",
                       f"Enviada tarde {f_env:%d/%m}  ·  debía ir {dia:%d/%m}")
             else:
                 poner(r, LOTE_ENVIADA, f"📨 Ya enviada en {asunto(conc)} del {f_env:%d/%m}", f"Enviada {f_env:%d/%m}")
@@ -1747,7 +2057,7 @@ def clasificar_lotes(
                 motivo_ticket = (f"DATOS EQUIVOCADOS en el ticket único del {_fecha_concentrado(ticket_hit):%d/%m}: "
                                  f"{r['Error_Envio']}")
             else:
-                motivo_ticket = "el ticket está en el concentrado pero NO este Cliente+Crédito"
+                motivo_ticket = "el incidente viene en el ticket único pero NO este Cliente+Crédito"
                 if en_conc:
                     motivo_ticket += "; ahí viene " + ", ".join(f"Cliente {f['cliente']} Crédito {f['credito']}" for f in en_conc)
         equivocada = "datos equivocados  ·  " if r['Error_Envio'] else ""
@@ -1791,15 +2101,15 @@ def clasificar_lotes(
                 continue
             if motivo_ticket:
                 motivo, corto = motivo_ticket, ("datos equivocados en el ticket único" if r['Error_Envio']
-                                                else "otros datos en el concentrado")
+                                                else "otros datos en el ticket único")
             elif junto_al_envio:
-                motivo, corto = f"llegó mientras se enviaba el ticket único ({junto_al_envio:%H:%M})", "llegó junto al envío"
+                motivo, corto = f"llegó mientras se enviaba el ticket único de las {junto_al_envio:%H:%M}", "llegó junto al envío"
             elif not es_habil(llegada.date()):
                 motivo, corto = ("llegó en fin de semana" if llegada.weekday() >= 5 else "llegó en día inhábil"), "día inhábil"
             elif llegada.date() in cortes:
-                motivo, corto = f"llegó después del envío del ticket único ({cortes[llegada.date()]:%H:%M})", "después del envío"
+                motivo, corto = f"llegó después del envío del ticket único de las {cortes[llegada.date()]:%H:%M}", "después del envío"
             elif metodo == 'concentrado':
-                motivo, corto = "no está en el concentrado", "no se envió"
+                motivo, corto = "no viene en el ticket único", "no salió"
             elif metodo == 'marca':
                 motivo, corto = "después de la última marca", "después de la marca"
             else:
@@ -1815,12 +2125,12 @@ def clasificar_lotes(
                 f_c = cierre.get('fecha_dt')
                 cuando = f" el {f_c:%d/%m}" if f_c else ""
                 poner(r, LOTE_CERRADA_SIN_ENVIO,
-                      f"❌ NO SE ENVIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}) y el incidente ya se cerró{cuando}",
-                      f"NO ENVIADA ({dia:%d/%m})  ·  {equivocada}cerrado{cuando}")
+                      f"❌ NO SALIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}) y el incidente ya se cerró{cuando}",
+                      f"NO SALIÓ ({dia:%d/%m})  ·  {equivocada}cerrado{cuando}")
             else:
                 poner(r, LOTE_REZAGADA,
-                      f"❌ NO SE ENVIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}); se suma al lote {de_hoy}",
-                      f"NO ENVIADA ({dia:%d/%m})  ·  {equivocada}{va_hoy}")
+                      f"❌ NO SALIÓ: debía ir en el ticket único del {dia:%d/%m} ({motivo}); se suma al lote {de_hoy}",
+                      f"NO SALIÓ ({dia:%d/%m})  ·  {equivocada}{va_hoy}")
         elif dia == dia_anterior and metodo == 'marca':
             if llegada <= marca:
                 poner(r, LOTE_ENVIADA, f"📨 Enviada (antes de la marca {marca:%d/%m %H:%M})", "Enviada (marca local)")

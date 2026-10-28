@@ -255,7 +255,7 @@ class TestRevisionEnvios(unittest.TestCase):
         self.revisar(rows, [self.CONC_30()])
         self.assertEqual(rows[0]['Lote_Estado'], LOTE_REZAGADA)
         self.assertTrue(rows[0]['No_Enviada'])
-        self.assertEqual(rows[0]['Lote_Resumen'], "NO ENVIADA (30/09)  ·  va hoy")
+        self.assertEqual(rows[0]['Lote_Resumen'], "NO SALIÓ (30/09)  ·  va hoy")
 
     def test_lunes_enviada_el_martes_no_cuenta_como_faltante(self):
         rows = [fila("I-362001", "4530500", "91258", datetime(2026, 10, 19, 11, 0))]
@@ -470,7 +470,7 @@ class TestCorteReal(unittest.TestCase):
         conc = concentrado("Ticket único 22-10-2026", datetime(2026, 10, 22, 19, 10), "I-361001 5864479 56572")
         info = self.clasificar(rows, [conc])
         self.assertEqual([r['Lote_Estado'] for r in rows], [LOTE_ENVIADA, LOTE_REZAGADA])
-        self.assertIn("después del envío del ticket único (19:10)", rows[1]['Lote_Etiqueta'])
+        self.assertIn("después del envío del ticket único de las 19:10", rows[1]['Lote_Etiqueta'])
         self.assertEqual(info['corte_anterior'], datetime(2026, 10, 22, 19, 10))
 
     def test_ticket_de_ayer_salio_temprano(self):
