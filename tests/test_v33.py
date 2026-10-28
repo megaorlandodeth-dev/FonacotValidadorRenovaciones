@@ -43,5 +43,51 @@ class TestEtiquetaConParentesis(unittest.TestCase):
         self.assertEqual(leer("CLIENTE: 7438176\nCREDITO (57815)\ncancelar renovacion")[0][1], "57815")
 
 
+class TestConexionSinCryptography(unittest.TestCase):
+    """3.3.1: el .exe de la 3.3 no traía cryptography (DPY-3016): se usa el Oracle Client instalado."""
+
+    def test_dpy3016_usa_el_oracle_client(self):
+        import types
+        from unittest import mock
+        import sql_renovaciones as sql
+        llamadas = []
+
+        def connect(**kw):
+            llamadas.append("connect")
+            if len(llamadas) == 1:
+                raise Exception("DPY-3016: python-oracledb thin mode cannot be used because the cryptography "
+                                "package cannot be imported")
+            return types.SimpleNamespace()
+
+        falso = types.SimpleNamespace(connect=connect, makedsn=lambda h, p, service_name: f"{h}:{p}/{service_name}",
+                                      init_oracle_client=lambda lib_dir: llamadas.append(f"cliente {lib_dir}"),
+                                      __version__="3.4.2")
+        with mock.patch.dict(sys.modules, {"oracledb": falso}), \
+                mock.patch.object(sql, "_buscar_cliente_oracle", return_value=r"C:\oracle\bin"), \
+                mock.patch.object(sql, "_cliente_oracle_iniciado", False):
+            sql.conectar("scanfonacot.fonacot.gob.mx:1521/fonatop", "usuario", "clave")
+        self.assertEqual(llamadas, ["connect", r"cliente C:\oracle\bin", "connect"])
+
+    def test_autoprueba_detecta_que_falta(self):
+        import types
+        from unittest import mock
+        import autoprueba
+
+        def oracledb_que_responde(error):
+            def connect(**kw):
+                raise Exception(error)
+            return types.SimpleNamespace(connect=connect, __version__="3.4.2")
+
+        sin_cifrado = oracledb_que_responde("DPY-3016: python-oracledb thin mode cannot be used because the "
+                                            "cryptography package cannot be imported")
+        completo = oracledb_que_responde("DPY-6005: cannot connect to database. [WinError 10061] refused")
+        with mock.patch.dict(sys.modules, {"oracledb": sin_cifrado}):
+            nivel, detalle = autoprueba._oracle_thin()
+        self.assertEqual(nivel, autoprueba.FALLA)
+        self.assertIn("DPY-3016", detalle)
+        with mock.patch.dict(sys.modules, {"oracledb": completo}):
+            self.assertEqual(autoprueba._oracle_thin()[0], autoprueba.OK)
+
+
 if __name__ == "__main__":
     unittest.main()
