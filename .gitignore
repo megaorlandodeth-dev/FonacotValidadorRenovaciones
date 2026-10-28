@@ -24,6 +24,8 @@ wheels/
 # PyInstaller
 *.manifest
 *.spec
+!ValidadorRenovaciones.spec
+ValidadorRenovaciones.zip
 
 # Local configurations and cache
 *.json

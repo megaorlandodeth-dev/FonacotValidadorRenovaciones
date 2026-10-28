@@ -3,8 +3,9 @@ chcp 65001 >nul
 title FONACOT - Validador Diario de Cancelacion de Renovaciones
 cd /d "%~dp0"
 
-if exist "dist\FonacotValidadorRenovaciones_v1\FonacotValidadorRenovaciones_v1.exe" (
-    start "" "dist\FonacotValidadorRenovaciones_v1\FonacotValidadorRenovaciones_v1.exe"
+rem Si ya se construyo el ejecutable (Construir_Ejecutable.bat), se abre ese: no hace falta Python
+if exist "dist\ValidadorRenovaciones\ValidadorRenovaciones.exe" (
+    start "" "dist\ValidadorRenovaciones\ValidadorRenovaciones.exe"
     exit
 )
 

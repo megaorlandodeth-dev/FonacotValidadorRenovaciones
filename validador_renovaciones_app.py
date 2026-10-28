@@ -75,7 +75,7 @@ import equipo_compartido as equipo
 import registro
 
 
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 # Trabajo en equipo por carpeta compartida (lo que marcan los analistas le llega al validador): apagado por ahora
 EQUIPO_ACTIVO = False
 

@@ -966,13 +966,16 @@ class RenovacionTicketParser:
         # "CREDITO 56572 Y 56574", "Número de Crédito (renovación): 61116,61117,61118",
         # "Número de renovación 48736 - 48735", "C- 74544 y C- 74545", "+ 2431191 + 20757 + 20758"
         multi_credit_label_patterns = [
-            r'(?:n[úu]mero|num\.?|no\.?)\s+de\s+cr[ée]ditos?\s*(?:[\(/]\s*renovaci(?:[óo]n|ones)\s*\)?)?\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
+            # «Número de crédito (renovación): 61116», «NUMERO DE CREDITO (REN) : 57815», «No. de crédito (hijo)»
+            r'(?:n[úu]mero|num\.?|no\.?)\s+de\s+cr[ée]ditos?\s*(?:[\(/]\s*(?:renovaci(?:[óo]n|ones)|renov\.?|ren\.?|hijo|nuevo|'
+            r'a\s+cancelar)\s*\)?)?\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             r'(?:n[úu]mero|num\.?|no\.?)\s+de\s+renovaci(?:[óo]n|ones)(?:\s+nueva)?\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             # «No. de crédito a cancelar», «Crédito a cancelar: 71470», «Renovación a cancelar 71470», «crédito renovado a cancelar»
             r'(?:(?:n[úu]mero|num\.?|no\.?)\s+de(?:l)?\s+)?(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|pagar[ée]s?)(?:\s+renovad[oa]s?)?\s+a\s+cancelar\s*[:\.\-]*\s*([C\-\d,\s yY\+]{3,45})',
             r'(?:ya\s+renovado|cr[ée]dito\s+nuevo|cr[ée]dito\s+renovado|cr[ée]dito\s+hijo|pagar[ée])\s*[:\.\-\(]*\s*([C\-\d,\s yY]{3,35})',
-            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|;|/|y|Y|e|E|\-|\+)\s*[C\-\d]+)+)',
-            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?[C\-]?[^\S\n]*(\d{3,7})\b',
+            # La etiqueta puede traer una aclaración entre paréntesis, solo letras: «CREDITO (REN): 57815»
+            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:[^\S\n]*\([A-Za-zÁÉÍÓÚáéíóúÑñ\.\s]{1,25}\))?(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?([C\-\d]+(?:\s*(?:,|;|/|y|Y|e|E|\-|\+)\s*[C\-\d]+)+)',
+            r'\b(?:cr[ée]ditos?|renovaci(?:[óo]n|ones)|ren)(?:[^\S\n]*\([A-Za-zÁÉÍÓÚáéíóúÑñ\.\s]{1,25}\))?(?:\s*(?:n[úu]mero|num\.?|no\.?|n°)\s*|[^\S\n]*)(?:[:#\.]\s*)?[C\-\(]?[^\S\n]*(\d{3,7})\b',
             r'\bse\s+renov[óo]\s+al\s+(\d{4,7})\b',
             # «65000 -> 71470» (el padre ya se tomó) y «Cliente 4919283 -> 71470»
             r'\d{3,8}[^\S\n]*(?:->|→|=>)[^\S\n]*(\d{3,6})(?!\d)',
