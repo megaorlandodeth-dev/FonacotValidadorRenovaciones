@@ -142,12 +142,14 @@ Solo lo hace quien reparte la app, en un equipo con **Python 3.10+** (probado co
    - instala las librerías de `requirements.txt` y PyInstaller;
    - arma `dist\ValidadorRenovaciones\` con `ValidadorRenovaciones.spec` (Python, CustomTkinter, pandas, pywin32,
      oracledb, Pillow, lxml y los datos de idioma van adentro);
-   - lo comprime en **`ValidadorRenovaciones.zip`** (unos 55 MB).
+   - genera esta guía en PDF (`GUIA_DE_USO.pdf`, con `guia_pdf.py` y Microsoft Edge) y la pone junto al `.exe`;
+   - lo comprime en **`ValidadorRenovaciones.zip`** (unos 56 MB).
 3. Probar el `.zip` (sección 5.3) y repartirlo (carpeta compartida, correo interno o *release* en GitHub).
 
 Notas:
 
-- `dist\`, `build\` y el `.zip` no se suben al repositorio.
+- `dist\`, `build\` y el `.zip` no se suben al repositorio. El PDF de la guía sí, para descargarlo desde GitHub.
+- Si se cambia la guía (`GUIA_DE_USO.md`), el PDF se vuelve a generar con `python guia_pdf.py`.
 - No usar un ejecutable de un solo archivo: tarda más en abrir y los antivirus lo marcan más.
 - Al descomprimir, la carpeta donde quede no debe ser muy profunda: la ruta más larga dentro del paquete mide unos
   110 caracteres y Windows tiene un límite de 260.

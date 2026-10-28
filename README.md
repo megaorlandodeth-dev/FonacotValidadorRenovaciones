@@ -4,6 +4,7 @@ Aplicación de escritorio para Windows que arma y valida el **lote diario de can
 que llegan como incidentes de iTop a Outlook, y prepara el **ticket único** del día.
 
 La guía completa (uso diario, cómo decide la app, cómo se construye y cómo se valida) está en
+[GUIA_DE_USO.pdf](GUIA_DE_USO.pdf) (también viene dentro del `.zip`, junto al `.exe`). Su fuente es
 [GUIA_DE_USO.md](GUIA_DE_USO.md).
 
 ---
@@ -95,6 +96,7 @@ Para construir el `.zip`: doble clic en `Construir_Ejecutable.bat` (ver la guía
 | `equipo_compartido.py` | Trabajo en equipo por carpeta compartida (apagado en esta versión) |
 | `tests/` | Pruebas automáticas (no necesitan Outlook ni la base) |
 | `ValidadorRenovaciones.spec`, `Construir_Ejecutable.bat` | Construcción del ejecutable |
+| `GUIA_DE_USO.md`, `guia_pdf.py` | La guía y el script que la convierte en `GUIA_DE_USO.pdf` |
 | `Ejecutar_Validador_Renovaciones.bat` | Abre el ejecutable si existe; si no, la app con Python |
 
 ## Configuración

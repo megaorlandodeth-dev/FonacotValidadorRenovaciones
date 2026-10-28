@@ -17,13 +17,16 @@ if not defined PYEXE (
 )
 
 echo Instalando lo necesario para construir...
-%PYEXE% -m pip install -r requirements.txt "pyinstaller>=6.10,<7"
+%PYEXE% -m pip install -r requirements.txt "pyinstaller>=6.10,<7" "markdown>=3.5,<4"
 if errorlevel 1 goto error
 
 %PYEXE% -m PyInstaller ValidadorRenovaciones.spec --noconfirm --clean
 if errorlevel 1 goto error
 
-copy /y GUIA_DE_USO.md dist\ValidadorRenovaciones\ >nul
+rem La guia va en PDF (los analistas no tienen lector de .md); la imprime Edge
+%PYEXE% guia_pdf.py
+if errorlevel 1 goto error
+copy /y GUIA_DE_USO.pdf dist\ValidadorRenovaciones\ >nul
 if exist ValidadorRenovaciones.zip del ValidadorRenovaciones.zip
 powershell -NoProfile -Command "Compress-Archive -Path 'dist\ValidadorRenovaciones' -DestinationPath 'ValidadorRenovaciones.zip'"
 if errorlevel 1 goto error
