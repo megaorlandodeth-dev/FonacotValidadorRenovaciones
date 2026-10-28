@@ -155,7 +155,7 @@ Notas:
 - No usar un ejecutable de un solo archivo: tarda más en abrir y los antivirus lo marcan más.
 - Al descomprimir, la carpeta donde quede no debe ser muy profunda: la ruta más larga dentro del paquete mide unos
   110 caracteres y Windows tiene un límite de 260.
-- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.2*). Se cambia en `APP_VERSION` de
+- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.3*). Se cambia en `APP_VERSION` de
   `validador_renovaciones_app.py`.
 
 ---
@@ -218,6 +218,8 @@ autoprueba.
 | No aparece ninguna renovación | Revisar que Outlook esté abierto y el periodo elegido; F5 otra vez. |
 | *SIN CRÉDITO* / *SIN CLIENTE* | Ver el correo original o el adjunto y usar **Corregir dato** (E). |
 | *DPI-1050* al conectar a la base | El Oracle Client del equipo es 12.2: la app ya usa oracledb 3.4, compatible. Si persiste, poner la carpeta del Oracle Client en `sql_cliente_oracle`. |
+| Captura de *Consulta de Crédito*: lee el crédito pero sale *SIN CLIENTE* | Pasaba antes de la 3.3.3 (el OCR se saltaba el renglón del cliente). Con la 3.3.3 se lee; si aun así falta, la columna *Base de datos* dice de qué cliente es la renovación: usar **Corregir dato** (E). |
+| *ORA-12154* en modo clásico | Pasaba antes de la 3.3.3 con algunos Oracle Client instalados: descargar la versión más reciente. |
 | *DPY-4000* / *getaddrinfo failed* | Revisar *Nombre del host* (`scanfonacot.fonacot.gob.mx`), *Puerto* y *Nombre del servicio*, y la VPN. |
 | *no tiene la fecha de la emisión de …* | La página de FONACOT no ha publicado esa emisión o no hubo internet; se vuelve a intentar en la siguiente búsqueda. |
 | *DPY-3015 … password verifier type … not supported* y *no hay un Oracle Client* | La base pide el modo clásico. SQL Developer no sirve para esto (usa su propio driver de Java): hay que instalar Oracle Instant Client 19 de 64 bits en cualquier disco, o poner su carpeta en `sql_cliente_oracle`. `Revisar_Equipo.bat` dice si lo encuentra. |

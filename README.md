@@ -1,4 +1,4 @@
-# FONACOT · Validador de Renovaciones — v3.3.2
+# FONACOT · Validador de Renovaciones — v3.3.3
 
 Aplicación de escritorio para Windows que arma y valida el **lote diario de cancelaciones y reversas de renovaciones**
 que llegan como incidentes de iTop a Outlook, y prepara el **ticket único** del día.
@@ -45,6 +45,12 @@ Se elige al abrir la app y se cambia con el botón de perfil (arriba a la derech
 
 - **Ejecutable para equipos sin Python:** se reparte `ValidadorRenovaciones.zip`; el analista lo descomprime y abre
   `ValidadorRenovaciones.exe`. No hay que instalar Python ni librerías.
+- **3.3.3 · Cliente en las capturas de «Consulta de Crédito»:** el OCR de Windows se saltaba el renglón del
+  cliente (número, botón «?» y nombre) y salía *SIN CLIENTE* aunque el crédito sí se leía (I-363027). Si la
+  etiqueta se lee y su número no, ahora se lee sola la caja de la derecha.
+- **3.3.3 · Dirección completa en modo clásico:** con el Oracle Client se conecta con la dirección completa
+  `(DESCRIPTION=…)`; la corta (`host:1521/servicio`) fallaba con *ORA-12154* si el `sqlnet.ora` del cliente
+  instalado solo admite TNSNAMES.
 - **3.3.2 · Modo clásico de Oracle:** la base de FONACOT pide el modo clásico (*DPY-3015*) y la app solo buscaba el
   Oracle Client en C:. Ahora lo busca en todos los discos y en el registro de Windows, descarta los de 32 bits y cambia
   al modo clásico con cualquier error que el modo thin no soporte. Los errores comunes (contraseña, cuenta bloqueada,

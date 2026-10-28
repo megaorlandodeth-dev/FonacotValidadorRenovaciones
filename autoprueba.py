@@ -76,7 +76,7 @@ def _oracle_cliente(config: dict):
             continue
         version = ".".join(str(n) for n in oracledb.clientversion())
         try:
-            oracledb.connect(user="prueba", password="prueba", dsn="127.0.0.1:9/prueba")
+            oracledb.connect(user="prueba", password="prueba", dsn=sql.dsn_clasico("127.0.0.1:9/prueba"))
         except Exception as e:
             texto = str(e).splitlines()[0] if str(e) else type(e).__name__
             if not re.search(r"ORA-125\d\d|ORA-12170|TNS-", texto):

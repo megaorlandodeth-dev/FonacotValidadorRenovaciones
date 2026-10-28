@@ -246,6 +246,19 @@ def _explicar_cliente_viejo(texto: str, carpeta: str) -> str:
             f"instalar Oracle Instant Client 19 o más reciente e indicar su carpeta en «sql_cliente_oracle».")
 
 
+def dsn_clasico(dsn: str) -> str:
+    """
+    «host:puerto/servicio» -> la dirección completa (DESCRIPTION=…) para el modo clásico: con un Oracle Client
+    instalado cuyo sqlnet.ora solo admite TNSNAMES, la dirección corta falla con ORA-12154.
+    """
+    m = re.fullmatch(r'([^:/\s()]+):(\d+)/([A-Za-z0-9_$#.\-]+)', dsn or "")
+    if not m:
+        return dsn
+    host, puerto, servicio = m.groups()
+    return (f"(DESCRIPTION=(TRANSPORT_CONNECT_TIMEOUT=10)(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={puerto}))"
+            f"(CONNECT_DATA=(SERVICE_NAME={servicio})))")
+
+
 def _pide_modo_clasico(texto: str) -> bool:
     """
     Errores del modo thin que el modo clásico (Oracle Client) sí resuelve: DPY-3xxx («not supported in thin mode»:
@@ -306,7 +319,8 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
                                                    cliente_oracle))
     dsn = armar_dsn(servidor, oracledb)
     try:
-        conn = oracledb.connect(user=usuario, password=password, dsn=dsn, tcp_connect_timeout=10)
+        conn = oracledb.connect(user=usuario, password=password, tcp_connect_timeout=10,
+                                dsn=dsn_clasico(dsn) if _cliente_oracle_iniciado else dsn)
     except Exception as e:
         texto = _mensaje(e)
         if _cliente_oracle_iniciado or not _pide_modo_clasico(texto):
@@ -321,7 +335,7 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
                 continue
             _cliente_oracle_iniciado = True
             try:
-                conn = oracledb.connect(user=usuario, password=password, dsn=dsn)
+                conn = oracledb.connect(user=usuario, password=password, dsn=dsn_clasico(dsn))
             except Exception as e2:
                 raise ErrorSQL(_con_consejo(f"{_mensaje(e2)}  (modo clásico, Oracle Client de {carpeta})", servidor))
             break

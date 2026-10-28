@@ -237,9 +237,87 @@ def leer_imagenes(rutas: list) -> dict:
                     lecturas = [leidas.get(v, []) for v in versiones]
                     if _palabras_leidas(lecturas) > _palabras_leidas(resultado[ruta]):
                         resultado[ruta] = lecturas
+            _leer_cajas_de_etiquetas(pendientes, resultado, tmp)
             for ruta, (huella, _) in pendientes.items():
                 _CACHE[huella] = resultado[ruta]
     return resultado
+
+
+BLANCO_CAJA = 245                # las cajas de los campos son blancas; el fondo de las pantallas, gris (≤ 240)
+MAX_CAJAS_POR_LECTURA = 6
+
+
+def _caja_a_la_derecha(im, etiqueta) -> tuple:
+    """
+    (x0, y0, x1, y1) de la primera caja blanca a la derecha de una etiqueta (los campos de «Consulta de Crédito»);
+    None si no hay. Una columna es de la caja si tiene blanco en su franja: el borde, el fondo gris y el botón «?» no.
+    """
+    _, x, y, w, h = etiqueta
+    arriba, abajo, izq = max(0, int(y - h * 0.5)), min(im.height, int(y + h * 1.5)), int(x + w)
+    if abajo - arriba < 4 or izq >= im.width - 4:
+        return None
+    banda = im.crop((izq, arriba, im.width, abajo))
+    pix, (ancho, alto) = banda.load(), banda.size
+    minimo = max(2, int(alto * 0.15))
+    inicio = None
+    for i in range(ancho + 1):
+        blanca = i < ancho and sum(1 for j in range(alto) if pix[i, j] >= BLANCO_CAJA) >= minimo
+        if blanca and inicio is None:
+            inicio = i
+        elif not blanca and inicio is not None:
+            if i - inicio >= h * 1.5:
+                return izq + inicio, arriba, izq + i, abajo
+            inicio = None
+    return None
+
+
+def _leer_cajas_de_etiquetas(pendientes: dict, resultado: dict, carpeta: str):
+    """
+    El OCR de Windows a veces se salta un renglón entero de la pantalla «Consulta de Crédito»: el del cliente, con el
+    número, el botón «?» y el nombre (I-363027). Si una etiqueta Cliente o Crédito se leyó pero su número no, se lee
+    sola la caja que tiene a la derecha y sus palabras se agregan a esa lectura, en su lugar.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    recortes = {}
+    for ruta, (_, versiones) in pendientes.items():
+        if len(resultado.get(ruta, [])) != len(versiones):
+            continue
+        for k, (version, lineas) in enumerate(zip(versiones, resultado[ruta])):
+            if not lineas or version == ruta:
+                continue  # sin Pillow la «versión» es la imagen original: no se recorta
+            datos = extraer_cliente_credito(lineas)
+            etiquetas = [p for ln in lineas for p in ln
+                         if (not datos['cliente'] and _es_etiqueta_cliente(_norm(p[0])))
+                         or (not datos['credito'] and _es_etiqueta_credito(_norm(p[0])))][:MAX_CAJAS_POR_LECTURA]
+            if not etiquetas:
+                continue
+            try:
+                with Image.open(version) as im:
+                    im = im.convert("L")
+                    for n, etiqueta in enumerate(etiquetas):
+                        caja = _caja_a_la_derecha(im, etiqueta)
+                        if not caja:
+                            continue
+                        margen = 20
+                        recorte = Image.new("L", (caja[2] - caja[0] + margen * 2, caja[3] - caja[1] + margen * 2), 255)
+                        recorte.paste(im.crop(caja), (margen, margen))
+                        destino = f"{version[:-4]}_caja{n}.png"
+                        recorte.save(destino)
+                        recortes[destino] = (ruta, k, caja[0] - margen, caja[1] - margen)
+            except Exception:
+                continue
+    if not recortes:
+        return
+    try:
+        leidas = _ejecutar_ocr(list(recortes))
+    except OCRNoDisponible:
+        return
+    for destino, (ruta, k, dx, dy) in recortes.items():
+        for ln in leidas.get(destino, []):
+            resultado[ruta][k].append([(t, x + dx, y + dy, w, h) for t, x, y, w, h in ln])
 
 
 def pdf_a_imagenes(pdfs: list, notas: list = None) -> list:
