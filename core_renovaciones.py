@@ -440,13 +440,14 @@ class RenovacionTicketParser:
         has_renewal_word = bool(re.search(
             r'\b(renov\w*|reno|ren)\b|credito\s+padre|credito\s+hijo|credito\s+original|credito\s+anterior|antes\s+de\s+renovar|operacion\s*\(\s*origen\s*\)',
             combined
-        ))
+        )) or bool(cls._RENOVACION_MAL_ESCRITA.search(combined))
         has_cancel_word = bool(re.search(
             r'\b(canc\w*|reversa\w*|sin\s+efecto|baja)\b',
             combined
         ))
         has_capacity_reason = bool(re.search(
-            r'(no\s+libero\s+(disponible|capacidad|credito)|no\s+dio\s+disponible|no\s+da\s+disponible|bajo\s+(su\s+|la\s+|el\s+)?(capacidad|nivel)|topado\s+por\s+buro|capacidad\s+(de\s+cuota\s+|de\s+credito\s+)?agotada|plazo\s+menor\s+en\s+la\s+app)',
+            r'(no\s+(le\s+)?(libero|dio|dieron|otorgo|deposito|alcanzo)\s+(el\s+|la\s+|lo\s+)?(capital|monto|dinero|cantidad|importe|que\s+(el\s+|ella\s+)?(requeria|necesitaba|pedia|esperaba|solicito))|'
+            r'no\s+libero\s+(disponible|capacidad|credito)|no\s+dio\s+disponible|no\s+da\s+disponible|bajo\s+(su\s+|la\s+|el\s+)?(capacidad|nivel)|topado\s+por\s+buro|capacidad\s+(de\s+cuota\s+|de\s+credito\s+)?agotada|plazo\s+menor\s+en\s+la\s+app)',
             combined
         ))
 
@@ -460,6 +461,20 @@ class RenovacionTicketParser:
             return True, subtipo, motivo
 
         return False, "", ""
+
+    # «RENOMVACION», «RENOBACION», «RENOVASION», «RENVACION»: ren + hasta 3 letras + v/b + …ción/sión
+    _RENOVACION_MAL_ESCRITA = re.compile(r'\bre+n+[a-z]{0,3}[vb][a-z]{0,2}(?:ci|si|s)[a-z]*\b')
+
+    @classmethod
+    def pide_cancelacion(cls, resumen: str, descripcion: str) -> bool:
+        """
+        El correo pide cancelar o reversar algo aunque no diga «renovación» ni traiga números (asunto «APOYO» y el
+        estado de cuenta en PDF o una captura adjunta): vale la pena revisar sus adjuntos.
+        """
+        combined = normalize_text(f"{resumen} {descripcion}")
+        if re.search(r'dice.{0,40}debe\s+decir|correccion\s+de\s+(domicilio|nombre|datos)|reimpresion', combined):
+            return False
+        return bool(re.search(r'\b(cancel\w*|canc|reversa\w*|revertir|sin\s+efecto)\b', combined))
 
     @staticmethod
     def _extract_motivo(raw_desc: str, norm_combined: str) -> str:
@@ -476,6 +491,8 @@ class RenovacionTicketParser:
             if mot and not mot.lower().startswith('intermitencia / error de cuenta / cambio'):
                 return mot[:85]
 
+        if re.search(r'no\s+(le\s+)?(libero|dio|dieron|otorgo|deposito|alcanzo)\s+(el\s+|lo\s+)?(capital|monto|dinero|que)', norm_combined):
+            return "No le liberó el capital que requería"
         if 'buro' in norm_combined or '10%' in norm_combined or '15%' in norm_combined or 'disponible' in norm_combined or 'capacidad' in norm_combined:
             return "Sin disponible / Topado por Buró / Bajó capacidad"
         if 'app' in norm_combined or 'plazo menor' in norm_combined:
@@ -1202,12 +1219,14 @@ class RenovacionTicketParser:
         ticket_num: str,
         gafete: str,
         nombre_asignado: str,
-        carpeta_origen: str = "Bandeja de entrada"
+        carpeta_origen: str = "Bandeja de entrada",
+        por_adjunto: bool = False
     ) -> list:
         """
         Analiza un correo de asignación de iTop. Si es de Cancelación/Reversa de Renovación,
         devuelve la lista de filas desglosadas (1 fila por cada renovación individual).
         Si NO es de Cancelación de Renovación, devuelve una lista vacía [].
+        `por_adjunto`: el correo pide cancelar sin decir qué (asunto «APOYO») y su adjunto dirá si es renovación.
         """
         base = cls.parse_itop_base_fields(html_body, plain_body)
         resumen = base['resumen'] or subject
@@ -1215,6 +1234,9 @@ class RenovacionTicketParser:
         inner_tables = base['inner_tables']
 
         is_ren_cancel, subtipo, motivo = cls.classify_renewal_ticket(resumen, descripcion, inner_tables)
+        if not is_ren_cancel and por_adjunto and cls.pide_cancelacion(resumen, descripcion):
+            is_ren_cancel, subtipo = True, "Cancelación (según el adjunto)"
+            motivo = cls._extract_motivo(descripcion, normalize_text(f"{resumen} {descripcion}"))
         if not is_ren_cancel:
             return []
 
@@ -1311,12 +1333,13 @@ def completar_con_imagenes(rows: list, lecturas: list) -> list:
     for lec in lecturas:
         par = (first_digits(lec.get('cliente') or ''), first_digits(lec.get('credito') or ''))
         if any(par) and par not in [p[:2] for p in pares]:
-            pares.append((par[0], par[1], lec.get('imagen') or 'imagen', bool(lec.get('dudosa'))))
+            fuente = lec.get('fuente') or f"de la imagen «{lec.get('imagen') or 'imagen'}»"
+            pares.append((par[0], par[1], fuente, bool(lec.get('dudosa'))))
     if not pares or not any(r.get('Datos_Incompletos') for r in rows):
         return rows
 
     def llenar(r, par):
-        pc, pr, imagen, dudosa = par
+        pc, pr, fuente, dudosa = par
         leido = []
         if r['Numero_Cliente'] == "SIN CLIENTE" and pc:
             r['Numero_Cliente'] = pc
@@ -1325,7 +1348,7 @@ def completar_con_imagenes(rows: list, lecturas: list) -> list:
             r['Credito_Renovado_Hijo'] = pr
             leido.append(f"Crédito {pr}")
         r['Datos_Incompletos'] = r['Numero_Cliente'] == "SIN CLIENTE" or r['Credito_Renovado_Hijo'] == "SIN CRÉDITO"
-        r['Dato_Imagen'] = f"{' y '.join(leido)} leído de la imagen «{imagen}»" + (" (lectura dudosa)" if dudosa else "")
+        r['Dato_Imagen'] = f"{' y '.join(leido)} leído {fuente}" + (" (lectura dudosa)" if dudosa else "")
         if r['Datos_Incompletos']:
             r['Alerta_Renovacion'] = f"🚨 FALTA DATO · {r['Dato_Imagen']}: revísalo"
             r['Nivel_Alerta'] = "incompleto"

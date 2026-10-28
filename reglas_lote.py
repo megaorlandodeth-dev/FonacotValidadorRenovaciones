@@ -280,6 +280,9 @@ def _check_correo(r: dict) -> tuple:
         return AVISO, (f"Correo: trae el crédito padre {r['Credito_Padre_Enviado']}; en el lote va su renovación {cred}. "
                        f"Valida que sea la correcta.")
     if r.get("Dato_Imagen"):
+        if "estado de cuenta" in r["Dato_Imagen"]:
+            return AVISO, (f"Correo: no trae los números; {_limpio(r['Dato_Imagen'])}. Compáralo con el PDF adjunto "
+                           f"(la renovación es la del crédito autorizado más reciente).")
         return AVISO, f"Correo: leído de una captura de pantalla ({_limpio(r['Dato_Imagen'])}). Compáralo con la imagen."
     if "DISCREPANCIA" in str(r.get("Alerta_Renovacion", "")):
         return AVISO, f"Correo: trae dos números de cliente para este crédito ({cli}). Confirma cuál es."

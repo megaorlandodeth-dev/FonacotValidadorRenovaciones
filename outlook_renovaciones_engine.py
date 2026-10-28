@@ -49,7 +49,7 @@ from core_renovaciones import (
     RenovacionTicketParser
 )
 
-from ocr_imagenes import leer_correo, OCRNoDisponible
+from ocr_imagenes import EXT_IMAGEN, leer_correo, OCRNoDisponible
 from calendario_cedulas import cortes_entre
 
 # Días hábiles hacia atrás que revisa el lote del día (lo no enviado sigue apareciendo una semana)
@@ -664,15 +664,35 @@ class FonacotRenovacionesEngine:
                 self.errores_lectura.append(cand['Numero_Ticket'])
                 continue
 
+            por_adjunto = False
+            if not disagg_rows and leer_imagenes and msg_obj is not None and self._tiene_adjuntos(msg_obj):
+                # Asunto sin relación («APOYO») y sin números: si pide cancelar, su adjunto (estado de cuenta en PDF,
+                # captura) dice si es una renovación
+                try:
+                    disagg_rows = RenovacionTicketParser.parse_and_disaggregate_email(
+                        subject=cand['Asunto'], html_body=html_body, plain_body=plain_body,
+                        received_dt=cand['Fecha_DT'], ticket_num=cand['Numero_Ticket'], gafete=cand['Gafete'],
+                        nombre_asignado=cand['Nombre_Asignado'], carpeta_origen=cand['Carpeta_Origen'],
+                        por_adjunto=True)
+                except Exception:
+                    disagg_rows = []
+                por_adjunto = bool(disagg_rows)
+
             if not disagg_rows:
                 continue
 
-            # Incidentes que mandan una captura de pantalla en vez de escribir Cliente y Crédito
+            # Incidentes que mandan una captura de pantalla o el estado de cuenta en vez de escribir Cliente y Crédito
             if leer_imagenes and msg_obj is not None and any(r['Datos_Incompletos'] for r in disagg_rows):
                 if progress_callback:
                     progress_callback(total_folders, total_folders + 1,
-                                      f"🖼️ Leyendo imágenes del incidente {cand['Numero_Ticket']}...")
-                disagg_rows = self._completar_con_imagenes(msg_obj, disagg_rows, cand['Numero_Ticket'])
+                                      f"🖼️ Leyendo imágenes y PDF del incidente {cand['Numero_Ticket']}...")
+                disagg_rows = self._completar_con_imagenes(msg_obj, disagg_rows, cand['Numero_Ticket'],
+                                                           ref=cand['Fecha_DT'].date())
+            if por_adjunto:
+                # Solo se queda si el adjunto trajo el cliente o la renovación (si no, era otro trámite)
+                disagg_rows = [r for r in disagg_rows if r.get('Dato_Imagen')]
+                if not disagg_rows:
+                    continue
 
             # Hora en que el ticket llegó por primera vez (asignación inicial), no la de la última reasignación:
             # es la que decide si entró antes o después del corte.
@@ -736,11 +756,25 @@ class FonacotRenovacionesEngine:
         self.tickets_summary = tickets_summary_list
         return all_renewal_rows, tickets_summary_list
 
-    def _completar_con_imagenes(self, msg, rows: list, ticket: str) -> list:
+    @staticmethod
+    def _tiene_adjuntos(msg) -> bool:
+        """¿Trae algún PDF o imagen adjunta (o un correo reenviado)? Sin abrirlos."""
+        try:
+            adjuntos = msg.Attachments
+            for i in range(1, adjuntos.Count + 1):
+                nombre = str(getattr(adjuntos.Item(i), 'FileName', '') or '').lower()
+                if nombre.endswith(('.pdf', '.msg') + EXT_IMAGEN):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _completar_con_imagenes(self, msg, rows: list, ticket: str, ref=None) -> list:
         """
-        Lee con OCR las imágenes del correo y completa el dato que falta (ver core.completar_con_imagenes). Si en
-        ese correo no hay imágenes, prueba con los demás correos del mismo incidente (la asignación original, la
+        Lee con OCR las imágenes y los PDF del correo y completa el dato que falta (ver core.completar_con_imagenes).
+        Si en ese correo no hay imágenes, prueba con los demás correos del mismo incidente (la asignación original, la
         reasignación, la nota de iTop…). Si no se pudo, deja en 'Imagen_Info' por qué, para verlo en pantalla.
+        `ref`: fecha del correo (en un estado de cuenta, la renovación es la que se autorizó en esos días).
         """
         if self.ocr_info['error']:
             for r in rows:
@@ -751,7 +785,7 @@ class FonacotRenovacionesEngine:
         lecturas, n_imagenes, notas, error = [], 0, [], ''
         for correo in correos:
             try:
-                leidas, n = leer_correo(correo, notas)
+                leidas, n = leer_correo(correo, notas, ref)
             except OCRNoDisponible as e:
                 self.ocr_info['error'] = str(e)
                 error = str(e)
@@ -769,8 +803,10 @@ class FonacotRenovacionesEngine:
         if any(r['Datos_Incompletos'] for r in rows):
             if n_imagenes:
                 self.ocr_info['sin_leer'].append(ticket)
-                info = (f"Se leyeron {n_imagenes} imagen(es) del incidente y no se encontró el No. de cliente ni el "
-                        f"No. de crédito (revisa la imagen en el correo o en iTop)")
+                info = (f"Se leyeron {n_imagenes} imagen(es) o página(s) de PDF del incidente y no se encontró el No. "
+                        f"de cliente ni el No. de crédito"
+                        + (f" ({'; '.join(dict.fromkeys(notas))})" if notas else "")
+                        + " (revisa el adjunto en el correo o en iTop)")
             elif error:
                 info = f"No se pudieron leer las imágenes: {error}"
             else:

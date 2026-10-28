@@ -16,14 +16,18 @@ import re
 import subprocess
 import tempfile
 import unicodedata
+from datetime import date, timedelta
 
 EXT_IMAGEN = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff')
 TAM_MIN_IMAGEN = 6 * 1024        # logos, iconos y firmas pesan menos
 MAX_IMAGENES_POR_CORREO = 4
+MAX_PAGINAS_PDF = 2              # del estado de cuenta basta la primera hoja
+TAM_MIN_PDF = 1024
 TIEMPO_MAX_OCR = 90              # segundos por llamada
 
 _SEP = "\x1f"
 _CACHE = {}                      # sha1 de la imagen -> líneas leídas (no se vuelve a leer en cada actualización)
+_CACHE_PDF = {}                  # sha1 del PDF -> imágenes de sus páginas
 
 # Imprime por cada imagen "IMG<tab>ruta", luego "LIN<tab>palabra<tab>palabra…" (palabra = texto␟x␟y␟ancho␟alto)
 _SCRIPT_PS = r"""
@@ -66,6 +70,51 @@ foreach ($path in Get-Content -LiteralPath '__LISTA__' -Encoding UTF8) {
 """
 
 
+# Convierte cada PDF de la lista («ruta<tab>prefijo») en imágenes PNG de sus primeras páginas con el lector de PDF que
+# trae Windows (Windows.Data.Pdf): imprime "PNG<tab>ruta" por página o "ERR<tab>motivo".
+_SCRIPT_PDF_PS = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+  $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+  $null = [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime]
+  $null = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+  $metodos = [System.WindowsRuntimeSystemExtensions].GetMethods()
+  $asTask = ($metodos | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+  $asTaskA = ($metodos | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+  function Await($op, [Type]$t) { $task = $asTask.MakeGenericMethod($t).Invoke($null, @($op)); $null = $task.Wait(-1); $task.Result }
+  function AwaitA($op) { $null = $asTaskA.Invoke($null, @($op)).Wait(-1) }
+} catch { "ERR`t" + $_.Exception.Message; exit }
+foreach ($renglon in Get-Content -LiteralPath '__LISTA__' -Encoding UTF8) {
+  if (-not $renglon) { continue }
+  $pdf, $prefijo = $renglon -split "`t", 2
+  try {
+    $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($pdf)) ([Windows.Storage.StorageFile])
+    $doc = Await ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
+    $paginas = [Math]::Min([int]$doc.PageCount, __PAGINAS__)
+    for ($i = 0; $i -lt $paginas; $i++) {
+      $page = $doc.GetPage($i)
+      $opt = New-Object Windows.Data.Pdf.PdfPageRenderOptions
+      $opt.DestinationWidth = [uint32]2400
+      $ms = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+      AwaitA ($page.RenderToStreamAsync($ms, $opt))
+      $salida = $prefijo + "_pag" + ($i + 1) + ".png"
+      $net = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($ms.GetInputStreamAt(0))
+      $fs = [System.IO.File]::Create($salida)
+      $net.CopyTo($fs)
+      $fs.Close()
+      $ms.Dispose()
+      $page.Dispose()
+      "PNG`t" + $salida
+    }
+  } catch { "ERR`t" + $_.Exception.Message }
+}
+"""
+
+
 class OCRNoDisponible(Exception):
     """El equipo no permite usar el OCR de Windows (sin idioma, PowerShell bloqueado, etc.)."""
 
@@ -77,16 +126,21 @@ class OCRNoDisponible(Exception):
 LADOS_OCR = (1800, 2400)
 
 
-def _preparar(ruta: str, carpeta: str) -> list:
-    """Copias listas para el OCR (orientación de la foto corregida, en gris, a cada tamaño). Sin Pillow, la original."""
+def _preparar(ruta: str, carpeta: str, giro: int = 0) -> list:
+    """
+    Copias listas para el OCR (orientación de la foto corregida, en gris, a cada tamaño). Sin Pillow, la original.
+    `giro`: grados para enderezar una foto tomada de lado (el OCR de Windows solo lee texto derecho).
+    """
     try:
         from PIL import Image, ImageOps
     except ImportError:
-        return [ruta]
+        return [ruta] if not giro else []
     try:
         with Image.open(ruta) as im:
             im = ImageOps.exif_transpose(im).convert("L")
-            base = os.path.join(carpeta, hashlib.sha1(ruta.encode('utf-8')).hexdigest()[:12])
+            if giro:
+                im = im.rotate(giro, expand=True)
+            base = os.path.join(carpeta, hashlib.sha1(f"{ruta}|{giro}".encode('utf-8')).hexdigest()[:12])
             versiones = []
             for lado in LADOS_OCR:
                 factor = lado / max(max(im.size), 1)
@@ -95,7 +149,14 @@ def _preparar(ruta: str, carpeta: str) -> list:
                 copia.save(versiones[-1])
             return versiones
     except Exception:
-        return [ruta]
+        return [ruta] if not giro else []
+
+
+MIN_PALABRAS_DERECHA = 25        # con menos, la foto pudo tomarse de lado: se prueba girándola
+
+
+def _palabras_leidas(versiones: list) -> int:
+    return max((sum(1 for ln in v for p in ln if len(p[0]) >= 3) for v in versiones), default=0)
 
 
 def _ejecutar_ocr(rutas: list) -> dict:
@@ -159,11 +220,85 @@ def leer_imagenes(rutas: list) -> dict:
                 pendientes[ruta] = (huella, _preparar(ruta, tmp))
         if pendientes:
             leidas = _ejecutar_ocr([v for _, versiones in pendientes.values() for v in versiones])
+            de_lado = {}
             for ruta, (huella, versiones) in pendientes.items():
                 lecturas = [leidas.get(v, []) for v in versiones]
-                _CACHE[huella] = lecturas
                 resultado[ruta] = lecturas
+                if _palabras_leidas(lecturas) < MIN_PALABRAS_DERECHA:
+                    for giro in (90, 270):
+                        de_lado[(ruta, giro)] = _preparar(ruta, tmp, giro)
+            if de_lado:
+                leidas = _ejecutar_ocr([v for versiones in de_lado.values() for v in versiones])
+                for (ruta, giro), versiones in de_lado.items():
+                    lecturas = [leidas.get(v, []) for v in versiones]
+                    if _palabras_leidas(lecturas) > _palabras_leidas(resultado[ruta]):
+                        resultado[ruta] = lecturas
+            for ruta, (huella, _) in pendientes.items():
+                _CACHE[huella] = resultado[ruta]
     return resultado
+
+
+def pdf_a_imagenes(pdfs: list, notas: list = None) -> list:
+    """
+    Convierte en imágenes las primeras páginas de cada PDF (`pdfs`: [(ruta del pdf, prefijo de las imágenes)]) para
+    leerlas con el OCR: así se leen el estado de cuenta o la consulta que la sucursal manda en PDF, sea texto o un
+    escaneo. Un PDF que ya se convirtió no se vuelve a convertir en la siguiente actualización.
+    """
+    rutas, pendientes = [], []
+    for pdf, prefijo in pdfs:
+        try:
+            with open(pdf, "rb") as f:
+                huella = hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            continue
+        if huella in _CACHE_PDF:
+            for n, datos in enumerate(_CACHE_PDF[huella], 1):
+                with open(f"{prefijo}_pag{n}.png", "wb") as f:
+                    f.write(datos)
+                rutas.append(f"{prefijo}_pag{n}.png")
+        else:
+            pendientes.append((pdf, prefijo, huella))
+    if not pendientes:
+        return rutas
+    with tempfile.TemporaryDirectory(prefix="fonacot_pdf_") as tmp:
+        lista = os.path.join(tmp, "lista.txt")
+        with open(lista, "w", encoding="utf-8") as f:
+            f.write("\n".join(f"{pdf}\t{prefijo}" for pdf, prefijo, _ in pendientes))
+        script = _SCRIPT_PDF_PS.replace("__LISTA__", lista.replace("'", "''")).replace("__PAGINAS__", str(MAX_PAGINAS_PDF))
+        cifrado = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", cifrado],
+                capture_output=True, timeout=TIEMPO_MAX_OCR,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            if notas is not None:
+                notas.append(f"no se pudo abrir el PDF adjunto ({type(e).__name__})")
+            return rutas
+    hechas = []
+    for renglon in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        tipo, _, resto = renglon.partition("\t")
+        if tipo == "PNG" and os.path.exists(resto.strip()):
+            hechas.append(resto.strip())
+        elif tipo == "ERR" and notas is not None:
+            notas.append(f"no se pudo abrir el PDF adjunto ({resto.strip()[:80]})")
+    for pdf, prefijo, huella in pendientes:
+        paginas = [r for r in hechas if r.startswith(prefijo + "_pag")]
+        if paginas:
+            datos = []
+            for r in paginas:
+                with open(r, "rb") as f:
+                    datos.append(f.read())
+            _CACHE_PDF[huella] = datos
+        rutas += paginas
+    return rutas
+
+
+def nombre_mostrado(ruta: str) -> str:
+    """«adj2_EDO CTA.pdf_pag1.png» -> «EDO CTA.pdf (pág. 1)»; «adj1_captura.png» -> «captura.png»."""
+    nombre = os.path.basename(ruta).split("_", 1)[-1]
+    return re.sub(r'\.pdf_pag(\d+)\.png$', r'.pdf (pág. \1)', nombre, flags=re.I)
 
 
 # ======================= Imágenes del correo =======================
@@ -206,10 +341,11 @@ def _descargar_imagen(url: str, ruta_sin_ext: str, notas: list = None) -> str:
 
 def guardar_imagenes_del_correo(msg, carpeta: str, notas: list = None, _nivel: int = 0) -> list:
     """
-    Guarda en `carpeta` las imágenes del correo: adjuntas, pegadas en el cuerpo, ligadas al servidor de iTop y las
-    de un correo reenviado como adjunto (.msg). Ignora logos y firmas.
+    Guarda en `carpeta` las imágenes del correo: adjuntas, pegadas en el cuerpo, ligadas al servidor de iTop, las
+    páginas de los PDF adjuntos (estado de cuenta) y las de un correo reenviado como adjunto (.msg). Ignora logos
+    y firmas.
     """
-    rutas = []
+    rutas, pdfs = [], []
     try:
         adjuntos = msg.Attachments
         total = adjuntos.Count
@@ -236,6 +372,11 @@ def guardar_imagenes_del_correo(msg, carpeta: str, notas: list = None, _nivel: i
                     except Exception:
                         pass
                 continue
+            if nombre.lower().endswith('.pdf') and int(getattr(att, 'Size', 0) or 0) >= TAM_MIN_PDF:
+                ruta_pdf = os.path.join(carpeta, f"adj{i}.pdf")
+                att.SaveAsFile(ruta_pdf)
+                pdfs.append((ruta_pdf, os.path.join(carpeta, f"adj{i}_{re.sub(r'[^A-Za-z0-9._-]', '_', nombre)}")))
+                continue
             if os.path.splitext(nombre)[1].lower() not in EXT_IMAGEN or int(getattr(att, 'Size', 0) or 0) < TAM_MIN_IMAGEN:
                 continue
             ruta = os.path.join(carpeta, f"adj{i}_{re.sub(r'[^A-Za-z0-9._-]', '_', nombre)}")
@@ -243,6 +384,8 @@ def guardar_imagenes_del_correo(msg, carpeta: str, notas: list = None, _nivel: i
             rutas.append(ruta)
         except Exception:
             continue
+    if pdfs and len(rutas) < MAX_IMAGENES_POR_CORREO:
+        rutas += pdf_a_imagenes(pdfs, notas)[:MAX_IMAGENES_POR_CORREO - len(rutas)]
     # Imágenes pegadas dentro del HTML (data:image/…;base64)
     try:
         html = str(getattr(msg, 'HTMLBody', '') or '')
@@ -274,10 +417,11 @@ def guardar_imagenes_del_correo(msg, carpeta: str, notas: list = None, _nivel: i
     return rutas[:MAX_IMAGENES_POR_CORREO]
 
 
-def leer_correo(msg, notas: list = None) -> tuple:
+def leer_correo(msg, notas: list = None, ref: date = None) -> tuple:
     """
-    Lee las imágenes del correo de un incidente. Devuelve (lecturas, número de imágenes): una lectura
-    {'cliente', 'credito', 'imagen', 'texto', 'dudosa'} por imagen en la que se encontró algún dato.
+    Lee las imágenes (y los PDF) del correo de un incidente. Devuelve (lecturas, número de imágenes): una lectura
+    {'cliente', 'credito', 'imagen', 'texto', 'dudosa'} por imagen en la que se encontró algún dato; de un estado de
+    cuenta, una por cada renovación autorizada cerca de `ref` (la fecha del correo), con 'fuente' que lo explica.
     En `notas` deja lo que no se pudo bajar o abrir (para explicarlo en pantalla).
     Lanza OCRNoDisponible si el OCR de Windows no se puede usar en este equipo.
     """
@@ -289,8 +433,19 @@ def leer_correo(msg, notas: list = None) -> tuple:
         lecturas = []
         for ruta in rutas:
             datos = extraer_de_versiones(leidas.get(ruta, []))
+            datos['imagen'] = nombre_mostrado(ruta)
+            if datos.get('edo_cuenta'):
+                elegida = renovacion_del_estado(datos['edo_cuenta'], ref)
+                if elegida['nota'] and notas is not None:
+                    notas.append(elegida['nota'])
+                for cred in elegida['creditos']:
+                    lecturas.append(dict(datos, credito=cred, dudosa=datos['dudosa'] or elegida['dudosa'],
+                                         fuente=f"del estado de cuenta «{datos['imagen']}» (autorizado el "
+                                                f"{elegida['fecha']:%d/%m/%Y})"))
+                if elegida['creditos'] or not datos['cliente']:
+                    continue
+                datos['credito'] = ''  # el primer crédito de la tabla no es la renovación
             if datos['cliente'] or datos['credito']:
-                datos['imagen'] = os.path.basename(ruta).split("_", 1)[-1]
                 lecturas.append(datos)
         return lecturas, len(rutas)
 
@@ -325,8 +480,12 @@ def extraer_de_versiones(versiones: list) -> dict:
     """
     datos = [extraer_cliente_credito(v) for v in versiones if v]
     if not datos:
-        return {'cliente': '', 'credito': '', 'texto': '', 'dudosa': False}
-    elegido = {'texto': max((d['texto'] for d in datos), key=len), 'dudosa': False}
+        return {'cliente': '', 'credito': '', 'texto': '', 'dudosa': False, 'edo_cuenta': []}
+    elegido = {'texto': max((d['texto'] for d in datos), key=len), 'dudosa': False,
+               'edo_cuenta': [d['edo_cuenta'] for d in datos if d.get('edo_cuenta')]}
+    if elegido['edo_cuenta']:
+        for d in datos:
+            d['credito'] = ''  # en un estado de cuenta el crédito sale de su tabla, no de la etiqueta
     for campo in ('cliente', 'credito'):
         valores = [d[campo] for d in datos if d[campo]]
         elegido[campo] = max(valores, key=valores.count) if valores else ''
@@ -389,4 +548,73 @@ def extraer_cliente_credito(lineas: list) -> dict:
         if not credito:
             m = re.search(r'(?:credito|renovacion)\W{0,6}(\d{3,7})\b', plano, re.I)
             credito = m.group(1) if m else ''
-    return {'cliente': cliente, 'credito': credito, 'texto': texto}
+    res = {'cliente': cliente, 'credito': credito, 'texto': texto}
+    edo = creditos_estado_de_cuenta(lineas)
+    if edo:
+        res['edo_cuenta'] = edo  # solo si es un estado de cuenta
+    return res
+
+# ======================= Estado de cuenta (FORM5061) =======================
+# Trae al cliente y TODOS sus créditos (NO. CREDITO · PRODUCTO · FECHA AUTORIZADO · …): la renovación a cancelar es
+# la que se autorizó en esos días (pagos 0/12). Lo de la etiqueta «NO. CREDITO» sería el primer crédito de la tabla.
+
+DIAS_ESTADO_DE_CUENTA = 31       # la renovación se autorizó a lo más un mes antes del correo
+
+
+def creditos_estado_de_cuenta(lineas: list) -> list:
+    """
+    [(crédito, fecha autorizado)] de los renglones de la tabla de un estado de cuenta: el primer número del renglón
+    (3 a 6 dígitos), luego el producto (1 a 3 dígitos) y la primera fecha. [] si el texto no es un estado de cuenta.
+    """
+    palabras = [p for ln in lineas for p in ln]
+    plano = _norm("".join(p[0] for p in palabras))
+    if not ('decuenta' in plano or 'autoriz' in plano or ('producto' in plano and 'credito' in plano)):
+        return []
+
+    def mismo_renglon(a, b):
+        ca, cb = a[2] + a[4] / 2, b[2] + b[4] / 2
+        return abs(ca - cb) <= max(a[4], b[4]) * 0.6
+
+    res = []
+    for p in palabras:
+        m = re.fullmatch(r'(\d{1,2})/(\d{1,2})/(\d{4})', p[0].strip(".,;:"))
+        if not m:
+            continue
+        try:
+            fecha = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            continue
+        renglon = sorted((q for q in palabras if q is not p and mismo_renglon(p, q) and q[1] < p[1]), key=lambda q: q[1])
+        if any(re.search(r'\d{1,2}/\d{1,2}/\d{4}', q[0]) for q in renglon):
+            continue  # no es la primera fecha del renglón (FECHA EJERCIDO)
+        nums = [_numero(q[0]) or (q[0] if re.fullmatch(r'\d{1,2}', q[0]) else '') for q in renglon]
+        if len(nums) >= 2 and nums[0] and 3 <= len(nums[0]) <= 6 and nums[1] and len(nums[1]) <= 3 and all(
+                re.fullmatch(r'\d+', q[0]) for q in renglon):
+            res.append((nums[0], fecha))
+    return list(dict.fromkeys(res))
+
+
+def renovacion_del_estado(versiones_edo: list, ref: date = None) -> dict:
+    """
+    De lo leído de un estado de cuenta (una lista de renglones por cada tamaño leído) elige la renovación: los
+    créditos con la fecha de autorización más reciente, si es de hasta un mes antes del correo (`ref`).
+    {'creditos': [...], 'fecha': date|None, 'dudosa': bool, 'nota': str}
+    """
+    renglones = max(versiones_edo, key=len) if versiones_edo else []
+    if not renglones:
+        return {'creditos': [], 'fecha': None, 'dudosa': False, 'nota': ''}
+    hasta = (ref or max(f for _, f in renglones)) + timedelta(days=1)
+    validos = [(c, f) for c, f in renglones if f <= hasta]
+    if not validos:
+        return {'creditos': [], 'fecha': None, 'dudosa': False, 'nota': ''}
+    fecha = max(f for _, f in validos)
+    if ref and fecha < ref - timedelta(days=DIAS_ESTADO_DE_CUENTA):
+        ultimo = next(c for c, f in validos if f == fecha)
+        return {'creditos': [], 'fecha': None, 'dudosa': False,
+                'nota': (f"el estado de cuenta no trae ningún crédito autorizado cerca del {ref:%d/%m/%Y} "
+                         f"(el último: {ultimo} del {fecha:%d/%m/%Y})")}
+    creditos = [c for c, f in validos if f == fecha]
+    otras = [{c for c, f in v if f == fecha} for v in versiones_edo if v]
+    dudosa = any(o and o != set(creditos) for o in otras)
+    return {'creditos': creditos, 'fecha': fecha, 'dudosa': dudosa, 'nota': ''}
+
