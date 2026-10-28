@@ -112,7 +112,9 @@ class TestCerradoPorError(unittest.TestCase):
         self.assertEqual(reglas.veredicto(r)['nivel'], reglas.NO_SE_MANDA)
 
     def test_resuelta_hoy_es_informativa(self):
-        r = renovacion(Cerrado_iTop=True, Cierre_iTop={'motivo': 'Se canceló en sucursal', 'cerro': 'Ana'})
+        # Sin TZ_LOCK (no se pudo leer): con TZ_LOCK = 0 sería «¿Resuelto sin cancelar?» (v3.3.4)
+        r = renovacion(Cerrado_iTop=True, Cierre_iTop={'motivo': 'Se canceló en sucursal', 'cerro': 'Ana'},
+                       SQL_Tz_Lock=None)
         reglas.aplicar_reglas([r])
         self.assertEqual(r['Informativa_Tipo'], reglas.INFO_CERRADA)
         self.assertFalse(reglas.va_en_lote(r))

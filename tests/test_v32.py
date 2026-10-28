@@ -22,7 +22,8 @@ from test_v30 import cerrada, renovacion  # noqa: E402
 
 class TestCerradasNoSonFaltantes(unittest.TestCase):
     def test_resuelta_en_itop_no_cuenta_como_no_enviada(self):
-        r = cerrada("Ya no requiere", No_Enviada=True, Dia_Lote=date(2026, 10, 26))
+        # Sin TZ_LOCK (no se pudo leer): con 0 sería «¿Resuelto sin cancelar?» y con 7 «ya cancelada» (v3.3.4)
+        r = cerrada("Ya no requiere", No_Enviada=True, Dia_Lote=date(2026, 10, 26), SQL_Tz_Lock=None)
         reglas.aplicar_reglas([r])
         self.assertFalse(r['No_Enviada'])
         self.assertTrue(r['Cerrada_Sin_Envio'])
@@ -50,7 +51,7 @@ class TestCerradasNoSonFaltantes(unittest.TestCase):
 
     def test_recontar_envios(self):
         dia = date(2026, 10, 26)
-        filas = [cerrada("Ya no requiere", No_Enviada=True, Dia_Lote=dia),
+        filas = [cerrada("Ya no requiere", No_Enviada=True, Dia_Lote=dia, SQL_Tz_Lock=None),
                  cerrada("Es de otro día", No_Enviada=True, Dia_Lote=dia),
                  renovacion(No_Enviada=True, Dia_Lote=date(2026, 10, 27)),
                  renovacion(No_Enviada=True, Dia_Lote=dia, En_Periodo=False)]
