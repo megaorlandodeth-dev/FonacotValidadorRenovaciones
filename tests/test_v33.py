@@ -174,6 +174,41 @@ class TestModoClasico(unittest.TestCase):
         self.assertIn("VPN", error)
 
 
+class TestDireccionModoClasico(unittest.TestCase):
+    """En modo clásico va la dirección completa: el sqlnet.ora de un Oracle Client instalado puede no admitir la corta."""
+
+    def test_dsn_clasico(self):
+        import sql_renovaciones as sql
+        self.assertEqual(sql.dsn_clasico("scanfonacot.fonacot.gob.mx:1521/fonatop"),
+                         "(DESCRIPTION=(TRANSPORT_CONNECT_TIMEOUT=10)(ADDRESS=(PROTOCOL=TCP)"
+                         "(HOST=scanfonacot.fonacot.gob.mx)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=fonatop)))")
+        for igual in ("(DESCRIPTION=(ADDRESS=(HOST=x)(PORT=1)))", "FONATOP", "host:1521"):
+            self.assertEqual(sql.dsn_clasico(igual), igual)
+
+    def test_conectar_usa_la_direccion_completa_en_modo_clasico(self):
+        import types
+        from unittest import mock
+        import sql_renovaciones as sql
+        dsns = []
+
+        def connect(**kw):
+            dsns.append(kw["dsn"])
+            if len(dsns) == 1:
+                raise Exception("DPY-3015: password verifier type 0x939 is not supported")
+            return types.SimpleNamespace()
+
+        falso = types.SimpleNamespace(connect=connect, init_oracle_client=lambda lib_dir: None, __version__="3.4.2",
+                                      makedsn=lambda h, p, service_name: f"{h}:{p}/{service_name}")
+        with mock.patch.dict(sys.modules, {"oracledb": falso}), \
+                mock.patch.object(sql, "_clientes_oracle", return_value=[r"C:\oc"]), \
+                mock.patch.object(sql, "_cliente_oracle_iniciado", False):
+            sql.conectar("scanfonacot.fonacot.gob.mx:1521/fonatop", "FNT_USUARIO", "clave")
+            sql.conectar("scanfonacot.fonacot.gob.mx:1521/fonatop", "FNT_USUARIO", "clave")
+        self.assertEqual(dsns[0], "scanfonacot.fonacot.gob.mx:1521/fonatop")
+        self.assertTrue(all(d.startswith("(DESCRIPTION=") for d in dsns[1:]), dsns)
+        self.assertEqual(len(dsns), 3)
+
+
 class TestBuscarClienteOracle(unittest.TestCase):
     """El Oracle Client de SQL Developer puede estar en D: (perfiles en D:\\Users) y solo sirve el de 64 bits."""
 

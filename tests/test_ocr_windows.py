@@ -38,6 +38,36 @@ def captura(ruta):
     im.save(ruta)
 
 
+def captura_con_boton(ruta):
+    """
+    Como la de I-363027: en el renglón del cliente vienen la caja del número, el botón «?» y la caja del nombre. El OCR
+    de Windows se salta ese renglón entero; solo se leía el crédito.
+    """
+    im = Image.new("RGB", (760, 300), (212, 208, 200))
+    d = ImageDraw.Draw(im)
+    f = ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", 13)
+    fb = ImageFont.truetype(r"C:\Windows\Fonts\arialbd.ttf", 13)
+    d.rectangle((0, 0, 760, 28), fill=(40, 90, 160))
+    d.text((10, 6), "CONSULTA DE CREDITO", fill="white", font=fb)
+    d.text((14, 62), "Identificación del Crédito", fill="black", font=f)
+
+    def campo(x, y, ancho, texto, derecha=True):
+        d.rectangle((x, y, x + ancho, y + 20), fill="white", outline=(120, 120, 120))
+        d.text((x + ancho - d.textlength(texto, font=f) - 4 if derecha else x + 4, y + 3), texto, fill="black", font=f)
+
+    for y, etiqueta in ((80, "No. Cliente"), (130, "No. Credito"), (156, "Producto")):
+        d.rectangle((18, y, 168, y + 20), fill=(90, 90, 90))
+        d.text((48, y + 3), etiqueta, fill="white", font=fb)
+    campo(178, 80, 110, "8283620")
+    d.rectangle((292, 80, 306, 100), outline=(120, 120, 120))
+    d.text((296, 83), "?", fill="black", font=f)
+    campo(312, 80, 420, "HERNANDEZ RENTERIA ITZEL GUADALUPE", derecha=False)
+    campo(178, 130, 150, "63223")
+    campo(178, 156, 150, "390")
+    d.text((345, 159), "RENOVACION CREDITO MUJER EFECTIVO", fill="black", font=f)
+    im.save(ruta)
+
+
 class Adjunto:
     def __init__(self, ruta):
         self.ruta, self.FileName, self.Size = ruta, "image001.png", os.path.getsize(ruta)
@@ -79,6 +109,20 @@ class TestCapturaDeVerdad(unittest.TestCase):
             self.assertEqual((filas[0]['Numero_Cliente'], filas[0]['Credito_Renovado_Hijo']), ("4363419", "17626"))
             self.assertFalse(filas[0]['Datos_Incompletos'])
             self.assertEqual(motor.ocr_info['completadas'], 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_renglon_del_cliente_con_boton_y_nombre(self):
+        import ocr_imagenes
+        tmp = tempfile.mkdtemp()
+        try:
+            ruta = os.path.join(tmp, "consulta_boton.png")
+            captura_con_boton(ruta)
+            try:
+                datos = ocr_imagenes.extraer_de_versiones(ocr_imagenes.leer_imagenes([ruta]).get(ruta, []))
+            except ocr_imagenes.OCRNoDisponible as e:
+                self.skipTest(f"OCR de Windows no disponible: {e}")
+            self.assertEqual((datos['cliente'], datos['credito'], datos['dudosa']), ("8283620", "63223", False))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
