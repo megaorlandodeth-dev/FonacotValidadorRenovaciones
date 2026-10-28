@@ -22,8 +22,8 @@
 5. Opcional, pero recomendable la primera vez: doble clic en **`Revisar_Equipo.bat`** (junto al `.exe`). Revisa
    que el equipo tenga todo y muestra el resultado; debe decir *0 falla(s)* (ver [5.3](#53-probar-el-ejecutable)).
 
-El equipo necesita **Outlook** abierto con la cuenta donde llegan los incidentes. Para validar en la base hace falta el
-**Oracle Client** de SQL Developer y la VPN o la red de FONACOT. La lectura de capturas y PDF usa lo que ya trae
+El equipo necesita **Outlook** abierto con la cuenta donde llegan los incidentes. Para validar en la base hace falta un
+**Oracle Client** de 64 bits (SQL Developer no lo trae: se instala aparte) y la VPN o la red de FONACOT. La lectura de capturas y PDF usa lo que ya trae
 Windows 10/11.
 
 **Actualizar:** cerrar la app, borrar la carpeta `ValidadorRenovaciones` y descomprimir el `.zip` nuevo en el mismo
@@ -155,7 +155,7 @@ Notas:
 - No usar un ejecutable de un solo archivo: tarda más en abrir y los antivirus lo marcan más.
 - Al descomprimir, la carpeta donde quede no debe ser muy profunda: la ruta más larga dentro del paquete mide unos
   110 caracteres y Windows tiene un límite de 260.
-- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.1*). Se cambia en `APP_VERSION` de
+- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.2*). Se cambia en `APP_VERSION` de
   `validador_renovaciones_app.py`.
 
 ---
@@ -220,6 +220,8 @@ autoprueba.
 | *DPI-1050* al conectar a la base | El Oracle Client del equipo es 12.2: la app ya usa oracledb 3.4, compatible. Si persiste, poner la carpeta del Oracle Client en `sql_cliente_oracle`. |
 | *DPY-4000* / *getaddrinfo failed* | Revisar *Nombre del host* (`scanfonacot.fonacot.gob.mx`), *Puerto* y *Nombre del servicio*, y la VPN. |
 | *no tiene la fecha de la emisión de …* | La página de FONACOT no ha publicado esa emisión o no hubo internet; se vuelve a intentar en la siguiente búsqueda. |
+| *DPY-3015 … password verifier type … not supported* y *no hay un Oracle Client* | La base pide el modo clásico. SQL Developer no sirve para esto (usa su propio driver de Java): hay que instalar Oracle Instant Client 19 de 64 bits en cualquier disco, o poner su carpeta en `sql_cliente_oracle`. `Revisar_Equipo.bat` dice si lo encuentra. |
+| *ORA-01017* / *ORA-28000* / *ORA-28001* | Contraseña incorrecta / cuenta bloqueada / contraseña vencida: la misma de SQL Developer; si venció, cambiarla ahí. |
 | *DPY-3016 … cryptography package cannot be imported* | Pasaba en el ejecutable 3.3: descargar la 3.3.1 (ya trae `cryptography`). |
 | No se sabe qué falla en un equipo | Doble clic en `Revisar_Equipo.bat` y mandar `autoprueba.txt` al responsable de la app. |
 | La app se cierra o un botón falla | Mandar `validador.log` (junto al `.exe`) al responsable de la app. |

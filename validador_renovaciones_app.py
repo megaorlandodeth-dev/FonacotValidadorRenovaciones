@@ -75,7 +75,7 @@ import equipo_compartido as equipo
 import registro
 
 
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.3.2"
 # Trabajo en equipo por carpeta compartida (lo que marcan los analistas le llega al validador): apagado por ahora
 EQUIPO_ACTIVO = False
 
@@ -2398,6 +2398,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self.lbl_sql_estado.configure(text=texto, text_color=COL["success"] if ok else C("#B91C1C"))
         if ok:
             self._save_config()
+        else:
+            registro.log().warning("Probar conexión a la base: %s", texto)
 
     @staticmethod
     def _validar_sql(rows: list, lote_info: dict, cfg: dict) -> dict:
@@ -2410,8 +2412,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             finally:
                 conn.close()
         except ErrorSQL as e:
+            registro.log().warning("Validar en la base: %s", e)
             return {'ok': False, 'error': str(e)}
         except Exception as e:
+            registro.error("Validar en la base")
             texto = str(e).strip().splitlines()[0] if str(e).strip() else ""
             return {'ok': False, 'error': f"{type(e).__name__}: {texto}"}
 

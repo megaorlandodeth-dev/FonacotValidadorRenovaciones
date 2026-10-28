@@ -134,22 +134,93 @@ def armar_dsn(servidor: str, oracledb=None) -> str:
     return s
 
 
-def _buscar_cliente_oracle() -> str:
-    """Carpeta de un Oracle Client instalado (la de SQL Developer o la del sistema), para el modo clásico. '' si no hay."""
+# El ejecutable trae el Oracle Instant Client 19 en esta carpeta (Construir_Ejecutable.bat): acepta bases 11.2 o más
+CARPETA_CLIENTE_INCLUIDO = "oracle_cliente"
+# Donde suele quedar el Oracle Client en cualquier unidad (el de SQL Developer de FONACOT: D:\app\client\<usuario>\…)
+_PATRONES_CLIENTE = (r"app\*\product\*\*\bin", r"app\client\*\product\*\*\bin", r"app\*\product\*\*",
+                     r"app\*\instantclient*", r"oracle\*\bin", r"oracle\product\*\*\bin", r"oracle\instantclient*",
+                     r"oracle\*\instantclient*", r"instantclient*", r"Program Files\Oracle\*\bin")
+
+
+def _es_de_esta_app(dll: str) -> bool:
+    """El oci.dll es de 64 bits como la app (uno de 32 bits da DPI-1047 y no sirve)."""
+    import struct
+    maquina = 0x8664 if struct.calcsize("P") == 8 else 0x14C
+    try:
+        with open(dll, "rb") as f:
+            cabecera = f.read(4096)
+        pe = struct.unpack_from("<I", cabecera, 0x3C)[0]
+        return cabecera[pe:pe + 4] == b"PE\0\0" and struct.unpack_from("<H", cabecera, pe + 4)[0] == maquina
+    except (OSError, struct.error):
+        return False
+
+
+def _unidades_fijas() -> list:
+    """Discos C:, D:… (solo discos del equipo: una unidad de red desconectada haría esperar)."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        mapa = k32.GetLogicalDrives()
+    except Exception:
+        return ["C:\\"]
+    return [f"{chr(65 + i)}:\\" for i in range(26)
+            if mapa >> i & 1 and k32.GetDriveTypeW(f"{chr(65 + i)}:\\") == 3]
+
+
+def _homes_del_registro() -> list:
+    """ORACLE_HOME de los Oracle Client que registró el instalador (HKLM/SOFTWARE/ORACLE/KEY_…)."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    homes = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\ORACLE") as raiz:
+            for i in range(winreg.QueryInfoKey(raiz)[0]):
+                try:
+                    with winreg.OpenKey(raiz, winreg.EnumKey(raiz, i)) as llave:
+                        homes.append(winreg.QueryValueEx(llave, "ORACLE_HOME")[0])
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return homes
+
+
+def _clientes_oracle() -> list:
+    """
+    Carpetas con un Oracle Client que esta app puede usar para el modo clásico: primero el que trae el ejecutable,
+    luego el instalado (ORACLE_HOME, PATH, registro y las carpetas de siempre en cada disco).
+    """
     import glob
     import os
+    from core_renovaciones import get_app_dir
     candidatos = []
-    for var in ("ORACLE_HOME",):
-        if os.environ.get(var):
-            candidatos += [os.path.join(os.environ[var], "bin"), os.environ[var]]
+    incluido = os.path.join(get_app_dir(), CARPETA_CLIENTE_INCLUIDO)
+    candidatos += [incluido] + sorted(glob.glob(os.path.join(incluido, "instantclient*")), reverse=True)
+    homes = ([os.environ["ORACLE_HOME"]] if os.environ.get("ORACLE_HOME") else []) + _homes_del_registro()
+    for home in homes:
+        candidatos += [os.path.join(home, "bin"), home]
     candidatos += [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
-    for patron in (r"C:\app\*\product\*\*\bin", r"C:\app\client\*\product\*\*\bin", r"C:\oracle\*\bin",
-                   r"C:\oracle\product\*\*\bin", r"C:\instantclient*", r"C:\oracle\instantclient*"):
-        candidatos += sorted(glob.glob(patron), reverse=True)
+    for unidad in _unidades_fijas():
+        for patron in _PATRONES_CLIENTE:
+            candidatos += sorted(glob.glob(os.path.join(unidad, patron)), reverse=True)
+    vistos, carpetas = set(), []
     for carpeta in candidatos:
-        if os.path.isfile(os.path.join(carpeta, "oci.dll")):
-            return carpeta
-    return ""
+        clave = os.path.normcase(os.path.normpath(carpeta))
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        dll = os.path.join(carpeta, "oci.dll")
+        if os.path.isfile(dll) and _es_de_esta_app(dll):
+            carpetas.append(carpeta)
+    return carpetas
+
+
+def _buscar_cliente_oracle() -> str:
+    """El primer Oracle Client que sirve (ver _clientes_oracle). '' si no hay."""
+    carpetas = _clientes_oracle()
+    return carpetas[0] if carpetas else ""
 
 
 # oracledb 4 ya no acepta Oracle Client anteriores a 19 (el de SQL Developer de FONACOT es 12.2): la 3.4 sí
@@ -173,6 +244,36 @@ def _explicar_cliente_viejo(texto: str, carpeta: str) -> str:
             f"de oracledb ya no lo acepta.  →  Cierra la app y ábrela con Ejecutar_Validador_Renovaciones.bat (instala "
             f"la versión compatible) o ejecuta:  python -m pip install \"{ORACLEDB_COMPATIBLE}\"  ·  Otra opción: "
             f"instalar Oracle Instant Client 19 o más reciente e indicar su carpeta en «sql_cliente_oracle».")
+
+
+def _pide_modo_clasico(texto: str) -> bool:
+    """
+    Errores del modo thin que el modo clásico (Oracle Client) sí resuelve: DPY-3xxx («not supported in thin mode»:
+    3010 versión de la base, 3015 contraseña con verificador 10G, 3001 cifrado de red, 3016 falta cryptography…) y
+    DPY-4011 (la base cierra la conexión, p. ej. porque exige cifrado de red).
+    """
+    return bool(re.search(r'DPY-3\d{3}', texto)) or "DPY-4011" in texto
+
+
+_CONSEJOS = (
+    (("ORA-01017",), "Usuario o contraseña incorrectos: usa los mismos de SQL Developer (la contraseña distingue "
+                     "mayúsculas)."),
+    (("ORA-28000",), "La cuenta de la base está bloqueada: pide que la desbloqueen."),
+    (("ORA-28001", "ORA-28002"), "La contraseña de la base venció: cámbiala en SQL Developer y escríbela aquí."),
+    (("ORA-12514", "ORA-12505", "DPY-4000", "DPY-4026", "DPY-4027", "ORA-12154"),
+     "Revisa Host, Puerto y Servicio (como en SQL Developer: Básico, Nombre del servicio)."),
+    (("ORA-12541", "ORA-12170", "ORA-12535", "ORA-12543", "DPY-6005", "DPY-6000", "getaddrinfo", "11001"),
+     "No responde el servidor «{host}»: revisa el Nombre del host y que estés en la red de FONACOT (VPN)."),
+    (("ORA-01005",), "Falta la contraseña de la base."),
+)
+
+
+def _con_consejo(texto: str, servidor: str) -> str:
+    """El error de Oracle con qué hacer al final (si se conoce)."""
+    for codigos, consejo in _CONSEJOS:
+        if any(c in texto for c in codigos):
+            return f"{texto}  →  {consejo.format(host=separar_servidor(servidor)[0])}"
+    return texto
 
 
 def _mensaje(e: Exception) -> str:
@@ -208,28 +309,29 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
         conn = oracledb.connect(user=usuario, password=password, dsn=dsn, tcp_connect_timeout=10)
     except Exception as e:
         texto = _mensaje(e)
-        # DPY-3016: al modo thin le falta «cryptography»; con el Oracle Client instalado, el modo clásico sí funciona
-        clasico = "DPY-3015" in texto or "DPY-3010" in texto or "DPY-3016" in texto
-        encontrado = _buscar_cliente_oracle() if clasico and not _cliente_oracle_iniciado else ""
-        if encontrado:
-            # La base pide el modo clásico: se usa el Oracle Client que ya está instalado (el de SQL Developer)
+        if _cliente_oracle_iniciado or not _pide_modo_clasico(texto):
+            raise ErrorSQL(_con_consejo(texto, servidor))
+        # La base pide el modo clásico: el Oracle Client que trae la app o el instalado (el de SQL Developer)
+        fallos = []
+        for carpeta in _clientes_oracle():
             try:
-                oracledb.init_oracle_client(lib_dir=encontrado)
-                _cliente_oracle_iniciado = True
+                oracledb.init_oracle_client(lib_dir=carpeta)
+            except Exception as e2:
+                fallos.append(_explicar_cliente_viejo(f"{_mensaje(e2)} ({carpeta})", carpeta))
+                continue
+            _cliente_oracle_iniciado = True
+            try:
                 conn = oracledb.connect(user=usuario, password=password, dsn=dsn)
             except Exception as e2:
-                raise ErrorSQL(_explicar_cliente_viejo(f"{_mensaje(e2)}  (con el Oracle Client de {encontrado})",
-                                                       encontrado))
+                raise ErrorSQL(_con_consejo(f"{_mensaje(e2)}  (modo clásico, Oracle Client de {carpeta})", servidor))
+            break
         else:
-            if clasico:
-                texto += ("  →  Esta base pide el modo clásico de Oracle y no se encontró un Oracle Client: indica "
-                          "su carpeta en la configuración («sql_cliente_oracle»).")
-            elif "DPY-4000" in texto or "DPY-4026" in texto or "DPY-4027" in texto:
-                texto += "  →  Revisa Host, Puerto y Servicio (como en SQL Developer: Básico, Nombre del servicio)."
-            elif "getaddrinfo" in texto or "11001" in texto or "DPY-6005" in texto:
-                texto += (f"  →  No se encontró o no responde el servidor «{separar_servidor(servidor)[0]}»: revisa el "
-                          "Nombre del host y que estés en la red de FONACOT (VPN).")
-            raise ErrorSQL(texto)
+            if fallos:
+                raise ErrorSQL(f"{texto}  →  Esta base pide el modo clásico de Oracle y no se pudo usar ningún "
+                               f"Oracle Client: {'  ·  '.join(fallos)}")
+            raise ErrorSQL(f"{texto}  →  Esta base pide el modo clásico de Oracle y en este equipo no hay un Oracle "
+                           f"Client de 64 bits (SQL Developer no lo trae): pide que instalen Oracle Instant Client 19 "
+                           f"o indica su carpeta en «sql_cliente_oracle».")
     try:
         conn.call_timeout = TIEMPO_MAX_MS
     except Exception:

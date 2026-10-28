@@ -1,4 +1,4 @@
-# FONACOT · Validador de Renovaciones — v3.3.1
+# FONACOT · Validador de Renovaciones — v3.3.2
 
 Aplicación de escritorio para Windows que arma y valida el **lote diario de cancelaciones y reversas de renovaciones**
 que llegan como incidentes de iTop a Outlook, y prepara el **ticket único** del día.
@@ -45,6 +45,10 @@ Se elige al abrir la app y se cambia con el botón de perfil (arriba a la derech
 
 - **Ejecutable para equipos sin Python:** se reparte `ValidadorRenovaciones.zip`; el analista lo descomprime y abre
   `ValidadorRenovaciones.exe`. No hay que instalar Python ni librerías.
+- **3.3.2 · Modo clásico de Oracle:** la base de FONACOT pide el modo clásico (*DPY-3015*) y la app solo buscaba el
+  Oracle Client en C:. Ahora lo busca en todos los discos y en el registro de Windows, descarta los de 32 bits y cambia
+  al modo clásico con cualquier error que el modo thin no soporte. Los errores comunes (contraseña, cuenta bloqueada,
+  servicio, VPN) dicen qué hacer y quedan en `validador.log`. La autoprueba revisa también que el servidor responda. El OCR y el lector de PDF llaman a PowerShell por su ruta completa (funcionan aunque TI haya cambiado el PATH).
 - **3.3.1 · Conexión a la base desde el ejecutable:** el `.exe` de la 3.3 no traía `cryptography` y *Probar
   conexión* fallaba con *DPY-3016*. Ya la trae; además, si el modo thin no se puede usar, se intenta con el Oracle
   Client instalado.
@@ -65,7 +69,8 @@ Se elige al abrir la app y se cambia con el botón de perfil (arriba a la derech
 2. Abrir `ValidadorRenovaciones\ValidadorRenovaciones.exe`.
 3. Si aparece *Windows protegió su PC*: *Más información → Ejecutar de todas formas* (el `.exe` no está firmado).
 
-El equipo necesita **Outlook** con la sesión abierta y, para validar en la base, el **Oracle Client** de SQL Developer.
+El equipo necesita **Outlook** con la sesión abierta y, para validar en la base, un **Oracle Client** de 64 bits
+(SQL Developer no lo trae: se instala aparte).
 Para actualizar se borra la carpeta anterior y se descomprime la nueva; la configuración se conserva.
 
 ### Desarrollo (con Python 3.10+)

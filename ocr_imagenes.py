@@ -24,6 +24,10 @@ MAX_IMAGENES_POR_CORREO = 4
 MAX_PAGINAS_PDF = 2              # del estado de cuenta basta la primera hoja
 TAM_MIN_PDF = 1024
 TIEMPO_MAX_OCR = 90              # segundos por llamada
+# Por ruta completa: en equipos con el PATH cambiado (políticas de TI) «powershell.exe» solo no se encuentra
+_POWERSHELL = next((p for p in [os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
+                                             "WindowsPowerShell", "v1.0", "powershell.exe")] if os.path.isfile(p)),
+                   "powershell.exe")
 
 _SEP = "\x1f"
 _CACHE = {}                      # sha1 de la imagen -> líneas leídas (no se vuelve a leer en cada actualización)
@@ -170,7 +174,7 @@ def _ejecutar_ocr(rutas: list) -> dict:
         cifrado = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         try:
             proc = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", cifrado],
+                [_POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", cifrado],
                 capture_output=True, timeout=TIEMPO_MAX_OCR,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
@@ -268,7 +272,7 @@ def pdf_a_imagenes(pdfs: list, notas: list = None) -> list:
         cifrado = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         try:
             proc = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", cifrado],
+                [_POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", cifrado],
                 capture_output=True, timeout=TIEMPO_MAX_OCR,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )

@@ -11,6 +11,7 @@ import importlib
 import json
 import os
 import platform
+import re
 import sys
 import tempfile
 import time
@@ -59,18 +60,46 @@ def _oracle_thin():
 
 
 def _oracle_cliente(config: dict):
+    # El modo clásico, que la base de FONACOT pide (DPY-3015): el Oracle Client que trae la app o el instalado
     import oracledb
     import sql_renovaciones as sql
-    carpeta = config.get("sql_cliente_oracle") or sql._buscar_cliente_oracle()
-    if not carpeta:
-        return AVISO, ("no se encontró Oracle Client (el de SQL Developer). Solo hace falta si la base pide el modo "
-                       "clásico; sin él, la validación en la base puede no funcionar")
+    carpetas = [config["sql_cliente_oracle"]] if config.get("sql_cliente_oracle") else sql._clientes_oracle()
+    if not carpetas:
+        return AVISO, ("no se encontró un Oracle Client de 64 bits en ningún disco (SQL Developer no lo trae): si "
+                       "la base pide el modo clásico (DPY-3015), la validación en la base no funcionará")
+    fallos = []
+    for carpeta in carpetas:
+        try:
+            oracledb.init_oracle_client(lib_dir=carpeta)
+        except Exception as e:
+            fallos.append(sql._explicar_cliente_viejo(f"{carpeta}: {str(e).splitlines()[0]}", carpeta))
+            continue
+        version = ".".join(str(n) for n in oracledb.clientversion())
+        try:
+            oracledb.connect(user="prueba", password="prueba", dsn="127.0.0.1:9/prueba")
+        except Exception as e:
+            texto = str(e).splitlines()[0] if str(e) else type(e).__name__
+            if not re.search(r"ORA-125\d\d|ORA-12170|TNS-", texto):
+                return AVISO, f"Oracle Client {version} en {carpeta}: respuesta inesperada: {texto[:160]}"
+        return OK, f"Oracle Client {version} en {carpeta} (modo clásico listo)"
+    return FALLA, "no se pudo usar ningún Oracle Client: " + "  ·  ".join(fallos)
+
+
+def _servidor(config: dict):
+    # Solo abre y cierra el puerto del servidor de la base (sin usuario ni contraseña)
+    import socket
+    import sql_renovaciones as sql
+    servidor = sql.servidor_de(config.get("sql_host", ""), config.get("sql_puerto", ""), config.get("sql_servicio", ""))
+    if not servidor:
+        return AVISO, "aún no hay servidor en «Validar en la base de datos»"
+    host, puerto, _ = sql.separar_servidor(servidor)
+    puerto = int(puerto or 1521)
     try:
-        oracledb.init_oracle_client(lib_dir=carpeta)
-    except Exception as e:
-        return FALLA, sql._explicar_cliente_viejo(f"no se pudo usar el de {carpeta}: {e}", carpeta)
-    version = ".".join(str(n) for n in oracledb.clientversion())
-    return OK, f"Oracle Client {version} en {carpeta}"
+        socket.create_connection((host, puerto), timeout=5).close()
+    except OSError as e:
+        return AVISO, (f"no responde {host}:{puerto} ({e.strerror or e}): revisa el Nombre del host y que estés en la "
+                       f"red de FONACOT (VPN)")
+    return OK, f"{host}:{puerto} responde"
 
 
 def _excel():
@@ -171,6 +200,7 @@ def revisar() -> list:
         ("Cifrado (para la base)", _cifrado),
         ("Conector de la base (modo thin)", _oracle_thin),
         ("Oracle Client (modo clásico)", lambda: _oracle_cliente(config)),
+        ("Servidor de la base", lambda: _servidor(config)),
         ("Excel", _excel),
         ("OCR de capturas", _ocr),
         ("Lector de PDF", lambda: _pdf(app_dir)),
