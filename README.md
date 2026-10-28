@@ -1,4 +1,4 @@
-# FONACOT · Validador de Renovaciones — v3.3
+# FONACOT · Validador de Renovaciones — v3.3.1
 
 Aplicación de escritorio para Windows que arma y valida el **lote diario de cancelaciones y reversas de renovaciones**
 que llegan como incidentes de iTop a Outlook, y prepara el **ticket único** del día.
@@ -45,6 +45,12 @@ Se elige al abrir la app y se cambia con el botón de perfil (arriba a la derech
 
 - **Ejecutable para equipos sin Python:** se reparte `ValidadorRenovaciones.zip`; el analista lo descomprime y abre
   `ValidadorRenovaciones.exe`. No hay que instalar Python ni librerías.
+- **3.3.1 · Conexión a la base desde el ejecutable:** el `.exe` de la 3.3 no traía `cryptography` y *Probar
+  conexión* fallaba con *DPY-3016*. Ya la trae; además, si el modo thin no se puede usar, se intenta con el Oracle
+  Client instalado.
+- **3.3.1 · Autoprueba del equipo:** `Revisar_Equipo.bat` (junto al `.exe`) revisa que el ejecutable y el equipo
+  tengan todo (librerías, conector de la base, Oracle Client, Excel, OCR, PDF, Outlook, carpeta, internet) y deja
+  el resultado en `autoprueba.txt`.
 - **Etiquetas del crédito con aclaración entre paréntesis:** *NUMERO DE CREDITO (REN) : 57815*, *CREDITO (REN): …*,
   *No. de crédito (hijo)*, *RENOVACION (CREDITO NUEVO): …* y *CREDITO (57815)* ya se leen (antes salía
   *SIN CRÉDITO*).
@@ -96,6 +102,7 @@ Para construir el `.zip`: doble clic en `Construir_Ejecutable.bat` (ver la guía
 | `equipo_compartido.py` | Trabajo en equipo por carpeta compartida (apagado en esta versión) |
 | `tests/` | Pruebas automáticas (no necesitan Outlook ni la base) |
 | `ValidadorRenovaciones.spec`, `Construir_Ejecutable.bat` | Construcción del ejecutable |
+| `autoprueba.py`, `Revisar_Equipo.bat` | Autoprueba del equipo y del ejecutable (`--autoprueba`) |
 | `GUIA_DE_USO.md`, `guia_pdf.py` | La guía y el script que la convierte en `GUIA_DE_USO.pdf` |
 | `Ejecutar_Validador_Renovaciones.bat` | Abre el ejecutable si existe; si no, la app con Python |
 

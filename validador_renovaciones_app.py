@@ -75,7 +75,7 @@ import equipo_compartido as equipo
 import registro
 
 
-APP_VERSION = "3.3"
+APP_VERSION = "3.3.1"
 # Trabajo en equipo por carpeta compartida (lo que marcan los analistas le llega al validador): apagado por ahora
 EQUIPO_ACTIVO = False
 
@@ -5026,5 +5026,9 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
 
 if __name__ == "__main__":
+    if "--autoprueba" in sys.argv:
+        # Revisa que este equipo y el ejecutable tengan todo (Revisar_Equipo.bat); ver autoprueba.py
+        import autoprueba
+        sys.exit(autoprueba.main(APP_VERSION, con_ventana="--sin-ventana" not in sys.argv))
     app = FonacotValidadorRenovacionesApp()
     app.mainloop()

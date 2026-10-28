@@ -19,6 +19,8 @@
 3. Si sale *Windows protegió su PC*: *Más información → Ejecutar de todas formas*. Si Sistemas bloquea programas fuera
    de *Archivos de programa*, hay que pedirles que lo permitan.
 4. La primera vez se elige el perfil (**Usuario** o **Validador**) y el gafete.
+5. Opcional, pero recomendable la primera vez: doble clic en **`Revisar_Equipo.bat`** (junto al `.exe`). Revisa
+   que el equipo tenga todo y muestra el resultado; debe decir *0 falla(s)* (ver [5.3](#53-probar-el-ejecutable)).
 
 El equipo necesita **Outlook** abierto con la cuenta donde llegan los incidentes. Para validar en la base hace falta el
 **Oracle Client** de SQL Developer y la VPN o la red de FONACOT. La lectura de capturas y PDF usa lo que ya trae
@@ -153,7 +155,7 @@ Notas:
 - No usar un ejecutable de un solo archivo: tarda más en abrir y los antivirus lo marcan más.
 - Al descomprimir, la carpeta donde quede no debe ser muy profunda: la ruta más larga dentro del paquete mide unos
   110 caracteres y Windows tiene un límite de 260.
-- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3*). Se cambia en `APP_VERSION` de
+- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.1*). Se cambia en `APP_VERSION` de
   `validador_renovaciones_app.py`.
 
 ---
@@ -183,11 +185,20 @@ cambio solo se reparte si **todas** pasan.
 ### 5.3 Probar el ejecutable
 
 1. Descomprimir el `.zip` en una carpeta nueva (por ejemplo en el Escritorio) de un equipo **sin Python**.
-2. Abrir el `.exe`: debe salir la ventana con *Versión 3.3* al pie.
-3. **Extraer y validar** con Outlook abierto: deben aparecer las renovaciones del día.
-4. Con *Validaciones automáticas*: **Probar conexión** a la base y revisar que la columna *Base de datos* se llene.
-5. Abrir un incidente con captura o PDF y revisar que el desglose diga *leído de la imagen* o *del estado de cuenta*.
-6. **Exportar a Excel** y **Crear correo Ticket Único** (solo el borrador, sin enviarlo).
+2. Doble clic en **`Revisar_Equipo.bat`** (o `ValidadorRenovaciones.exe --autoprueba`). Prueba dentro del
+   ejecutable, sin usuario ni contraseña: las librerías, el cifrado y el conector de la base (modo thin), el Oracle
+   Client (modo clásico), el Excel, el OCR con una imagen de prueba, el lector de PDF con esta guía, Outlook, que se
+   pueda escribir en la carpeta y la página del calendario. Deja el resultado en `autoprueba.txt`. Con alguna
+   **FALLA** no se reparte; los **AVISO** dependen del equipo (Outlook cerrado, sin Oracle Client, sin internet).
+3. Abrir el `.exe`: debe salir la ventana con la versión al pie.
+4. **Extraer y validar** con Outlook abierto: deben aparecer las renovaciones del día.
+5. Con *Validaciones automáticas*: **Probar conexión** a la base y revisar que la columna *Base de datos* se llene.
+6. Abrir un incidente con captura o PDF y revisar que el desglose diga *leído de la imagen* o *del estado de cuenta*.
+7. **Exportar a Excel** y **Crear correo Ticket Único** (solo el borrador, sin enviarlo).
+
+Si al ejecutable le falta una librería que la app carga solo en algún momento (como `cryptography`, que la base
+usa al conectarse), se agrega en `hiddenimports` de `ValidadorRenovaciones.spec` y se prueba de nuevo con la
+autoprueba.
 
 ### 5.4 En el día a día
 
@@ -209,4 +220,6 @@ cambio solo se reparte si **todas** pasan.
 | *DPI-1050* al conectar a la base | El Oracle Client del equipo es 12.2: la app ya usa oracledb 3.4, compatible. Si persiste, poner la carpeta del Oracle Client en `sql_cliente_oracle`. |
 | *DPY-4000* / *getaddrinfo failed* | Revisar *Nombre del host* (`scanfonacot.fonacot.gob.mx`), *Puerto* y *Nombre del servicio*, y la VPN. |
 | *no tiene la fecha de la emisión de …* | La página de FONACOT no ha publicado esa emisión o no hubo internet; se vuelve a intentar en la siguiente búsqueda. |
+| *DPY-3016 … cryptography package cannot be imported* | Pasaba en el ejecutable 3.3: descargar la 3.3.1 (ya trae `cryptography`). |
+| No se sabe qué falla en un equipo | Doble clic en `Revisar_Equipo.bat` y mandar `autoprueba.txt` al responsable de la app. |
 | La app se cierra o un botón falla | Mandar `validador.log` (junto al `.exe`) al responsable de la app. |

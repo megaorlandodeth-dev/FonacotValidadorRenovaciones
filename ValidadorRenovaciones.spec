@@ -5,8 +5,10 @@
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = collect_data_files("customtkinter") + collect_data_files("tkcalendar") + collect_data_files("babel")
-hiddenimports = (["win32timezone", "babel.numbers", "babel.dates", "PIL.Image", "PIL.ImageOps", "lxml.etree"]
-                 + collect_submodules("oracledb"))
+# oracledb carga cryptography desde código compilado (PyInstaller no lo ve): sin ella, el modo thin falla con DPY-3016
+hiddenimports = (["win32timezone", "win32cred", "win32clipboard", "babel.numbers", "babel.dates", "PIL.Image",
+                  "PIL.ImageOps", "PIL.ImageDraw", "PIL.ImageFont", "lxml.etree", "autoprueba"]
+                 + collect_submodules("oracledb") + collect_submodules("cryptography"))
 
 a = Analysis(
     ["validador_renovaciones_app.py"],

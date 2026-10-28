@@ -26,6 +26,7 @@ wheels/
 *.spec
 !ValidadorRenovaciones.spec
 ValidadorRenovaciones.zip
+autoprueba.txt
 
 # Local configurations and cache
 *.json

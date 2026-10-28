@@ -19,6 +19,7 @@ Administrador de credenciales de Windows.
 """
 
 import re
+import sys
 from datetime import date, datetime, timedelta
 
 TABLA_DEFAULT = "TOPAZ.CR_RENOVACIONES"
@@ -164,6 +165,10 @@ def _explicar_cliente_viejo(texto: str, carpeta: str) -> str:
         version = oracledb.__version__
     except Exception:
         version = "?"
+    if getattr(sys, 'frozen', False):
+        return (f"El Oracle Client de este equipo ({carpeta or 'el instalado'}) no es compatible con la versión "
+                f"{version} de oracledb que trae el ejecutable.  →  Instala Oracle Instant Client 19 o más reciente e "
+                f"indica su carpeta en «sql_cliente_oracle», o avisa a quien reparte la app.")
     return (f"El Oracle Client de este equipo ({carpeta or 'el instalado'}) es anterior a 19 y la versión {version} "
             f"de oracledb ya no lo acepta.  →  Cierra la app y ábrela con Ejecutar_Validador_Renovaciones.bat (instala "
             f"la versión compatible) o ejecuta:  python -m pip install \"{ORACLEDB_COMPATIBLE}\"  ·  Otra opción: "
@@ -203,7 +208,8 @@ def conectar(servidor: str, usuario: str, password: str, cliente_oracle: str = "
         conn = oracledb.connect(user=usuario, password=password, dsn=dsn, tcp_connect_timeout=10)
     except Exception as e:
         texto = _mensaje(e)
-        clasico = "DPY-3015" in texto or "DPY-3010" in texto
+        # DPY-3016: al modo thin le falta «cryptography»; con el Oracle Client instalado, el modo clásico sí funciona
+        clasico = "DPY-3015" in texto or "DPY-3010" in texto or "DPY-3016" in texto
         encontrado = _buscar_cliente_oracle() if clasico and not _cliente_oracle_iniciado else ""
         if encontrado:
             # La base pide el modo clásico: se usa el Oracle Client que ya está instalado (el de SQL Developer)

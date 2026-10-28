@@ -27,6 +27,7 @@ rem La guia va en PDF (los analistas no tienen lector de .md); la imprime Edge
 %PYEXE% guia_pdf.py
 if errorlevel 1 goto error
 copy /y GUIA_DE_USO.pdf dist\ValidadorRenovaciones\ >nul
+copy /y Revisar_Equipo.bat dist\ValidadorRenovaciones\ >nul
 if exist ValidadorRenovaciones.zip del ValidadorRenovaciones.zip
 powershell -NoProfile -Command "Compress-Archive -Path 'dist\ValidadorRenovaciones' -DestinationPath 'ValidadorRenovaciones.zip'"
 if errorlevel 1 goto error
