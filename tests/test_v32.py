@@ -467,5 +467,75 @@ class TestCorregirDato(unittest.TestCase):
         self.assertIn("usa «Corregir dato» (E)", reglas._accion_corregir(r, []))
 
 
+class TestCorreoSinAsuntoConAdjunto(unittest.TestCase):
+    """Asunto «APOYO», «RENOMVACION» y el estado de cuenta en PDF (I-362736)."""
+
+    TEXTO = ("Asunto APOYO\nDescripcion\nBUENAS TARDES EL TRABAJADOR ME INDICA SI SE PUEDE CANCELAR LA RENOMVACION "
+             "YA QUE NO LE LIBERO EL CAPITAL QUE EL REQUERIA\n\nSIN MAS QUEDO ATENTA")
+
+    def leer(self, texto, por_adjunto=False):
+        return Parser.parse_and_disaggregate_email("APOYO", "", texto, datetime(2026, 10, 27, 16, 0), "I-362736",
+                                                   "2609", "N", por_adjunto=por_adjunto)
+
+    def test_renovacion_mal_escrita(self):
+        rows = self.leer(self.TEXTO)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]['Datos_Incompletos'])
+        self.assertEqual(rows[0]['Motivo'], "No le liberó el capital que requería")
+        for mal in ("RENOBACION", "RENOVASION", "RENVACION"):
+            self.assertTrue(self.leer(self.TEXTO.replace("RENOMVACION", mal)), mal)
+
+    def test_solo_pide_cancelar_depende_del_adjunto(self):
+        texto = "Asunto APOYO\nDescripcion\nBUEN DIA FAVOR DE CANCELAR, ANEXO ESTADO DE CUENTA"
+        self.assertEqual(self.leer(texto), [])
+        rows = self.leer(texto, por_adjunto=True)
+        self.assertEqual(rows[0]['Subtipo_Renovacion'], "Cancelación (según el adjunto)")
+        self.assertEqual(self.leer("Asunto APOYO\nDescripcion\nFAVOR DE REVISAR EL ADJUNTO", por_adjunto=True), [])
+        self.assertEqual(self.leer("Asunto APOYO\nDescripcion\nDICE JUAN DEBE DECIR JUAN, FAVOR DE CANCELAR",
+                                   por_adjunto=True), [])
+
+    @staticmethod
+    def renglon(y, *textos):
+        palabras, x = [], 40
+        for t in textos:
+            palabras.append((t, x, y, len(t) * 9, 14))
+            x += len(t) * 9 + 30
+        return palabras
+
+    def lineas(self):
+        r = self.renglon
+        return [r(20, "ESTADO", "DE", "CUENTA"), r(60, "Cliente:", "3084664", "MARTINEZ", "CARRERA", "FRANCISCO"),
+                r(80, "No.", "IMSS:", "52886601756", "Fecha", "Alta:", "08/11/2015"),
+                r(120, "NO.", "CREDITO", "PRODUCTO", "FECHA", "AUTORIZADO", "FECHA", "EJERCIDO"),
+                r(140, "43267", "53", "27/03/2022", "0", "0.00"),
+                r(200, "1085", "350", "29/09/2021", "30/09/2021", "5,184.04", "12/12"),
+                r(220, "22207", "301", "02/09/2025", "02/09/2025", "8,319.87", "13/27"),
+                r(240, "41342", "301", "26/10/2026", "26/10/2026", "49,217.29", "0/12"),
+                r(400, "Fecha:", "26/10/2026", "FORM5061")]
+
+    def test_estado_de_cuenta(self):
+        import ocr_imagenes as o
+        d = o.extraer_de_versiones([self.lineas(), self.lineas()])
+        self.assertEqual(d['cliente'], "3084664")
+        self.assertEqual(d['credito'], "")  # no el primero de la tabla (43267)
+        elegida = o.renovacion_del_estado(d['edo_cuenta'], date(2026, 10, 27))
+        self.assertEqual((elegida['creditos'], elegida['fecha'], elegida['dudosa']), (["41342"], date(2026, 10, 26), False))
+        lejos = o.renovacion_del_estado(d['edo_cuenta'], date(2026, 12, 15))
+        self.assertEqual(lejos['creditos'], [])
+        self.assertIn("el último: 41342 del 26/10/2026", lejos['nota'])
+        self.assertEqual(o.nombre_mostrado(r"C:\t\adj2_EDO_CTA.pdf_pag1.png"), "EDO_CTA.pdf (pág. 1)")
+
+    def test_completa_y_lo_explica(self):
+        from core_renovaciones import completar_con_imagenes
+        rows = completar_con_imagenes(self.leer(self.TEXTO), [{
+            'cliente': "3084664", 'credito': "41342", 'dudosa': False, 'imagen': "EDO.pdf (pág. 1)",
+            'fuente': "del estado de cuenta «EDO.pdf (pág. 1)» (autorizado el 26/10/2026)"}])
+        r = rows[0]
+        self.assertEqual((r['Numero_Cliente'], r['Credito_Renovado_Hijo'], r['Datos_Incompletos']), ("3084664", "41342", False))
+        nivel, texto = reglas._check_correo(r)
+        self.assertEqual(nivel, reglas.AVISO)
+        self.assertIn("estado de cuenta «EDO.pdf (pág. 1)» (autorizado el 26/10/2026)", texto)
+
+
 if __name__ == "__main__":
     unittest.main()

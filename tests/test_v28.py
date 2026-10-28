@@ -162,7 +162,7 @@ class TestImagenesDelIncidente(unittest.TestCase):
         motor._correos_por_ticket = {'I-362700': [sin_imagen, con_imagen]}
         vistos = []
 
-        def leer(correo, notas=None):
+        def leer(correo, notas=None, ref=None):
             vistos.append(correo)
             return ([{'cliente': '4937968', 'credito': '85277', 'imagen': 'x.png', 'texto': '', 'dudosa': False}], 1) \
                 if correo is con_imagen else ([], 0)
