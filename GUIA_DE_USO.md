@@ -157,7 +157,7 @@ Notas:
 - No usar un ejecutable de un solo archivo: tarda más en abrir y los antivirus lo marcan más.
 - Al descomprimir, la carpeta donde quede no debe ser muy profunda: la ruta más larga dentro del paquete mide unos
   110 caracteres y Windows tiene un límite de 260.
-- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.4*). Se cambia en `APP_VERSION` de
+- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.5*). Se cambia en `APP_VERSION` de
   `validador_renovaciones_app.py`.
 
 ---
@@ -224,6 +224,8 @@ autoprueba.
 | Correo con «Crédito / Renovación / Cliente» (el crédito primero): sale el crédito como cliente o se manda el crédito en vez de la renovación | Pasaba antes de la 3.3.4. Con la 3.3.4 se cancela la renovación y el crédito queda como padre. |
 | Se mandó una renovación que ya estaba cancelada | Desde la 3.3.4, con la base activa, la que ya está bloqueada (`TZ_LOCK` distinto de 0) sale del lote: *No se manda: ya está cancelada*. |
 | Al cambiar de Validador a Usuario (o al revés) seguía haciendo lo del otro perfil | Pasaba antes de la 3.3.4. Al cambiar de perfil se limpia la tabla: F5 para buscar con el perfil nuevo. |
+| En una laptop no se ve el correo original (o algo queda cortado abajo) | Desde la 3.3.5 sale una barra a la derecha para bajar. El correo también se abre completo con **Abrir en ventana ↗** o con doble clic. |
+| No aparece un incidente que dice «cancelar el crédito X y regresar al Y» | Pasaba antes de la 3.3.5 (no decía «renovación»). Con la 3.3.5 se cancela X y Y queda como crédito origen. |
 | *ORA-12154* en modo clásico | Pasaba antes de la 3.3.3 con algunos Oracle Client instalados: descargar la versión más reciente. |
 | *DPY-4000* / *getaddrinfo failed* | Revisar *Nombre del host* (`scanfonacot.fonacot.gob.mx`), *Puerto* y *Nombre del servicio*, y la VPN. |
 | *no tiene la fecha de la emisión de …* | La página de FONACOT no ha publicado esa emisión o no hubo internet; se vuelve a intentar en la siguiente búsqueda. |

@@ -75,7 +75,7 @@ import equipo_compartido as equipo
 import registro
 
 
-APP_VERSION = "3.3.4"
+APP_VERSION = "3.3.5"
 # Trabajo en equipo por carpeta compartida (lo que marcan los analistas le llega al validador): apagado por ahora
 EQUIPO_ACTIVO = False
 
@@ -759,8 +759,22 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         self._build_sidebar(body)
 
-        main = ctk.CTkFrame(body, fg_color="transparent", corner_radius=0)
-        main.grid(row=0, column=2, sticky="nsew", padx=24, pady=(18, 14))
+        # La página va en un lienzo: si la ventana es más baja de lo que necesita (laptops a 125-150 %), sale una barra
+        # a la derecha para bajar al desglose y al correo en lugar de cortarlos (ver _ajustar_pagina)
+        self._lienzo = tk.Canvas(body, highlightthickness=0, bd=0, bg=COL["bg"], yscrollincrement=20)
+        self._lienzo.grid(row=0, column=2, sticky="nsew")
+        self._barra_pagina = ctk.CTkScrollbar(body, orientation="vertical", command=self._lienzo.yview)
+        self._lienzo.configure(yscrollcommand=self._barra_pagina.set)
+        pagina = ctk.CTkFrame(self._lienzo, fg_color="transparent", corner_radius=0)
+        pagina.grid_columnconfigure(0, weight=1)
+        pagina.grid_rowconfigure(0, weight=1)
+        self._pagina_id = self._lienzo.create_window(0, 0, window=pagina, anchor="nw")
+        self._lienzo.bind("<Configure>", lambda e: self._ajustar_pagina(), add="+")
+        self.bind_all("<MouseWheel>", self._rueda_pagina, add="+")
+        self._ajuste_pendiente = None
+
+        main = self._main = ctk.CTkFrame(pagina, fg_color="transparent", corner_radius=0)
+        main.grid(row=0, column=0, sticky="nsew", padx=24, pady=(18, 14))
         main.grid_columnconfigure(0, weight=1)
         main.grid_rowconfigure(3, weight=1)
 
@@ -769,9 +783,57 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         self._build_kpis(main)
         self._build_work_area(main)
         self._build_status_bar()
+        # Lo de arriba de la tabla cambia de alto (avisos, indicadores o bandeja del usuario): se vuelve a medir
+        for w in (main.grid_slaves(row=0)[0], self.notice, self.kpi_bar, self.hero):
+            for evento in ("<Configure>", "<Map>", "<Unmap>"):
+                w.bind(evento, lambda e: self._pedir_ajuste_pagina(), add="+")
 
         self._on_mode_change()
         self._aplicar_perfil()
+
+    # Alto mínimo (lógico) de la zona de tabla y desglose: con el desglose a la derecha, encabezado, veredicto,
+    # comprobaciones y al menos 5 renglones del correo; abajo, además unas filas de la tabla
+    ALTO_TRABAJO = {"derecha": 440, "abajo": 620, "sin_detalle": 300}
+
+    def _pedir_ajuste_pagina(self):
+        if self._ajuste_pendiente is None:
+            self._ajuste_pendiente = self.after_idle(self._ajustar_pagina)
+
+    def _ajustar_pagina(self):
+        """La página llena el alto de la ventana; si no cabe lo mínimo, se hace más alta y sale la barra para bajar."""
+        self._ajuste_pendiente = None
+        lienzo = self._lienzo
+        ancho, alto = lienzo.winfo_width(), lienzo.winfo_height()
+        if ancho <= 1 or alto <= 1:
+            return
+        s = self._scaling()
+        arriba = sum(w.winfo_reqheight() + int(20 * s) for w in self._main.grid_slaves()
+                     if int(w.grid_info().get("row", 3)) < 3)
+        vista = self.config_data.get("vista", {})
+        tipo = ("sin_detalle" if not vista.get("detalle", True) else
+                "derecha" if self._detalle_a_la_derecha() else "abajo")
+        necesita = arriba + int((self.ALTO_TRABAJO[tipo] + 32) * s)
+        alto_pagina = necesita if necesita > alto + int(6 * s) else alto  # sin barra por 1 o 2 píxeles
+        lienzo.itemconfigure(self._pagina_id, width=ancho, height=alto_pagina)
+        lienzo.configure(scrollregion=(0, 0, ancho, alto_pagina))
+        if alto_pagina > alto:
+            self._barra_pagina.grid(row=0, column=3, sticky="ns", padx=(0, 2))
+        else:
+            self._barra_pagina.grid_remove()
+            lienzo.yview_moveto(0)
+
+    def _rueda_pagina(self, e):
+        """La rueda sobre la página (fuera de tablas y textos, que tienen su propia barra) la sube o la baja."""
+        if not self._barra_pagina.winfo_ismapped():
+            return
+        w = e.widget
+        if not isinstance(w, tk.Misc) or not str(w).startswith(str(self._lienzo)):
+            return
+        while w is not None and w is not self._lienzo:
+            if isinstance(w, (ttk.Treeview, tk.Text, tk.Listbox)):
+                return
+            w = w.master
+        self._lienzo.yview_scroll(-3 if e.delta > 0 else 3, "units")
 
     def _hline(self, parent) -> ctk.CTkFrame:
         return ctk.CTkFrame(parent, height=1, corner_radius=0, fg_color=COL["border"])
@@ -796,11 +858,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         return ctk.CTkButton(parent, text=text, command=command, **opts)
 
     def _build_topbar(self):
-        bar = ctk.CTkFrame(self, fg_color=COL["surface"], corner_radius=0)
+        bar = self._topbar = ctk.CTkFrame(self, fg_color=COL["surface"], corner_radius=0)
         bar.grid(row=0, column=0, sticky="ew")
         bar.grid_columnconfigure(1, weight=1)
 
-        brand = ctk.CTkFrame(bar, fg_color="transparent")
+        brand = self._topbar_brand = ctk.CTkFrame(bar, fg_color="transparent")
         brand.grid(row=0, column=0, padx=(10, 0), pady=11, sticky="w")
         self.btn_panel = ctk.CTkButton(
             brand, text="☰", width=36, height=34, corner_radius=8, font=F(17), fg_color="transparent",
@@ -816,12 +878,13 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         ctk.CTkLabel(
             names, text="Validador de Renovaciones", font=F(15, True), text_color=COL["text"], height=20
         ).pack(anchor="w")
-        ctk.CTkLabel(
+        self._top_subtitulo = ctk.CTkLabel(
             names, text="FONACOT  ·  Cancelación y reversa de renovaciones",
             font=F(11), text_color=COL["muted"], height=16
-        ).pack(anchor="w")
+        )
+        self._top_subtitulo.pack(anchor="w")
 
-        right = ctk.CTkFrame(bar, fg_color="transparent")
+        right = self._topbar_right = ctk.CTkFrame(bar, fg_color="transparent")
         right.grid(row=0, column=2, padx=20, sticky="e")
         # Perfil (Usuario con su gafete / Validador): clic = cambiar de perfil o de gafete
         self.btn_perfil = ctk.CTkButton(
@@ -841,14 +904,52 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             fg_color=COL["track"], text_color=COL["text_2"]
         )
         self.lbl_clock.pack(side="left", padx=(0, 16), ipadx=12)
-        ctk.CTkFrame(right, width=1, height=28, fg_color=COL["border"], corner_radius=0).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(right, text="Buzón de Outlook", font=F(12), text_color=COL["muted"]).pack(side="left", padx=(0, 8))
+        self._top_sep = ctk.CTkFrame(right, width=1, height=28, fg_color=COL["border"], corner_radius=0)
+        self._top_sep.pack(side="left", padx=(0, 16))
+        self._top_buzon = ctk.CTkLabel(right, text="Buzón de Outlook", font=F(12), text_color=COL["muted"])
+        self._top_buzon.pack(side="left", padx=(0, 8))
         self.cmb_account = ctk.CTkComboBox(
             right, values=["Cargando cuentas..."], width=260, height=32, font=F(12), dropdown_font=F(12)
         )
         self.cmb_account.pack(side="left")
 
         self._hline(self).grid(row=0, column=0, sticky="sew")
+        # En pantallas angostas (laptop) la barra se compacta en vez de cortar la cuenta de Outlook a la derecha
+        self._reloj = ("--:--", "--:--")
+        self._top_nivel, self._top_necesita = 0, {}
+        bar.bind("<Configure>", lambda e: self._ajustar_topbar(), add="+")
+
+    def _compactar_topbar(self, nivel: int):
+        """0: completa. 1: sin «Buzón de Outlook». 2: reloj corto. 3: cuenta más angosta y sin el subtítulo."""
+        self._top_nivel = nivel
+        if nivel >= 1:
+            self._top_sep.pack_forget()
+            self._top_buzon.pack_forget()
+        elif not self._top_buzon.winfo_ismapped():
+            self._top_sep.pack(side="left", padx=(0, 16), before=self.cmb_account)
+            self._top_buzon.pack(side="left", padx=(0, 8), before=self.cmb_account)
+        self.lbl_clock.configure(text=self._reloj[1] if nivel >= 2 else self._reloj[0])
+        self.cmb_account.configure(width=190 if nivel >= 3 else 260)
+        if nivel >= 3:
+            self._top_subtitulo.pack_forget()
+        elif not self._top_subtitulo.winfo_ismapped():
+            self._top_subtitulo.pack(anchor="w")
+
+    def _ajustar_topbar(self):
+        """Compacta la barra de arriba un paso a la vez mientras no quepa; al agrandar la ventana, la regresa."""
+        ancho = self._topbar.winfo_width()
+        if ancho <= 1:
+            return
+        necesita = (self._topbar_brand.winfo_reqwidth() + self._topbar_right.winfo_reqwidth()
+                    + int(50 * self._scaling()))
+        nivel = self._top_nivel
+        if necesita > ancho and nivel < 3:
+            self._top_necesita[nivel] = necesita
+            self._compactar_topbar(nivel + 1)
+            self.after(30, self._ajustar_topbar)
+        elif nivel > 0 and ancho >= self._top_necesita.get(nivel - 1, 10 ** 6):
+            self._compactar_topbar(nivel - 1)
+            self.after(30, self._ajustar_topbar)
 
     def _section(self, parent, titulo: str, first: bool = False) -> ctk.CTkFrame:
         # Cada sección en su propio marco: el perfil Usuario oculta las que no usa (_mostrar_secciones)
@@ -2180,8 +2281,12 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
         self.lbl_det_titulo = ctk.CTkLabel(parent, text="DESGLOSE DEL TICKET  ·  comprobaciones", font=F(10, True),
                                            text_color=COL["primary"], anchor="w", height=14)
-        self.lbl_body_titulo = ctk.CTkLabel(parent, text="CORREO ORIGINAL  ·  números detectados resaltados",
-                                            font=F(10, True), text_color=COL["muted"], anchor="w", height=14)
+        # Título del correo con «Abrir en ventana»: en pantallas chicas el correo se lee completo aparte
+        self.lbl_body_titulo = ctk.CTkFrame(parent, fg_color="transparent")
+        ctk.CTkLabel(self.lbl_body_titulo, text="CORREO ORIGINAL  ·  números detectados resaltados", font=F(10, True),
+                     text_color=COL["muted"], anchor="w", height=14).pack(side="left")
+        self._btn(self.lbl_body_titulo, "Abrir en ventana ↗", self._ventana_correo, "link", height=18,
+                  font=F(10)).pack(side="left", padx=(8, 0))
 
         self.txt_detail = ctk.CTkTextbox(parent, font=F(13), fg_color=COL["subtle"], wrap="word")
         self.txt_detail.tag_config("titulo", foreground=COL["text"])
@@ -2218,6 +2323,10 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         # Resaltado: el amarillo invertido quedaba verde olivo con texto naranja (no se leía); en oscuro, su propio par
         fondo, texto = ("#854D0E", "#FEF3C7") if _TEMA["oscuro"] else ("#FEF08A", "#713F12")
         self.txt_body.tag_config("hl", background=fondo, foreground=texto)
+        self.txt_body._textbox.bind("<Double-1>", lambda e: self._ventana_correo(), add="+")
+        self._win_correo = None
+        # Al cambiar el alto del panel, el correo se vuelve a repartir con las comprobaciones
+        parent.bind("<Configure>", lambda e: self._ajustar_alto_correo(), add="+")
 
     def _colocar_detalle(self, derecha: bool):
         """A la derecha: desglose arriba (más alto) y correo abajo. Abajo: desglose a la izquierda (más ancho) y correo."""
@@ -2230,7 +2339,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         if derecha:
             # El desglose se queda con el alto que sobra; el correo, solo el que necesita (ver _ajustar_alto_correo)
             p.grid_columnconfigure(0, weight=1)
-            p.grid_rowconfigure(3, weight=1, minsize=int(220 * self._scaling()))
+            p.grid_rowconfigure(3, weight=1, minsize=int(80 * self._scaling()))
             p.grid_rowconfigure(5, weight=0)
             self.detail_hdr.grid(row=0, column=0, padx=16, pady=(12, 8), sticky="ew")
             self.banner.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="ew")
@@ -2253,22 +2362,84 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
 
     def _ajustar_encabezado_detalle(self, e):
         """El folio, cliente y crédito usan todo el ancho que dejan los botones (sin cortarse)."""
-        ancho_botones = self._detail_botones.winfo_width()
+        botones, s = self._detail_botones, self._scaling()
+        ancho_botones = botones.winfo_reqwidth()
         if ancho_botones < 20:  # todavía no se dibujan
-            ancho_botones = int(330 * self._scaling())
-        self.lbl_detail_header.configure(wraplength=max(220, int((e.width - ancho_botones) / self._scaling()) - 16))
+            ancho_botones = int(330 * s)
+        # Panel angosto (laptop): los botones bajan a otro renglón y el folio usa todo el ancho
+        abajo = e.width - ancho_botones < int(280 * s)
+        if abajo != (int(botones.grid_info().get("row", 0)) == 1):
+            if abajo:
+                botones.grid(row=1, column=0, columnspan=2, sticky="w", padx=0, pady=(6, 0))
+            else:
+                botones.grid(row=0, column=1, columnspan=1, sticky="ne", padx=(8, 0), pady=0)
+        libre = e.width if abajo else e.width - ancho_botones
+        self.lbl_detail_header.configure(wraplength=max(220, int(libre / s) - 16))
 
     def _ajustar_alto_correo(self):
         """
         A la derecha, el correo original toma el alto de su texto (entre 4 y 14 renglones) y no le quita espacio a las
-        comprobaciones; abajo, comparten el alto.
+        comprobaciones; abajo, comparten el alto. Si el panel es bajo (laptop), las comprobaciones ceden su espacio
+        hasta que el correo tenga al menos 5 renglones, para que nunca desaparezca.
         """
         if not getattr(self, "_detalle_derecha", True):
-            self.txt_body.configure(height=200)
-            return
+            alto = 200
+        else:
+            texto = self.txt_body.get("1.0", "end").rstrip("\n")
+            renglones = sum(1 + len(linea) // 70 for linea in texto.split("\n")) if texto else 3
+            alto = max(4, min(14, renglones)) * 18 + 16
+            s = self._scaling()
+            panel = self.detail_frame.winfo_height() / s
+            if panel > 100:
+                fijo = sum(w.winfo_reqheight() for w in (self.detail_hdr, self.banner, self.lbl_det_titulo,
+                                                         self.lbl_body_titulo)) / s + 72
+                alto = min(alto, max(5 * 18 + 16, int(panel - fijo - 220)))
+        if int(self.txt_body.cget("height")) != alto:
+            self.txt_body.configure(height=alto)
+
+    def _ventana_correo(self, enfocar: bool = True):
+        """El correo original completo en su propia ventana, con los números resaltados (para pantallas chicas)."""
         texto = self.txt_body.get("1.0", "end").rstrip("\n")
-        renglones = sum(1 + len(linea) // 70 for linea in texto.split("\n")) if texto else 3
-        self.txt_body.configure(height=max(4, min(14, renglones)) * 18 + 16)
+        if self._fila_detalle is None or not texto.strip():
+            self.lbl_status.configure(text="Selecciona una renovación para ver su correo original.")
+            return
+        win = self._win_correo
+        if win is None or not win.winfo_exists():
+            win = self._win_correo = ctk.CTkToplevel(self)
+            win.configure(fg_color=COL["surface"])
+            win.transient(self)
+            caja = win.caja = ctk.CTkTextbox(win, font=F(13), wrap="word")
+            caja.tag_config("hl", background=self.txt_body._textbox.tag_cget("hl", "background"),
+                            foreground=self.txt_body._textbox.tag_cget("hl", "foreground"))
+            botones = ctk.CTkFrame(win, fg_color="transparent")
+            botones.pack(side="bottom", fill="x", padx=16, pady=(0, 14))
+            caja.pack(fill="both", expand=True, padx=16, pady=(16, 10))
+            self._btn(botones, "Cerrar", win.destroy, "primary").pack(side="right", ipadx=12)
+            self._btn(botones, "Copiar texto", lambda: self._to_clipboard(
+                caja.get("1.0", "end").rstrip("\n"), "Correo original copiado al portapapeles.")).pack(side="right",
+                                                                                                    padx=(0, 8))
+            win.bind("<Escape>", lambda e: win.destroy())
+            # Hasta 760 x 640, sin pasarse del 70 % de la pantalla (geometry de CTkToplevel va en unidades lógicas)
+            s = self._scaling()
+            ancho = int(min(760, self.winfo_screenwidth() / s * 0.7))
+            alto = int(min(640, self.winfo_screenheight() / s * 0.7))
+            x = int(self.winfo_rootx() / s + max(0, (self.winfo_width() / s - ancho) / 2))
+            y = int(self.winfo_rooty() / s + max(0, (self.winfo_height() / s - alto) / 3))
+            win.geometry(f"{ancho}x{alto}+{x}+{y}")
+        ticket = self._fila_detalle.get('Numero_Ticket', '')
+        win.title(f"Correo original · {ticket}" if ticket else "Correo original")
+        caja = win.caja
+        caja.configure(state="normal")
+        caja.delete("1.0", "end")
+        caja.insert("1.0", texto)
+        rangos = self.txt_body._textbox.tag_ranges("hl")
+        for inicio, fin in zip(rangos[::2], rangos[1::2]):
+            caja.tag_add("hl", inicio, fin)
+        caja.configure(state="disabled")
+        if enfocar:
+            win.deiconify()
+            win.lift()
+            win.after(100, lambda: win.winfo_exists() and win.focus_force())
 
     def _toggle_checks(self):
         self._checks_abiertos = not self._checks_abiertos
@@ -2501,19 +2672,48 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         win.title("Atajos de teclado")
         win.resizable(False, False)
         win.transient(self)
-        ctk.CTkLabel(win, text="Atajos de teclado", font=F(16, True), text_color=COL["text"]).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=24, pady=(20, 12)
-        )
-        for i, (tecla, accion) in enumerate(ATAJOS, 1):
+        ctk.CTkLabel(win, text="Atajos de teclado", font=F(16, True), text_color=COL["text"]).pack(
+            anchor="w", padx=24, pady=(20, 12))
+        caja, lista, ajustar = self._cuerpo_con_barra(win)
+        for i, (tecla, accion) in enumerate(ATAJOS):
             ctk.CTkLabel(
-                win, text=tecla, font=F(11, True), fg_color=COL["track"], corner_radius=4,
+                lista, text=tecla, font=F(11, True), fg_color=COL["track"], corner_radius=4,
                 text_color=COL["text_2"], height=24
             ).grid(row=i, column=0, sticky="w", padx=(24, 16), pady=3, ipadx=8)
-            ctk.CTkLabel(win, text=accion, font=F(12), text_color=COL["text"]).grid(row=i, column=1, sticky="w", padx=(0, 24))
-        self._btn(win, "Cerrar", win.destroy, "primary").grid(
-            row=len(ATAJOS) + 1, column=1, sticky="e", padx=24, pady=(16, 20), ipadx=12
-        )
+            ctk.CTkLabel(lista, text=accion, font=F(12), text_color=COL["text"]).grid(row=i, column=1, sticky="w",
+                                                                                   padx=(0, 24))
+        botones = ctk.CTkFrame(win, fg_color="transparent")
+        botones.pack(side="bottom", fill="x", padx=24, pady=(16, 20))
+        caja.pack(fill="both", expand=True)
+        self._btn(botones, "Cerrar", win.destroy, "primary").pack(side="right", ipadx=12)
+        ajustar()
         win.after(150, win.focus_force)
+
+    def _cuerpo_con_barra(self, win):
+        """
+        Cuerpo de una ventana de tamaño fijo que en una laptop puede no caber en la pantalla: si su contenido es más
+        alto que lo que hay (menos el título y los botones), se desplaza con una barra y la rueda; si cabe, se ve igual.
+        Devuelve (caja para acomodar en `win`, interior donde van los widgets, ajustar() para llamar al terminar).
+        """
+        caja = ctk.CTkFrame(win, fg_color="transparent", corner_radius=0)
+        lienzo = tk.Canvas(caja, highlightthickness=0, bd=0, bg=win.cget("bg"), yscrollincrement=20)
+        barra = ctk.CTkScrollbar(caja, orientation="vertical", command=lienzo.yview)
+        lienzo.configure(yscrollcommand=barra.set)
+        lienzo.pack(side="left", fill="both", expand=True)
+        interior = ctk.CTkFrame(lienzo, fg_color="transparent", corner_radius=0)
+        lienzo.create_window(0, 0, window=interior, anchor="nw")
+
+        def ajustar():
+            win.update_idletasks()
+            ancho, alto = interior.winfo_reqwidth(), interior.winfo_reqheight()
+            # Lo que no es el cuerpo (título, botones, barra de la ventana) y la barra de tareas de Windows
+            resto = win.winfo_reqheight() - caja.winfo_reqheight() + int(110 * self._scaling())
+            visible = max(int(150 * self._scaling()), min(alto, self.winfo_screenheight() - resto))
+            lienzo.configure(width=ancho, height=visible, scrollregion=(0, 0, ancho, alto))
+            if alto > visible:
+                barra.pack(side="right", fill="y")
+                win.bind("<MouseWheel>", lambda e: lienzo.yview_scroll(-3 if e.delta > 0 else 3, "units"), add="+")
+        return caja, interior, ajustar
 
     def _toast(self, msg: str, color: str = None, ms: int = 7000, accion: tuple = None):
         """
@@ -2702,13 +2902,16 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         neutro = (COL["track"], COL["text_2"])
         if now.weekday() >= 5:
             text, (bg, fg) = f"{now:%H:%M}  ·  Fin de semana: entra como rezagada el lunes", neutro
+            corto = f"{now:%H:%M}  ·  Fin de semana"
         elif enviado:
             text, (bg, fg) = f"{now:%H:%M}  ·  Ticket único de hoy enviado a las {enviado:%H:%M}: lo nuevo va al siguiente", neutro
+            corto = f"{now:%H:%M}  ·  Ticket único enviado {enviado:%H:%M}"
         elif now < habitual_dt:
             mins = int((habitual_dt - now).total_seconds() // 60)
             h, m = divmod(mins, 60)
             restante = f"{h} h {m:02d} min" if h else f"{m} min"
             text = f"{now:%H:%M}  ·  Ticket único de hoy pendiente  ·  habitual {habitual:%H:%M} (en {restante})"
+            corto = f"{now:%H:%M}  ·  Ticket único en {restante}"
             if mins > 60:
                 bg, fg = COL["success_soft"], C("#047857")
             elif mins > 15:
@@ -2720,8 +2923,11 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 self._aviso_corte(mins)
         else:
             text = f"{now:%H:%M}  ·  Ticket único de hoy pendiente: lo que llegue aún entra hoy"
+            corto = f"{now:%H:%M}  ·  Ticket único pendiente"
             bg, fg = COL["warning_soft"], COL["warning"]
-        self.lbl_clock.configure(text=text, fg_color=bg, text_color=fg)
+        self._reloj = (text, corto)
+        self.lbl_clock.configure(text=corto if self._top_nivel >= 2 else text, fg_color=bg, text_color=fg)
+        self.after_idle(self._ajustar_topbar)
         self._actualizar_chip_corte()
         if reschedule:
             self.after(20000, self._tick_clock)
@@ -2786,8 +2992,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         win.configure(fg_color=COL["surface"])
         urgente = (fecha - hoy).days <= 1 or bloqueadas
         ctk.CTkFrame(win, height=6, corner_radius=0, fg_color=C("#DC2626") if urgente else C("#F59E0B")).pack(fill="x")
-        cuerpo = ctk.CTkFrame(win, fg_color="transparent")
-        cuerpo.pack(fill="both", padx=28, pady=(18, 8))
+        caja, cuerpo, ajustar = self._cuerpo_con_barra(win)
 
         def renglon(t, fuente=F(12), color=COL["text"], arriba=6):
             ctk.CTkLabel(cuerpo, text=t, font=fuente, text_color=color, justify="left", anchor="w",
@@ -2837,7 +3042,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
         ctk.CTkFrame(tabla, height=6, fg_color="transparent").grid(row=99, column=0)
 
         botones = ctk.CTkFrame(win, fg_color="transparent")
-        botones.pack(fill="x", padx=28, pady=(14, 20))
+        botones.pack(side="bottom", fill="x", padx=28, pady=(14, 20))
+        caja.pack(fill="both", expand=True, padx=28, pady=(18, 8))
         self._btn(botones, "Entendido", win.destroy, "primary").pack(side="right", ipadx=12)
         self._btn(botones, "Página del calendario (FONACOT)", lambda: webbrowser.open(URL_CALENDARIO), "link").pack(
             side="left")
@@ -2846,6 +3052,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 win.destroy()
                 self._apply_filter(FILTRO_INFORMATIVAS_TODAS)
             self._btn(botones, "Ver las que ya no se mandan", ver, "secondary").pack(side="right", padx=(0, 8))
+        ajustar()
         win.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
         y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
@@ -4281,6 +4488,8 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
                 self.txt_body.tag_add("hl", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
         self.txt_body.configure(state="disabled")
         self._ajustar_alto_correo()
+        if self._win_correo is not None and self._win_correo.winfo_exists():
+            self._ventana_correo(enfocar=False)  # la ventana abierta sigue a la renovación seleccionada
 
     # ================= ACCIONES SOBRE FILAS =================
 
@@ -4586,6 +4795,7 @@ class FonacotValidadorRenovacionesApp(ctk.CTk):
             self.after(200, self._ajustar_division)
         elif not vista.get("detalle", True) and en_paned:
             self.paned.forget(self.detail_frame)
+        self._pedir_ajuste_pagina()
 
     def _to_clipboard(self, text: str, aviso: str):
         self.clipboard_clear()

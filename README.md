@@ -1,4 +1,4 @@
-# FONACOT · Validador de Renovaciones — v3.3.4
+# FONACOT · Validador de Renovaciones — v3.3.5
 
 Aplicación de escritorio para Windows que arma y valida el **lote diario de cancelaciones y reversas de renovaciones**
 que llegan como incidentes de iTop a Outlook, y prepara el **ticket único** del día.
@@ -56,6 +56,13 @@ Se elige al abrir la app y se cambia con el botón de perfil (arriba a la derech
 - **3.3.4 · Cambio de perfil:** al regresar de Usuario a Validador volvía en *Por compañero* y la actualización
   automática repetía la búsqueda del otro perfil (al usuario le hacía la revisión semanal). Cada perfil vuelve a su
   modo y a su búsqueda.
+- **3.3.5 · Pantallas chicas (laptop):** si la ventana es más baja de lo que necesita, sale una barra a la derecha para
+  bajar al desglose y al correo. El correo original siempre tiene al menos 5 renglones, y **Abrir en ventana ↗** (o doble
+  clic en el correo) lo muestra completo aparte. La barra de arriba se compacta en lugar de cortar la cuenta de Outlook,
+  los botones del desglose bajan cuando no caben y las ventanas de *Atajos* y del calendario se desplazan si no caben.
+- **3.3.5 · «Cancelar el crédito X y regresar al Y» (I-363065):** sin decir «renovación», no se tomaba en cuenta. Ahora
+  se cancela X y Y queda como crédito origen; también con «volver al» y «reactivar el crédito». «Tope de buró» y «no le
+  arroja capacidad» cuentan como motivo de capacidad.
 - **3.3.3 · Cliente en las capturas de «Consulta de Crédito»:** el OCR de Windows se saltaba el renglón del
   cliente (número, botón «?» y nombre) y salía *SIN CLIENTE* aunque el crédito sí se leía (I-363027). Si la
   etiqueta se lee y su número no, ahora se lee sola la caja de la derecha.

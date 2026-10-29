@@ -440,14 +440,15 @@ class RenovacionTicketParser:
         has_renewal_word = bool(re.search(
             r'\b(renov\w*|reno|ren)\b|credito\s+padre|credito\s+hijo|credito\s+original|credito\s+anterior|antes\s+de\s+renovar|operacion\s*\(\s*origen\s*\)',
             combined
-        )) or bool(cls._RENOVACION_MAL_ESCRITA.search(combined))
+        )) or bool(cls._RENOVACION_MAL_ESCRITA.search(combined)) or bool(re.search(cls._REGRESA_AL_ANTERIOR, combined))
         has_cancel_word = bool(re.search(
             r'\b(canc\w*|reversa\w*|sin\s+efecto|baja)\b',
             combined
         ))
         has_capacity_reason = bool(re.search(
             r'(no\s+(le\s+)?(libero|dio|dieron|otorgo|deposito|alcanzo)\s+(el\s+|la\s+|lo\s+)?(capital|monto|dinero|cantidad|importe|que\s+(el\s+|ella\s+)?(requeria|necesitaba|pedia|esperaba|solicito))|'
-            r'no\s+libero\s+(disponible|capacidad|credito)|no\s+dio\s+disponible|no\s+da\s+disponible|bajo\s+(su\s+|la\s+|el\s+)?(capacidad|nivel)|topado\s+por\s+buro|capacidad\s+(de\s+cuota\s+|de\s+credito\s+)?agotada|plazo\s+menor\s+en\s+la\s+app)',
+            r'no\s+libero\s+(disponible|capacidad|credito)|no\s+dio\s+disponible|no\s+da\s+disponible|bajo\s+(su\s+|la\s+|el\s+)?(capacidad|nivel)|topado\s+por\s+buro|'
+            r'tope\s+de\s+buro|no\s+(le\s+)?arroja\s+capacidad|capacidad\s+(de\s+cuota\s+|de\s+credito\s+)?agotada|plazo\s+menor\s+en\s+la\s+app)',
             combined
         ))
 
@@ -461,6 +462,11 @@ class RenovacionTicketParser:
             return True, subtipo, motivo
 
         return False, "", ""
+
+    # «cancelar el crédito 67200 y regresar al 67774» (I-363065): volver al crédito de antes es reversar la renovación,
+    # aunque no diga «renovación». Sobre texto normalizado (sin acentos, en minúsculas)
+    _REGRESA_AL_ANTERIOR = (r'\b(?:regres\w*|volver|reactiv\w*)\s+(?:al|a\s+su|a\s+el|el)\s+(?:credito\s+)?'
+                            r'(?:anterior|original|(?:no\.?\s*)?\d{3,7}\b)')
 
     # «RENOMVACION», «RENOBACION», «RENOVASION», «RENVACION»: ren + hasta 3 letras + v/b + …ción/sión
     _RENOVACION_MAL_ESCRITA = re.compile(r'\bre+n+[a-z]{0,3}[vb][a-z]{0,2}(?:ci|si|s)[a-z]*\b')
@@ -969,6 +975,9 @@ class RenovacionTicketParser:
             # «la renovación 71470 del crédito 65000»
             r'cr[ée]dito\s+(\d{3,7})\s+' + cls._RENOVO_CON.replace('(\\d{4,7})', '\\d{4,7}', 1),
             r'renovaci[óo]n\s+\d{3,7}\s+del\s+cr[ée]dito\s+(\d{3,7})',
+            # «cancelar el crédito 67200 y regresar al 67774»: al que se regresa es el de antes (padre)
+            r'\b(?:regres\w*|volver|reactiv\w*)\s+(?:al|a\s+su|a\s+el|el)\s+(?:cr[ée]dito\s+)?(?:anterior\s+|original\s+)?'
+            r'(?:no\.?\s*)?(\d{3,7})\b',
             # «65000 -> 71470»: a la izquierda el padre (si a la izquierda hay un cliente de 7 u 8 dígitos, no aplica)
             r'(?<!\d)(\d{3,6})[^\S\n]*(?:->|→|=>)[^\S\n]*\d{3,6}(?!\d)',
         ]
