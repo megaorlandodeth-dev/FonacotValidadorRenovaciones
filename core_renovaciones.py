@@ -1178,6 +1178,15 @@ class RenovacionTicketParser:
         if len(creditos_renovados_found) > 1 and gafetes_sucursal:
             creditos_renovados_found = [c for c in creditos_renovados_found if c not in gafetes_sucursal]
 
+        # «crédito renovado 7933850 cliente GUERRERO… CREDITO REN 69988» (I-363102): el número va ANTES de la palabra
+        # «cliente» y después no viene otro número. Solo si no hay cliente y quedan otros créditos
+        if not clientes_found and len(creditos_renovados_found) >= 2:
+            m_cli = re.search(r'(?<!\d)(\d{6,10})[^\S\n]*[:\-]?[^\S\n]*cliente\b(?![^\S\n]*(?:n[úu]mero|num\.?|no\.?|n°)?'
+                              r'[^\S\n]*[:#\.\-]?[^\S\n]*\d)', full_context, re.I)
+            if m_cli and m_cli.group(1) in creditos_renovados_found:
+                creditos_renovados_found.remove(m_cli.group(1))
+                clientes_found.append(m_cli.group(1))
+
         # PASO 3: Emparejar Clientes, Créditos Renovados (Hijos) y Créditos Origen (Padres)
         disaggregated = []
 

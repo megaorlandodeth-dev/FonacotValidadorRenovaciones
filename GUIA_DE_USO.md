@@ -161,7 +161,7 @@ Notas:
 - No usar un ejecutable de un solo archivo: tarda más en abrir y los antivirus lo marcan más.
 - Al descomprimir, la carpeta donde quede no debe ser muy profunda: la ruta más larga dentro del paquete mide unos
   110 caracteres y Windows tiene un límite de 260.
-- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.6*). Se cambia en `APP_VERSION` de
+- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.7*). Se cambia en `APP_VERSION` de
   `validador_renovaciones_app.py`.
 
 ---
@@ -231,6 +231,7 @@ autoprueba.
 | En una laptop no se ve el correo original (o algo queda cortado abajo) | Desde la 3.3.5 sale una barra a la derecha para bajar. El correo también se abre completo con **Abrir en ventana ↗** o con doble clic. |
 | No aparece un incidente que dice «cancelar el crédito X y regresar al Y» | Pasaba antes de la 3.3.5 (no decía «renovación»). Con la 3.3.5 se cancela X y Y queda como crédito origen. |
 | En el ticket único la FECHA salía como el día del incidente | Pasaba antes de la 3.3.6. Ahora va la fecha de alta de la renovación que trae la base (sin base, la del correo). |
+| «crédito renovado 7933850 cliente …»: salen dos filas *SIN CLIENTE* | Pasaba antes de la 3.3.7. Ahora 7933850 se toma como el cliente. |
 | *ORA-12154* en modo clásico | Pasaba antes de la 3.3.3 con algunos Oracle Client instalados: descargar la versión más reciente. |
 | *DPY-4000* / *getaddrinfo failed* | Revisar *Nombre del host* (`scanfonacot.fonacot.gob.mx`), *Puerto* y *Nombre del servicio*, y la VPN. |
 | *no tiene la fecha de la emisión de …* | La página de FONACOT no ha publicado esa emisión o no hubo internet; se vuelve a intentar en la siguiente búsqueda. |
