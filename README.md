@@ -1,4 +1,4 @@
-# FONACOT · Validador de Renovaciones — v3.3.5
+# FONACOT · Validador de Renovaciones — v3.3.6
 
 Aplicación de escritorio para Windows que arma y valida el **lote diario de cancelaciones y reversas de renovaciones**
 que llegan como incidentes de iTop a Outlook, y prepara el **ticket único** del día.
@@ -56,6 +56,9 @@ Se elige al abrir la app y se cambia con el botón de perfil (arriba a la derech
 - **3.3.4 · Cambio de perfil:** al regresar de Usuario a Validador volvía en *Por compañero* y la actualización
   automática repetía la búsqueda del otro perfil (al usuario le hacía la revisión semanal). Cada perfil vuelve a su
   modo y a su búsqueda.
+- **3.3.6 · Fecha del ticket único:** al copiar filas o el lote y en el correo del ticket único, la columna FECHA es
+  la de alta de la renovación (`FECHA_ALTA` de la primera consulta a la base), no la de llegada del incidente. Sin
+  base, la que trae el correo y, si tampoco, la de llegada. Se reparte también como parche ligero (solo el `.exe`).
 - **3.3.5 · Pantallas chicas (laptop):** si la ventana es más baja de lo que necesita, sale una barra a la derecha para
   bajar al desglose y al correo. El correo original siempre tiene al menos 5 renglones, y **Abrir en ventana ↗** (o doble
   clic en el correo) lo muestra completo aparte. La barra de arriba se compacta en lugar de cortar la cuenta de Outlook,

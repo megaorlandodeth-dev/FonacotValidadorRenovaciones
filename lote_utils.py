@@ -290,8 +290,10 @@ INTRO_TICKET_UNICO_DEFAULT = (
 
 
 def _fila_ticket_unico(r: dict) -> tuple:
-    llegada = r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
-    fecha = llegada.strftime('%d/%m/%Y') if llegada else str(r.get('Fecha', ''))[:10]
+    # FECHA es la de alta de la renovación (FECHA_ALTA de la primera consulta a la base), no la del incidente; sin
+    # base, la que trae el correo, y si tampoco, la de llegada
+    alta = r.get('SQL_Fecha_Alta') or r.get('Fecha_Alta_Correo') or r.get('Fecha_Llegada_DT') or r.get('Fecha_DT')
+    fecha = alta.strftime('%d/%m/%Y') if alta else str(r.get('Fecha', ''))[:10]
     return (str(r.get('Numero_Ticket', '')), fecha,
             str(r.get('Numero_Cliente', '') or ''), str(r.get('Credito_Renovado_Hijo', '') or ''))
 

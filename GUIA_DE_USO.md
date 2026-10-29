@@ -154,10 +154,14 @@ Notas:
 
 - `dist\`, `build\` y el `.zip` no se suben al repositorio. El PDF de la guía sí, para descargarlo desde GitHub.
 - Si se cambia la guía (`GUIA_DE_USO.md`), el PDF se vuelve a generar con `python guia_pdf.py`.
+- **Parche ligero:** si solo cambió el código (las mismas librerías y el mismo Python), basta repartir el nuevo
+  `ValidadorRenovaciones.exe` (unos 12 MB): se cierra la app y se reemplaza el `.exe` de la carpeta. La configuración
+  y lo validado están en el usuario de Windows, no en la carpeta, así que no se pierden. Antes de repartirlo se
+  compara la carpeta `_internal` nueva con la anterior: si cambió algo, se reparte el `.zip` completo.
 - No usar un ejecutable de un solo archivo: tarda más en abrir y los antivirus lo marcan más.
 - Al descomprimir, la carpeta donde quede no debe ser muy profunda: la ruta más larga dentro del paquete mide unos
   110 caracteres y Windows tiene un límite de 260.
-- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.5*). Se cambia en `APP_VERSION` de
+- Para ver la versión del `.exe`: pie de la ventana (*Versión 3.3.6*). Se cambia en `APP_VERSION` de
   `validador_renovaciones_app.py`.
 
 ---
@@ -226,6 +230,7 @@ autoprueba.
 | Al cambiar de Validador a Usuario (o al revés) seguía haciendo lo del otro perfil | Pasaba antes de la 3.3.4. Al cambiar de perfil se limpia la tabla: F5 para buscar con el perfil nuevo. |
 | En una laptop no se ve el correo original (o algo queda cortado abajo) | Desde la 3.3.5 sale una barra a la derecha para bajar. El correo también se abre completo con **Abrir en ventana ↗** o con doble clic. |
 | No aparece un incidente que dice «cancelar el crédito X y regresar al Y» | Pasaba antes de la 3.3.5 (no decía «renovación»). Con la 3.3.5 se cancela X y Y queda como crédito origen. |
+| En el ticket único la FECHA salía como el día del incidente | Pasaba antes de la 3.3.6. Ahora va la fecha de alta de la renovación que trae la base (sin base, la del correo). |
 | *ORA-12154* en modo clásico | Pasaba antes de la 3.3.3 con algunos Oracle Client instalados: descargar la versión más reciente. |
 | *DPY-4000* / *getaddrinfo failed* | Revisar *Nombre del host* (`scanfonacot.fonacot.gob.mx`), *Puerto* y *Nombre del servicio*, y la VPN. |
 | *no tiene la fecha de la emisión de …* | La página de FONACOT no ha publicado esa emisión o no hubo internet; se vuelve a intentar en la siguiente búsqueda. |
